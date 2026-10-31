@@ -1,0 +1,121 @@
+name: Fork Rebase Validation
+on:
+  push:
+    branches: [codex/fork-rebase-validation]
+permissions:
+  contents: read
+jobs:
+  package:
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            script: package:mac
+            asset: mac-arm64.dmg
+          - os: windows-2022
+            script: package:windows
+            asset: win-x64.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require the exact reviewed product tree
+        shell: bash
+        run: git diff --exit-code baf1da8eaa1335c854f307674e245205aa1fa94d HEAD -- . ':!.github/scripts' ':!.github/workflows/fork-rebase-validation.yml'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run ${{ matrix.script }} -w apps/desktop
+      - name: Record the installer from this source build
+        env:
+          INSTALLER: apps/desktop/release/Spex-0.9.0-beta.20-${{ matrix.asset }}
+        run: node --input-type=module -e "import{readFileSync,writeFileSync}from'node:fs';import{createHash}from'node:crypto';const file=process.env.INSTALLER,b=readFileSync(file);writeFileSync('installer-proof.json',JSON.stringify({commit:process.env.GITHUB_SHA,productCommit:'baf1da8eaa1335c854f307674e245205aa1fa94d',platform:process.platform,arch:process.arch,file,bytes:b.length,sha256:createHash('sha256').update(b).digest('hex')},null,2))"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rebase-desktop-${{ matrix.asset }}
+          path: |
+            apps/desktop/release/Spex-0.9.0-beta.20-${{ matrix.asset }}
+            installer-proof.json
+          if-no-files-found: error
+      - name: Select the source-built installer
+        shell: bash
+        run: echo "SPEX_INSTALLER_FILE=$GITHUB_WORKSPACE/apps/desktop/release/Spex-0.9.0-beta.20-${{ matrix.asset }}" >> "$GITHUB_ENV"
+      - name: Install Mac app from its DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: >
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/Spex Fork Installed" "$RUNNER_TEMP/Spex DMG"
+
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/Spex DMG"
+          "$SPEX_INSTALLER_FILE"
+
+          trap 'hdiutil detach "$RUNNER_TEMP/Spex DMG"' EXIT
+
+          ditto "$RUNNER_TEMP/Spex DMG/Spex.app" "$RUNNER_TEMP/Spex Fork
+          Installed/Spex.app"
+
+          echo "SPEX_INSTALLED_EXECUTABLE=$RUNNER_TEMP/Spex Fork
+          Installed/Spex.app/Contents/MacOS/Spex" >> "$GITHUB_ENV"
+
+
+          echo "SPEX_INSTALLED_ROOT=$RUNNER_TEMP/Spex Fork Installed/Spex.app"
+          >> "$GITHUB_ENV"
+
+          echo "SPEX_INSTALLED_ARCHIVE=$RUNNER_TEMP/Spex Fork
+          Installed/Spex.app/Contents/Resources/app.asar" >> "$GITHUB_ENV"
+      - name: Install Windows app from its NSIS installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >
+          $installer = $env:SPEX_INSTALLER_FILE
+
+          $destination = Join-Path $env:RUNNER_TEMP 'Spex Fork Installed'
+
+          $process = Start-Process -FilePath $installer -ArgumentList @('/S',
+          "/D=$destination") -Wait -PassThru
+
+          if ($process.ExitCode -ne 0) { throw "Installer exited
+          $($process.ExitCode)" }
+
+          $executable = Join-Path $destination 'Spex.exe'
+
+          if (!(Test-Path -LiteralPath $executable)) { throw 'Installed
+          executable missing' }
+
+          "SPEX_INSTALLED_EXECUTABLE=$executable" >> $env:GITHUB_ENV
+
+
+          "SPEX_INSTALLED_ROOT=$destination" >> $env:GITHUB_ENV
+
+          "SPEX_INSTALLED_ARCHIVE=$(Join-Path $destination
+          'resources/app.asar')" >> $env:GITHUB_ENV
+      - name: Launch the actual installed UI
+        run: node .github/scripts/fork-installed-smoke.mjs
+      - name: Probe the actual installed runtime and GitHub installation
+        run: node .github/scripts/fork-launch-native-probes.cjs
+      - name: Install an isolated ASAR reader
+        shell: bash
+        run: npm install --prefix "$RUNNER_TEMP/asar-tools" --no-save --ignore-scripts @electron/asar@3.4.1
+      - name: Record the installed application payload
+        shell: bash
+        run: node .github/scripts/package-manifest.cjs --root="$SPEX_INSTALLED_ROOT" --archive="$SPEX_INSTALLED_ARCHIVE" --asar-anchor="$RUNNER_TEMP/asar-tools/package.json" --exe=Spex.exe --label=rebased-source-${{ runner.os }} --output=source-package-manifest.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rebase-proof-${{ matrix.asset }}
+          path: |
+            installer-proof.json
+            installer-smoke-evidence/
+            native-probe-evidence/
+            source-package-manifest.json
+          if-no-files-found: error
