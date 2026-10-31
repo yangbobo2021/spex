@@ -71,7 +71,7 @@ meta.md       The spec of specs
 | [DR-045](decisions/045-unified-session-storage.md) | 045-unified-session-storage.md | Shared desktop/CLI storage: one Spex home, portable history/graphs, local provider hints, Git with whole-session choices; in-app shared-branch sync by DR-057; layout and per-spex-repository sync by DR-103, library by DR-104; storage Git lease by DR-108; writers unstopped during the app's sync by DR-111 |
 | [DR-047](decisions/047-explicit-session-recovery.md) | 047-explicit-session-recovery.md | Explicit desktop Retry/Discard through shared uncertain-turn recovery; Retry becomes Restore, Discard conditional by DR-088; Restore and Discard on the assigned runtime alone by DR-134 |
 | [DR-048](decisions/048-failed-session-cleanup.md) | 048-failed-session-cleanup.md | Failed cleanup retains session ownership and project reservation |
-| [DR-049](decisions/049-supported-app-hosts.md) | 049-supported-app-hosts.md | macOS/Linux app hosts with private POSIX storage; Windows scaffold and browser clients |
+| [DR-049](decisions/049-supported-app-hosts.md) | 049-supported-app-hosts.md | Initial POSIX host boundary; native Windows private-storage admission by DR-165 |
 | [DR-050](decisions/050-shared-storage-cutover.md) | 050-shared-storage-cutover.md | Playbook 13 / Cligent 0.25 floors, former-store cutover and scoped damage isolation |
 | [DR-046](decisions/046-decision-record-evolution.md) | 046-decision-record-evolution.md | Accepted-decision evolution: successor DRs, scoped reciprocal links, current spec items updated on acceptance |
 | [DR-037](decisions/037-playbook-12-adoption.md) | 037-playbook-12-adoption.md | Playbook 12 adoption, installed templates and config relocation; host lifecycle amended by DR-045, dependency floors by DR-050; built-ins as a spec package by DR-104; the seed by Playbook's rule by DR-154 |
@@ -187,6 +187,11 @@ meta.md       The spec of specs
 | [DR-162](decisions/162-a-package-folder-from-what-you-already-have.md) | 162-a-package-folder-from-what-you-already-have.md | A package folder from what you already have: `spex package init` makes `spex-packages/<name>/` from a skill folder or a spec file with no server, naming the next steps in the IDE or the CLI; extends DR-151 and DR-157 |
 | [DR-163](decisions/163-the-cli-finds-the-running-app.md) | 163-the-cli-finds-the-running-app.md | The CLI finds the running app: the core keeps `local/endpoint.json` under the home while it serves a loopback endpoint, and the CLI reads it when no URL is given; amends DR-157 |
 | [DR-164](decisions/164-the-seat-signs-in-on-its-ticket.md) | 164-the-seat-signs-in-on-its-ticket.md | The seat signs in on its ticket: the open hands the ticket it presented to the seat's sign-in, the seat's device request carries it, the approval page opened only where the space still asks for it after the first poll interval, the stand-in granting on the ticket; amends DR-159 and DR-132 |
+| [DR-165](decisions/165-native-windows-private-storage.md) | 165-native-windows-private-storage.md | Native Windows private storage through fs-safe; fail-closed admission, privileged principals, coordinated storage dependency, launch environment and installation responsibilities |
+| [DR-166](decisions/166-session-creation-waits-for-initialization.md) | 166-session-creation-waits-for-initialization.md | Session creation awaits its initialization for two minutes through the existing command-class reply bound |
+| [DR-167](decisions/167-windows-git-source-long-paths.md) | 167-windows-git-source-long-paths.md | Command-scoped Git for Windows long paths for package mirrors without changing user configuration |
+| [DR-168](decisions/168-owned-session-start-wait.md) | 168-owned-session-start-wait.md | Observe the single owned session creation through initialization without a false UI deadline or automatic resend |
+| [DR-169](decisions/169-windows-bounded-codex-commands.md) | 169-windows-bounded-codex-commands.md | Native Windows bounded Codex command transport through supplied Cligent |
 
 ## Packages
 

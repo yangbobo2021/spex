@@ -229,6 +229,8 @@ When the core resolves or installs a Git source, it shall fetch the repository a
 
 - a `rev` naming a branch or tag resolves to its commit at resolution and the lock holds the commit alone;
 - a repository at the Git origin of no instance the home is signed in to, a signed-out instance's included, is fetched with this device's own Git, so a public one still installs and a private one reports Git's refusal.
+- On Windows, Git-source commands select Git's `core.longpaths=true` for that command only, so the mirror's pack and reference files remain usable below long cache roots without changing system, user or repository configuration ([DR-167](../decisions/167-windows-git-source-long-paths.md)).
+- A Git-source archive disables ambient automatic line-ending conversion for that command only, so a device's checkout preference does not rewrite the release bytes ([DR-167](../decisions/167-windows-git-source-long-paths.md)).
 
 ### Listing
 
@@ -414,6 +416,10 @@ When real protocol clients run delayed and overlapping environment mutations in 
 #### environments-37
 
 When a real protocol client previews and publishes to a controlled registry in terminal-wait mode, the integration suite shall assert actual instance/name/version/files in the upload-free preview, the actual publication receipt on success and a later failure despite a preceding successful `published` state [[environments-17](#environments-17)] [[environments-35](#environments-35)].
+
+#### environments-38
+
+When the Windows integration suite fetches and reuses a real Git source below a cache root whose mirror pack paths exceed the legacy Windows path bound, it shall assert the expected commit and exported file bytes, with the source repository's configuration unchanged [[environments-13](#environments-13)].
 
 ## References
 

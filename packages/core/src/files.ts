@@ -7,8 +7,10 @@
 // storage fault a reader reports.
 
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, fchmodSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, posix, resolve, win32 } from "node:path";
+import { closeSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, type Stats } from "node:fs";
+import { readOwnerAndDacl } from "@openclaw/fs-safe/permissions";
+import { createDirectorySync, createFileSync, assertNoSymlinkParentsSync } from "@openclaw/fs-safe/advanced";
+import { dirname, isAbsolute, parse, posix, resolve, win32 } from "node:path";
 import { i18n } from "./i18n.js";
 import { UUID_PATTERN } from "./protocol.js";
 
@@ -24,6 +26,49 @@ export class StorageFormatError extends Error {
     super(i18n._({ id: "{file}: {reason}", comment: "A storage fault as one line: the file, then the reason — itself a message",
       values: { file, reason } }));
     this.name = "StorageFormatError";
+  }
+}
+
+/** Spex's private-storage policy over facts inspected by fs-safe. Windows
+ * administrators and SYSTEM are privileged principals, as root is on POSIX. */
+export function hasPrivatePermissions(file: string, stat: Pick<Stats, "mode" | "uid">): boolean {
+  if (process.platform !== "win32") return (stat.mode & 0o077) === 0 &&
+    (typeof process.getuid !== "function" || stat.uid === process.getuid());
+  const facts = readOwnerAndDacl(file);
+  if (facts.status !== "supported" || !facts.complete || !facts.isLocal || !facts.daclPresent || facts.unsupportedAceTypes.length) return false;
+  const trusted = new Set([facts.currentUserSid, "s-1-5-18", "s-1-5-32-544"]);
+  return trusted.has(facts.ownerSid) && facts.aces.every(ace =>
+    ace.aceType === "deny" || ace.mask === 0 || trusted.has(ace.sid));
+}
+
+/** Create a Windows state root privately from its first appearance. Existing
+ * roots are verified, never silently repaired or admitted by synthetic mode bits. */
+export async function prepareWindowsStorageDirectory(directory: string): Promise<void> {
+  if (process.platform === "win32") makePrivateDirectory(directory);
+}
+
+/** Synchronous callers use the library's same private creator. */
+export function makePrivateDirectory(directory: string): void {
+  if (process.platform !== "win32") { mkdirSync(directory, { recursive: true, mode: 0o700 }); return; }
+  assertNoSymlinkParentsSync({ rootDir: parse(directory).root, targetPath: directory, requireDirectories: true });
+  const info = lstatSync(directory, { throwIfNoEntry: false });
+  if (!info) {
+    const parent = dirname(directory);
+    if (!lstatSync(parent, { throwIfNoEntry: false })) makePrivateDirectory(parent);
+    try { createDirectorySync(directory, { private: true }); }
+    catch (error) { if (!["EEXIST", "already-exists"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
+  }
+  const current = lstatSync(directory);
+  if (current.isSymbolicLink() || !current.isDirectory() || !hasPrivatePermissions(directory, current)) {
+    throw new StorageFormatError(directory, "private storage permissions cannot be verified");
+  }
+}
+
+function assertPrivateWindowsEntry(file: string): void {
+  if (process.platform !== "win32") return;
+  const info = lstatSync(file);
+  if (info.isSymbolicLink() || !hasPrivatePermissions(file, info)) {
+    throw new StorageFormatError(file, "private storage permissions cannot be verified");
   }
 }
 
@@ -82,9 +127,12 @@ export function readJsonFile(file: string): unknown {
 
 /** Atomic same-directory replacement, synced before and after the rename. */
 export function writeApplicationBytes(file: string, bytes: Buffer | string): void {
+  assertPrivateWindowsEntry(dirname(file));
   const temporary = `${file}.${randomUUID()}.tmp`;
-  const fd = openSync(temporary, "wx", 0o600);
-  try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
+  const owned = process.platform === "win32" ? createFileSync(temporary, { private: true }) : undefined;
+  const fd = owned?.fd ?? openSync(temporary, "wx", 0o600);
+  try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { if (owned) owned.close(); else closeSync(fd); }
+  assertPrivateWindowsEntry(temporary);
   renameSync(temporary, file);
   // Directory handles are not supported by Windows; the file is still synced.
   if (process.platform !== "win32") {
@@ -132,15 +180,21 @@ export const fileVersion = (file: string): FileVersion => readVersioned(file).ve
  * a write whose folder is gone is refused the same way. The temporary
  * file never outlives a refusal or a failure. */
 export function writeVersionedBytes(file: string, bytes: Buffer | string, expected: FileVersion, mode = 0o600): void {
+  if (mode === 0o600) assertPrivateWindowsEntry(dirname(file));
   const temporary = `${file}.${randomUUID()}.tmp`;
   let fd: number;
-  try { fd = openSync(temporary, "wx", mode); }
+  let owned: ReturnType<typeof createFileSync> | undefined;
+  try {
+    if (process.platform === "win32" && mode === 0o600) owned = createFileSync(temporary, { private: true });
+    fd = owned?.fd ?? openSync(temporary, "wx", mode);
+  }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new VersionConflictError(file);
     throw error;
   }
   try {
-    try { writeFileSync(fd, bytes); fchmodSync(fd, mode); fsyncSync(fd); } finally { closeSync(fd); }
+    try { writeFileSync(fd, bytes); fchmodSync(fd, mode); fsyncSync(fd); } finally { if (owned) owned.close(); else closeSync(fd); }
+    if (mode === 0o600) assertPrivateWindowsEntry(temporary);
     if (fileVersion(file) !== expected) throw new VersionConflictError(file);
     renameSync(temporary, file);
   } catch (error) {
