@@ -6,7 +6,31 @@ permissions:
   contents: read
   actions: read
 jobs:
+  await-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Wait for the actual Tag workflow to publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 85); do
+            conclusion=$(gh api "repos/$REPO/actions/runs/41217061270" --jq '.conclusion // "running"')
+            case "$conclusion" in failure|cancelled|timed_out|action_required) echo "Tag workflow concluded $conclusion"; exit 1;; esac
+            if [ "$conclusion" = success ] && gh api "repos/$REPO/releases/tags/app-v0.9.0-beta.20" --jq 'select(.draft == false) | .tag_name' | grep -qx app-v0.9.0-beta.20; then
+              echo 'The real Tag workflow passed and the release is published.'
+              exit 0
+            fi
+            echo "Waiting for the real Tag release ($attempt/85)."
+            sleep 30
+          done
+          echo 'Timed out waiting for the Tag release.'
+          exit 1
   verify:
+    needs: await-release
     timeout-minutes: 25
     strategy:
       fail-fast: false
