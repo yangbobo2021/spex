@@ -1,0 +1,61 @@
+name: Fork Installer Smoke
+on:
+  push:
+    branches: [codex/fork-installer-smoke]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  install:
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            source-run: 41204788953
+            artifact: desktop-mac-arm64.dmg
+          - os: windows-2022
+            source-run: 41205418762
+            artifact: desktop-win-x64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ matrix.source-run }}
+          name: ${{ matrix.artifact }}
+          path: download
+      - name: Install Mac app from its DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/Spex Fork Installed" "$RUNNER_TEMP/Spex DMG"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/Spex DMG" download/*.dmg
+          trap 'hdiutil detach "$RUNNER_TEMP/Spex DMG"' EXIT
+          ditto "$RUNNER_TEMP/Spex DMG/Spex.app" "$RUNNER_TEMP/Spex Fork Installed/Spex.app"
+          echo "SPEX_INSTALLED_EXECUTABLE=$RUNNER_TEMP/Spex Fork Installed/Spex.app/Contents/MacOS/Spex" >> "$GITHUB_ENV"
+      - name: Install Windows app from its NSIS installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem download/*.exe).FullName
+          $destination = Join-Path $env:RUNNER_TEMP 'Spex Fork Installed'
+          $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$destination") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)" }
+          $executable = Join-Path $destination 'Spex.exe'
+          if (!(Test-Path -LiteralPath $executable)) { throw 'Installed executable missing' }
+          "SPEX_INSTALLED_EXECUTABLE=$executable" >> $env:GITHUB_ENV
+      - name: Launch the installed app with an isolated profile and render its UI
+        run: node .github/scripts/fork-installed-smoke.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installer-smoke-${{ matrix.os }}
+          path: installer-smoke-evidence/
+          if-no-files-found: error
