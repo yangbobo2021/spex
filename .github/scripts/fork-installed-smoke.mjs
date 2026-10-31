@@ -1,9 +1,27 @@
 // Fork-only artifact installation check; not part of the upstream candidate.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
+
+if (process.argv[2] === "verify") {
+  const metadata = JSON.parse(readFileSync("download/installer-proof.json", "utf8"));
+  const root = resolve("download");
+  const installer = resolve(root, metadata.file);
+  assert(installer.startsWith(root + sep), "Installer path is outside its artifact");
+  assert.equal(metadata.platform, process.platform);
+  assert.equal(metadata.arch, process.arch);
+  const bytes = readFileSync(installer);
+  assert.equal(bytes.length, metadata.bytes);
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), metadata.sha256);
+  mkdirSync("installer-smoke-evidence", { recursive: true });
+  writeFileSync("installer-smoke-evidence/installer.json", JSON.stringify(metadata, null, 2));
+  appendFileSync(process.env.GITHUB_ENV, `SPEX_INSTALLER_FILE=${installer}\n`);
+  console.log(JSON.stringify({ verified: true, ...metadata }, null, 2));
+  process.exit(0);
+}
 
 const executable = process.env.SPEX_INSTALLED_EXECUTABLE;
 assert(executable && existsSync(executable), "Installed executable is missing");

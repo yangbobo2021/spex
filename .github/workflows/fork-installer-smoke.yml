@@ -30,13 +30,15 @@ jobs:
           run-id: ${{ matrix.source-run }}
           name: ${{ matrix.artifact }}
           path: download
+      - name: Verify downloaded installer identity and SHA-256
+        run: node .github/scripts/fork-installed-smoke.mjs verify
       - name: Install Mac app from its DMG
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/Spex Fork Installed" "$RUNNER_TEMP/Spex DMG"
-          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/Spex DMG" download/*.dmg
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/Spex DMG" "$SPEX_INSTALLER_FILE"
           trap 'hdiutil detach "$RUNNER_TEMP/Spex DMG"' EXIT
           ditto "$RUNNER_TEMP/Spex DMG/Spex.app" "$RUNNER_TEMP/Spex Fork Installed/Spex.app"
           echo "SPEX_INSTALLED_EXECUTABLE=$RUNNER_TEMP/Spex Fork Installed/Spex.app/Contents/MacOS/Spex" >> "$GITHUB_ENV"
@@ -44,7 +46,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $installer = (Get-ChildItem download/*.exe).FullName
+          $installer = $env:SPEX_INSTALLER_FILE
           $destination = Join-Path $env:RUNNER_TEMP 'Spex Fork Installed'
           $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$destination") -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)" }
