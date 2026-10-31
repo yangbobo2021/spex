@@ -20,11 +20,13 @@ const pass = (name, detail = true) => { proof.checks[name] = detail; console.log
 try {
   const cliRoot = join(modules, "@sublang/spex");
   const cliVersion = JSON.parse(readFileSync(join(cliRoot, "package.json"), "utf8")).version;
-  const cli = spawnSync(process.execPath, [join(cliRoot, "dist/cli.js"), "--version"], {
+  const scaffold = join(scratch, "scaffold");
+  mkdirSync(scaffold);
+  const cli = spawnSync(process.execPath, [join(cliRoot, "dist/cli.js"), "scaffold", "--lang", "en", "--agents", "codex", scaffold], {
     encoding: "utf8", env: process.env, timeout: 20_000,
   });
   assert.equal(cli.status, 0, cli.stderr);
-  assert(cli.stdout.includes(cliVersion), cli.stdout);
+  assert(existsSync(join(scaffold, "specs/meta.md")), cli.stdout);
   pass("bundled-cli-through-app-node", cliVersion);
 
   const esbuild = require("esbuild");
