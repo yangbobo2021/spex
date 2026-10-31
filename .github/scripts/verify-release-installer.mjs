@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import {readFileSync,writeFileSync} from 'node:fs';
+import {createHash} from 'node:crypto';
+const release=JSON.parse(readFileSync('release.json','utf8'));
+assert.equal(release.tag_name,'app-v0.9.0-beta.20');assert.equal(release.prerelease,true);assert.equal(release.draft,false);
+const names=['Spex-0.9.0-beta.20-mac-arm64.dmg','Spex-0.9.0-beta.20-win-x64.exe','SHA256SUMS'];
+for(const name of names)assert.equal(release.assets.filter(a=>a.name===name).length,1,'Missing or duplicate release asset '+name);
+const sums=Object.fromEntries(readFileSync('download/SHA256SUMS','utf8').trim().split(/\r?\n/).map(line=>{const m=/^([a-f0-9]{64})\s+(.+)$/.exec(line);assert(m,'Malformed checksum');return[m[2],m[1]]}));
+assert.deepEqual(Object.keys(sums).sort(),names.slice(0,2).sort());
+const file=process.platform==='darwin'?names[0]:names[1];const b=readFileSync('download/'+file);const sha256=createHash('sha256').update(b).digest('hex');assert.equal(sha256,sums[file]);
+const asset=release.assets.find(a=>a.name===file);assert.equal(asset.size,b.length);if(asset.digest)assert.equal(asset.digest,'sha256:'+sha256);
+writeFileSync('download/installer-proof.json',JSON.stringify({tag:release.tag_name,productCommit:'baf1da8eaa1335c854f307674e245205aa1fa94d',assetId:asset.id,platform:process.platform,arch:process.arch,file,bytes:b.length,sha256},null,2));
+console.log(JSON.stringify({file,bytes:b.length,sha256,releaseAssetId:asset.id}));

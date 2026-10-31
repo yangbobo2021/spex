@@ -1,0 +1,126 @@
+name: Fork Tag Installer Verification
+on:
+  push:
+    branches: [codex/fork-tag-verification]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  verify:
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            asset: mac-arm64.dmg
+            source-proof-run: 41215861385
+          - os: windows-2022
+            asset: win-x64.exe
+            source-proof-run: 41214373086
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify the released tag names the tested product commit
+        shell: bash
+        run: |
+          test "$(git rev-parse app-v0.9.0-beta.20^{commit})" = baf1da8eaa1335c854f307674e245205aa1fa94d
+          git diff --exit-code baf1da8eaa1335c854f307674e245205aa1fa94d HEAD -- . ':!.github'
+      - name: Download the real published release asset and checksums
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: Spex-0.9.0-beta.20-${{ matrix.asset }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/app-v0.9.0-beta.20" > release.json
+          gh release download app-v0.9.0-beta.20 --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --pattern SHA256SUMS --dir download
+      - name: Verify release digest, checksums and installer identity
+        run: node .github/scripts/verify-release-installer.mjs
+      - run: node .github/scripts/fork-installed-smoke.mjs verify
+      - name: Install Mac app from its DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: >
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/Spex Fork Installed" "$RUNNER_TEMP/Spex DMG"
+
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/Spex DMG"
+          "$SPEX_INSTALLER_FILE"
+
+          trap 'hdiutil detach "$RUNNER_TEMP/Spex DMG"' EXIT
+
+          ditto "$RUNNER_TEMP/Spex DMG/Spex.app" "$RUNNER_TEMP/Spex Fork
+          Installed/Spex.app"
+
+          echo "SPEX_INSTALLED_EXECUTABLE=$RUNNER_TEMP/Spex Fork
+          Installed/Spex.app/Contents/MacOS/Spex" >> "$GITHUB_ENV"
+
+
+          echo "SPEX_INSTALLED_ROOT=$RUNNER_TEMP/Spex Fork Installed/Spex.app"
+          >> "$GITHUB_ENV"
+
+          echo "SPEX_INSTALLED_ARCHIVE=$RUNNER_TEMP/Spex Fork
+          Installed/Spex.app/Contents/Resources/app.asar" >> "$GITHUB_ENV"
+      - name: Install Windows app from its NSIS installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >
+          $installer = $env:SPEX_INSTALLER_FILE
+
+          $destination = Join-Path $env:RUNNER_TEMP 'Spex Fork Installed'
+
+          $process = Start-Process -FilePath $installer -ArgumentList @('/S',
+          "/D=$destination") -Wait -PassThru
+
+          if ($process.ExitCode -ne 0) { throw "Installer exited
+          $($process.ExitCode)" }
+
+          $executable = Join-Path $destination 'Spex.exe'
+
+          if (!(Test-Path -LiteralPath $executable)) { throw 'Installed
+          executable missing' }
+
+          "SPEX_INSTALLED_EXECUTABLE=$executable" >> $env:GITHUB_ENV
+
+
+          "SPEX_INSTALLED_ROOT=$destination" >> $env:GITHUB_ENV
+
+          "SPEX_INSTALLED_ARCHIVE=$(Join-Path $destination
+          'resources/app.asar')" >> $env:GITHUB_ENV
+      - name: Launch the actual installed Tag UI
+        run: node .github/scripts/fork-installed-smoke.mjs
+      - name: Verify the actual Tag runtime and public GitHub package installation
+        run: node .github/scripts/fork-launch-native-probes.cjs
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ matrix.source-proof-run }}
+          name: rebase-proof-${{ matrix.asset }}
+          path: source-proof
+      - name: Install an isolated ASAR reader
+        shell: bash
+        run: npm install --prefix "$RUNNER_TEMP/asar-tools" --no-save --ignore-scripts @electron/asar@3.4.1
+      - name: Record the installed Tag payload
+        shell: bash
+        run: node .github/scripts/package-manifest.cjs --root="$SPEX_INSTALLED_ROOT" --archive="$SPEX_INSTALLED_ARCHIVE" --asar-anchor="$RUNNER_TEMP/asar-tools/package.json" --exe=Spex.exe --label=tag-installed-${{ runner.os }} --output=tag-package-manifest.json
+      - name: Compare with the tested rebased-source installer
+        run: node .github/scripts/compare-tag-payload.cjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tag-proof-${{ matrix.asset }}
+          path: |
+            release.json
+            download/installer-proof.json
+            download/SHA256SUMS
+            installer-smoke-evidence/
+            native-probe-evidence/
+            tag-package-manifest.json
+            tag-payload-comparison.json
+          if-no-files-found: error
