@@ -17,7 +17,7 @@ source; run source with `npm ci` and `npm start` (desktop) or
 
 ### Added
 
-- App tags build a macOS Apple Silicon ZIP and a Windows x64 per-user
+- App tags build a macOS Apple Silicon DMG and a Windows x64 per-user
   installer on native runners. Both builds must succeed before the
   release publishes both downloads and SHA-256 checksums; source
   instructions remain available. Builds are unsigned and the macOS app

@@ -178,7 +178,7 @@ When a valid tag matching `app-v*` is pushed, the app release workflow shall cre
 - the workflow confirms the CI workflow concluded `success` for the tagged commit, verifies the tag's version against both shells' `package.json`, and builds and tests the tree before creating the release — empty notes or a mismatch fail it without a release;
 - the release names Node.js 22.19 or later and, from a checkout of its tag, `npm ci`, `npm start` for the desktop, and `npm run start:server` for the server shell as the way to run it;
 - the desktop package names its Electron version exactly, never as a range: the local packager (`npm run package -w apps/desktop`, electron-builder [[3]]) downloads the platform binaries of one release and refuses a range outright;
-- the downloads are a macOS Apple Silicon ZIP and a Windows x64 per-user NSIS installer, named with version, platform and architecture, with SHA-256 checksums and notes identifying unsigned and non-notarized status;
+- the downloads are a macOS Apple Silicon DMG and a Windows x64 per-user NSIS installer ([DR-171](../decisions/171-native-desktop-installers.md)), named with version, platform and architecture, with SHA-256 checksums and notes identifying unsigned and non-notarized status;
 - native runners build both downloads with the shipped physical dependency tree [[app-shell-13](#app-shell-13)], and the workflow publishes only after both packaging jobs succeed [[release-37](release.md#release-37)];
 - the workflow does not publish to npm and does not run for CLI tags, keeping the release channels disjoint [[release-19](release.md#release-19)].
 
