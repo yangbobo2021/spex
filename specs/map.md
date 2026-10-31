@@ -71,7 +71,7 @@ meta.md       The spec of specs
 | [DR-045](decisions/045-unified-session-storage.md) | 045-unified-session-storage.md | Shared desktop/CLI storage: one Spex home, portable history/graphs, local provider hints, Git with whole-session choices; in-app shared-branch sync by DR-057; layout and per-spex-repository sync by DR-103, library by DR-104; storage Git lease by DR-108; writers unstopped during the app's sync by DR-111 |
 | [DR-047](decisions/047-explicit-session-recovery.md) | 047-explicit-session-recovery.md | Explicit desktop Retry/Discard through shared uncertain-turn recovery; Retry becomes Restore, Discard conditional by DR-088; Restore and Discard on the assigned runtime alone by DR-134 |
 | [DR-048](decisions/048-failed-session-cleanup.md) | 048-failed-session-cleanup.md | Failed cleanup retains session ownership and project reservation |
-| [DR-049](decisions/049-supported-app-hosts.md) | 049-supported-app-hosts.md | macOS/Linux app hosts with private POSIX storage; Windows scaffold and browser clients |
+| [DR-049](decisions/049-supported-app-hosts.md) | 049-supported-app-hosts.md | Initial POSIX host boundary; native Windows private-storage admission by DR-165 |
 | [DR-050](decisions/050-shared-storage-cutover.md) | 050-shared-storage-cutover.md | Playbook 13 / Cligent 0.25 floors, former-store cutover and scoped damage isolation |
 | [DR-046](decisions/046-decision-record-evolution.md) | 046-decision-record-evolution.md | Accepted-decision evolution: successor DRs, scoped reciprocal links, current spec items updated on acceptance |
 | [DR-037](decisions/037-playbook-12-adoption.md) | 037-playbook-12-adoption.md | Playbook 12 adoption, installed templates and config relocation; host lifecycle amended by DR-045, dependency floors by DR-050; built-ins as a spec package by DR-104; the seed by Playbook's rule by DR-154 |
@@ -191,6 +191,11 @@ meta.md       The spec of specs
 | [DR-170](decisions/170-space-is-written-at-every-pairing.md) | 170-space-is-written-at-every-pairing.md | `space` is written at every pairing: every `spex.yaml` the app writes for a project names the instance its spex repository is placed at, the home's default included, a project placed nowhere naming none; amends DR-165 |
 
 | [DR-168](decisions/168-independent-package-registry.md) | 168-independent-package-registry.md | Independent registry setting and account, shared CLI and IDE package operations, public Space discovery, preserved legacy sources and private package sign-in per seat |
+| [DR-171](decisions/171-native-windows-private-storage.md) | 171-native-windows-private-storage.md | Native Windows private storage through fs-safe; fail-closed admission, privileged principals, coordinated storage dependency, launch environment and installation responsibilities |
+| [DR-172](decisions/172-session-creation-waits-for-initialization.md) | 172-session-creation-waits-for-initialization.md | Session creation awaits its initialization for two minutes through the existing command-class reply bound |
+| [DR-173](decisions/173-windows-git-source-long-paths.md) | 173-windows-git-source-long-paths.md | Command-scoped Git for Windows long paths for package mirrors without changing user configuration |
+| [DR-174](decisions/174-owned-session-start-wait.md) | 174-owned-session-start-wait.md | Observe the single owned session creation through initialization without a false UI deadline or automatic resend |
+| [DR-175](decisions/175-windows-bounded-codex-commands.md) | 175-windows-bounded-codex-commands.md | Native Windows bounded Codex command transport through supplied Cligent |
 
 ## Packages
 
