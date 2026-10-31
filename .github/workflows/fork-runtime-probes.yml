@@ -1,4 +1,4 @@
-# Fork-only verification of native components that differ after clean builds.
+# Windows-only retained-fixture follow-up; Mac probes passed in run 41211100034.
 name: Fork Native Runtime Probes
 on:
   push:
@@ -14,10 +14,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
-            source-run: 41204788953
-            artifact: desktop-mac-arm64.dmg
-            baseline: macos
           - os: windows-2022
             source-run: 41205418762
             artifact: desktop-win-x64.exe

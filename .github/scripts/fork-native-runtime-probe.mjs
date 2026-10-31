@@ -107,13 +107,42 @@ try {
   pass("repository-claim-and-reacquire");
 
   if (process.platform === "win32") {
-    const tests = ["windows-storage.integration.test.js", "git-source-long-paths.integration.test.js"];
+    // Keep the shipped storage integration case unchanged. The separate
+    // mirror flow below retains its Git fixture: deleting read-only Git
+    // objects under Electron's Windows rmSync masked the prior assertions.
+    const tests = ["windows-storage.integration.test.js"];
     const result = spawnSync(process.execPath, ["--test", ...tests.map(name => join(modules, "@sublang/spex-core/dist", name))], {
       encoding: "utf8", env: process.env, timeout: 120_000,
     });
     writeFileSync(join(evidence, "windows-storage-tests.log"), result.stdout + result.stderr);
     assert.equal(result.status, 0, result.stdout + result.stderr);
-    pass("packaged-core-private-storage-and-long-git-paths");
+    pass("packaged-core-private-storage");
+
+    const { gitSource, defaultRunGit } = await import(pathToFileURL(join(modules, "@sublang/spex-core/dist/environment/git-source.js")));
+    const mirrorFixture = mkdtempSync(join(tmpdir(), "spex-git-longpaths-"));
+    proof.retainedGitFixture = mirrorFixture;
+    const origin = join(mirrorFixture, "origin");
+    mkdirSync(origin);
+    const originGit = (...args) => execFileSync(gitExe, args, { cwd: origin, encoding: "utf8" }).trim();
+    originGit("init", "--quiet", "--initial-branch=main");
+    writeFileSync(join(origin, "README.md"), "Real file-transport source\n".repeat(64));
+    originGit("add", "README.md");
+    originGit("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Source");
+    const head = originGit("rev-parse", "HEAD");
+    const config = readFileSync(join(origin, ".git/config"));
+    const mirrorName = "a".repeat(64) + "." + "b".repeat(36);
+    const componentLength = 201 - join(mirrorFixture, "cache", "git", mirrorName).length - 1;
+    assert(componentLength > 0 && componentLength <= 255);
+    const cache = join(mirrorFixture, "cache", "c".repeat(componentLength));
+    assert.equal(join(cache, "git", mirrorName).length, 201);
+    assert(join(cache, "git", mirrorName, "objects/pack", "pack-" + "c".repeat(40) + ".keep").length > 260);
+    const source = gitSource(cache, { runGit: (args, options) => defaultRunGit(["-c", "core.autocrlf=true", ...args], options) });
+    const fetched = await source.fetch(pathToFileURL(origin).href, "main");
+    assert.equal(fetched.commit, head);
+    assert.deepEqual(readFileSync(join(fetched.dir, "README.md")), readFileSync(join(origin, "README.md")));
+    assert.deepEqual(await source.fetch(pathToFileURL(origin).href, head), fetched);
+    assert.deepEqual(readFileSync(join(origin, ".git/config")), config);
+    pass("packaged-git-long-mirror-fetch-and-cache-reuse");
   }
   proof.status = "passed";
 } catch (error) {
@@ -121,6 +150,8 @@ try {
   proof.error = error.stack;
   throw error;
 } finally {
+  // These owned fixtures are evidence on a disposable CI VM. Retain them
+  // instead of changing ACLs or deleting evidence merely to green cleanup.
+  proof.retainedFixture = scratch;
   writeFileSync(join(evidence, "proof.json"), JSON.stringify(proof, null, 2));
-  rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
