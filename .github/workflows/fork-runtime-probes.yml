@@ -1,0 +1,97 @@
+# Fork-only verification of native components that differ after clean builds.
+name: Fork Native Runtime Probes
+on:
+  push:
+    branches:
+      - codex/fork-runtime-probes
+permissions:
+  contents: read
+  actions: read
+jobs:
+  probe:
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            source-run: 41204788953
+            artifact: desktop-mac-arm64.dmg
+            baseline: macos
+          - os: windows-2022
+            source-run: 41205418762
+            artifact: desktop-win-x64.exe
+            baseline: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ matrix.source-run }}
+          name: ${{ matrix.artifact }}
+          path: download
+      - name: Verify downloaded installer identity and SHA-256
+        run: node .github/scripts/fork-installed-smoke.mjs verify
+      - name: Install Mac app from its DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: >
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/Spex Fork Installed" "$RUNNER_TEMP/Spex DMG"
+
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/Spex DMG"
+          "$SPEX_INSTALLER_FILE"
+
+          trap 'hdiutil detach "$RUNNER_TEMP/Spex DMG"' EXIT
+
+          ditto "$RUNNER_TEMP/Spex DMG/Spex.app" "$RUNNER_TEMP/Spex Fork
+          Installed/Spex.app"
+
+          echo "SPEX_INSTALLED_EXECUTABLE=$RUNNER_TEMP/Spex Fork
+          Installed/Spex.app/Contents/MacOS/Spex" >> "$GITHUB_ENV"
+
+
+          echo "SPEX_INSTALLED_ROOT=$RUNNER_TEMP/Spex Fork Installed/Spex.app"
+          >> "$GITHUB_ENV"
+
+          echo "SPEX_INSTALLED_ARCHIVE=$RUNNER_TEMP/Spex Fork
+          Installed/Spex.app/Contents/Resources/app.asar" >> "$GITHUB_ENV"
+      - name: Install Windows app from its NSIS installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >
+          $installer = $env:SPEX_INSTALLER_FILE
+
+          $destination = Join-Path $env:RUNNER_TEMP 'Spex Fork Installed'
+
+          $process = Start-Process -FilePath $installer -ArgumentList @('/S',
+          "/D=$destination") -Wait -PassThru
+
+          if ($process.ExitCode -ne 0) { throw "Installer exited
+          $($process.ExitCode)" }
+
+          $executable = Join-Path $destination 'Spex.exe'
+
+          if (!(Test-Path -LiteralPath $executable)) { throw 'Installed
+          executable missing' }
+
+          "SPEX_INSTALLED_EXECUTABLE=$executable" >> $env:GITHUB_ENV
+
+
+          "SPEX_INSTALLED_ROOT=$destination" >> $env:GITHUB_ENV
+
+          "SPEX_INSTALLED_ARCHIVE=$(Join-Path $destination
+          'resources/app.asar')" >> $env:GITHUB_ENV
+      - name: Exercise native modules using the installed app as Node
+        run: node .github/scripts/fork-launch-native-probes.cjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-probe-${{ matrix.baseline }}
+          path: native-probe-evidence/
+          if-no-files-found: error
