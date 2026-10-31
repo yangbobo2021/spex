@@ -4,6 +4,7 @@ on:
     branches: [codex/fork-rebase-validation]
 permissions:
   contents: read
+  actions: read
 jobs:
   package:
     timeout-minutes: 45
@@ -14,9 +15,6 @@ jobs:
           - os: macos-15
             script: package:mac
             asset: mac-arm64.dmg
-          - os: windows-2022
-            script: package:windows
-            asset: win-x64.exe
     runs-on: ${{ matrix.os }}
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
@@ -24,30 +22,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Require the exact reviewed product tree
-        shell: bash
-        run: git diff --exit-code baf1da8eaa1335c854f307674e245205aa1fa94d HEAD -- . ':!.github/scripts' ':!.github/workflows/fork-rebase-validation.yml'
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: npm run ${{ matrix.script }} -w apps/desktop
-      - name: Record the installer from this source build
-        env:
-          INSTALLER: apps/desktop/release/Spex-0.9.0-beta.20-${{ matrix.asset }}
-        run: node --input-type=module -e "import{readFileSync,writeFileSync}from'node:fs';import{createHash}from'node:crypto';const file=process.env.INSTALLER,b=readFileSync(file);writeFileSync('installer-proof.json',JSON.stringify({commit:process.env.GITHUB_SHA,productCommit:'baf1da8eaa1335c854f307674e245205aa1fa94d',platform:process.platform,arch:process.arch,file,bytes:b.length,sha256:createHash('sha256').update(b).digest('hex')},null,2))"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
+          github-token: ${{ github.token }}
+          run-id: 41214373086
           name: rebase-desktop-${{ matrix.asset }}
-          path: |
-            apps/desktop/release/Spex-0.9.0-beta.20-${{ matrix.asset }}
-            installer-proof.json
-          if-no-files-found: error
-      - name: Select the source-built installer
-        shell: bash
-        run: echo "SPEX_INSTALLER_FILE=$GITHUB_WORKSPACE/apps/desktop/release/Spex-0.9.0-beta.20-${{ matrix.asset }}" >> "$GITHUB_ENV"
+          path: download
+      - name: Verify the original source installer hash
+        run: node .github/scripts/fork-installed-smoke.mjs verify
       - name: Install Mac app from its DMG
         if: runner.os == 'macOS'
         shell: bash

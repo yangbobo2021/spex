@@ -56,6 +56,9 @@ try {
     pass("electron-native-windows-process-tree");
   }
 
+  const dugite = require("dugite");
+  const preparedGit = dugite.setupEnvironment({});
+  Object.assign(process.env, preparedGit.env);
   const gitRoot = dirname(require.resolve("dugite/package.json"));
   const gitExe = process.platform === "win32" ? join(gitRoot, "git/cmd/git.exe") : join(gitRoot, "git/bin/git");
   const gitVersion = execFileSync(gitExe, ["--version"], { encoding: "utf8" }).trim();

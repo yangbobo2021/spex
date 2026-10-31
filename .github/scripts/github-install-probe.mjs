@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {execFileSync} from 'node:child_process';
+import {execFileSync,spawnSync} from 'node:child_process';
 import {createHash,randomUUID} from 'node:crypto';
 import {existsSync,mkdirSync,mkdtempSync,readFileSync,readdirSync,writeFileSync} from 'node:fs';
 import {createRequire} from 'node:module';
@@ -31,6 +31,8 @@ try {
  const rpc=(type,fields={})=>new Promise((yes,no)=>{const id='p'+(++seq);const timer=setTimeout(()=>{pending.delete(id);no(Error('RPC timeout '+type));},180000);pending.set(id,{resolve:yes,reject:no,timer});socket.send(JSON.stringify({type,id,...fields}));});
  const registered=await rpc('project.register',{path:project});proof.projectId=registered.id;
  const request={kind:'git',git:'https://github.com/yangbobo2021/app-delivery-acceptance-spex.git',rev:'main'};
+ const remote=spawnSync('git',['ls-remote',request.git,'refs/heads/main'],{encoding:'utf8',timeout:30000,windowsHide:true});
+ proof.gitPreflight={status:remote.status,stdout:remote.stdout,stderr:remote.stderr,error:remote.error?.message};assert.equal(remote.status,0,JSON.stringify(proof.gitPreflight));
  await rpc('environment.request',{repository:registered.id,name:'yangbobo2021/app-delivery-acceptance',request,wait:true});
  const state=await rpc('environment.get',{repository:registered.id});assert.equal(state.error,null,JSON.stringify(state));
  const pkg=state.packages.find(p=>p.name==='yangbobo2021/app-delivery-acceptance');assert(pkg?.installed,JSON.stringify(pkg));proof.checks.githubInstall=pkg;
