@@ -12,6 +12,7 @@ import { pathToFileURL } from "node:url";
 assert.equal(process.versions.electron, "44.0.0");
 const modules = process.env.SPEX_INSTALLED_ARCHIVE + ".unpacked/node_modules";
 const require = createRequire(join(modules, "@sublang/spex-core/package.json"));
+const appGitEnvironment = Object.fromEntries(["PATH", "GIT_EXEC_PATH", "GIT_CONFIG_SYSTEM", "GIT_TEMPLATE_DIR"].map(name => [name, process.env[name]]));
 const scratch = mkdtempSync(join(tmpdir(), "spex-runtime-probe-"));
 const proof = { platform: process.platform, arch: process.arch, versions: process.versions, checks: {} };
 const evidence = "native-probe-evidence";
@@ -146,6 +147,11 @@ try {
     assert.deepEqual(await source.fetch(pathToFileURL(origin).href, head), fetched);
     assert.deepEqual(readFileSync(join(origin, ".git/config")), config);
     pass("packaged-git-long-mirror-fetch-and-cache-reuse");
+  }
+  // The Mac desktop uses its captured login Git; only Windows selects
+  // dugite at startup. Restore that real Mac environment for the Core probe.
+  if (process.platform === "darwin") for (const [name, value] of Object.entries(appGitEnvironment)) {
+    if (value === undefined) delete process.env[name]; else process.env[name] = value;
   }
   process.env.SPEX_PROBE_CORE = join(modules, "@sublang/spex-core");
   process.env.SPEX_PROBE_OUTPUT = join(evidence, "github-install-proof.json");
