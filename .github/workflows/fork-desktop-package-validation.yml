@@ -1,4 +1,4 @@
-# Fork-only packaging harness; excluded from the upstream candidate branch.
+# Fork-only Windows retry; macOS passed in run 41204788953 and is not repeated.
 name: Fork Desktop Package Validation
 on:
   push:
@@ -15,9 +15,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
-            script: package:mac
-            asset: mac-arm64.dmg
           - os: windows-2022
             script: package:windows
             asset: win-x64.exe
@@ -53,6 +50,16 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: hdiutil verify "apps/desktop/release/Spex-$VERSION-mac-arm64.dmg"
+      - name: Verify unsigned CRT rejection
+        run: node --input-type=module -e
+          "import{mkdtempSync,writeFileSync,rmSync}from'node:fs';import{tmpdir}from'node:os';import{join}from'node:path';import{spawnSync}from'node:child_process';const
+          d=mkdtempSync(join(tmpdir(),'spex-unsigned-crt-'));try{for(const n
+          of['vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll'])writeFileSync(join(d,n),'unsigned
+          fixture');const
+          r=spawnSync(process.execPath,['apps/desktop/scripts/stage-windows-runtime.mjs'],{encoding:'utf8',env:{...process.env,SPEX_WINDOWS_CRT_DIR:d}});if(r.status===0||!r.stderr.includes('Microsoft
+          signature verification failed'))throw Error(r.stderr||'Unsigned CRT
+          accepted');console.log('Unsigned CRT rejected by Microsoft signature
+          gate')}finally{rmSync(d,{recursive:true,force:true})}"
       - name: Record installer identity
         env:
           INSTALLER: apps/desktop/release/Spex-${{ steps.version.outputs.version }}-${{
@@ -63,7 +70,7 @@ jobs:
           Error('Installer unexpectedly
           small');if(process.platform==='win32'&&b.subarray(0,2).toString()!=='MZ')throw
           Error('Invalid Windows
-          executable');writeFileSync('installer-proof.json',JSON.stringify({commit:process.env.GITHUB_SHA,platform:process.platform,arch:process.arch,file:p,bytes:b.length,sha256:createHash('sha256').update(b).digest('hex')},null,2))"
+          executable');writeFileSync('installer-proof.json',JSON.stringify({commit:process.env.GITHUB_SHA,platform:process.platform,arch:process.arch,file:p,bytes:b.length,sha256:createHash('sha256').update(b).digest('hex')},null,2));console.log(readFileSync('installer-proof.json','utf8'))"
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.asset }}
