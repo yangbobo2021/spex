@@ -1,0 +1,571 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// The single Boss composer (RUN-3/6/7/8): free text and /commands,
+// input between turns, a pending-question banner, and abort.
+// Failed submissions keep the draft and surface the error here.
+// Drafts live in the store so tab/surface switches never eat text.
+//
+// One composer shape across the app (run-view-106, DR-041 §9): the
+// field on top growing with its text, one caption line under it that
+// hints and acknowledgments share, and an action row beneath that
+// wraps — secondary left, primary last and right. The Captain home
+// builds its composer from the same parts.
+//
+// The queue is the one part that grows without bound, so it lives in
+// its own scrolling frame a few entries tall and the composer yields
+// around it: the field, its caption, and its actions keep their place
+// whatever the Boss has queued (run-view-8).
+
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import type { PlaybookSummary } from "@sublang/spex-core/protocol";
+
+import { i18n } from "../i18n.js";
+import { useAutoGrow } from "../lib/useAutoGrow.js";
+import type { ComposerState, StagedIntent } from "../state/store.js";
+import type { SessionView } from "../state/reducer.js";
+import { SlashMenuList, slashMatches } from "./SlashMenu.js";
+import { Rich } from "./Rich.js";
+import { Icon } from "./Icon.js";
+import {
+  AttachmentChips,
+  AttachmentPicker,
+  composerFileDrop,
+  composerFilePaste,
+  canSubmitContent,
+  type ComposerAttachmentControls,
+} from "./ComposerAttachments.js";
+
+/** The caption every composer carries when nothing else needs the
+ * line (run-view-106). Read where it is shown, never at module load
+ * (localization-4). */
+export const composerHint = (): string =>
+  i18n._("/ for playbooks · Enter sends");
+
+/** The primary control's key hint (run-view-8). */
+export const sendKeys = (): string =>
+  i18n._("Enter to send · Shift+Enter for a new line");
+
+/** A placeholder is at most 24 characters (run-view-106); a player
+ * whose id would push past that is not named — the measure is taken on
+ * the words the reader sees, whatever language they are in. */
+export function replyPlaceholder(player?: string): string {
+  const named = player ? i18n._("Reply to {player}…", { player }) : undefined;
+  return named && named.length <= 24 ? named : i18n._("Answer the question…");
+}
+
+const PRIMARY_CLASS =
+  "rounded-md bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-500 disabled:opacity-40";
+const SECONDARY_CLASS =
+  "rounded-md border border-neutral-300 px-3 py-1.5 text-sm text-neutral-600 hover:bg-neutral-50 disabled:opacity-40 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800";
+
+/** The box is the control (DR-010 §8): focus reads as its own border
+ * rather than a ring around it. */
+export function ComposerBox({
+  field,
+  caption,
+  secondary,
+  actions,
+  attachments,
+}: {
+  field: ReactNode;
+  caption: ReactNode;
+  /** The one secondary action, at the row's left. */
+  secondary?: ReactNode;
+  /** The right-hand group: Abort while a turn runs, then the primary. */
+  actions: ReactNode;
+  /** Shared file controls; transfer and durable ownership belong to the caller. */
+  attachments?: ComposerAttachmentControls;
+}) {
+  const pickerRef = useRef<HTMLButtonElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  return (
+    <div
+      data-testid="composer-box"
+      className="grid min-h-min flex-1 gap-1 rounded-xl border border-neutral-300 bg-white p-2 focus-within:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-900 dark:focus-within:border-neutral-400"
+      style={{ gridTemplateRows: [
+        attachments?.files.length ? "auto" : "",
+        "minmax(1.75rem,auto)",
+        caption !== null && caption !== undefined && caption !== false ? "auto" : "",
+        "auto",
+      ].filter(Boolean).join(" ") }}
+      onDragOver={attachments ? (event) => {
+        if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = attachments.disabled ? "none" : "copy";
+      } : undefined}
+      onDrop={attachments ? (event) => composerFileDrop(event, attachments) : undefined}
+      onPaste={attachments ? (event) => composerFilePaste(event, attachments) : undefined}
+    >
+      {attachments ? <AttachmentChips controls={attachments} pickerRef={pickerRef} /> : null}
+      <div className="flex min-h-7 flex-col">{field}</div>
+      {caption}
+      <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+        {attachments ? <AttachmentPicker controls={attachments} buttonRef={pickerRef} inputRef={fileInputRef} /> : null}
+        {secondary}
+        <span className="ml-auto flex items-center gap-1.5">{actions}</span>
+      </div>
+    </div>
+  );
+}
+
+/** The field: full width on top, one row when empty, growing with
+ * its text to a maximum and scrolling past it, no native grip. */
+export function ComposerField({
+  fieldRef,
+  value,
+  className,
+  ...rest
+}: Omit<ComponentProps<"textarea">, "ref" | "value" | "rows"> & {
+  fieldRef: RefObject<HTMLTextAreaElement | null>;
+  value: string;
+}) {
+  useAutoGrow(fieldRef, value, undefined, '[data-testid="captain-column"]');
+  return (
+    <textarea
+      ref={fieldRef}
+      value={value}
+      rows={1}
+      className={`min-h-7 w-full resize-none border-0 bg-transparent px-1 py-1 text-sm outline-none [field-sizing:content] max-h-[max(40vh,1.75rem)] disabled:opacity-60 ${
+        className ?? ""
+      }`}
+      {...rest}
+    />
+  );
+}
+
+/** One caption line: the staged intent chip, else a transient
+ * acknowledgment, else the hint (run-view-85, run-view-86). */
+export function ComposerCaption({
+  staged,
+  onDetachStaged,
+  note,
+  hint,
+}: {
+  staged?: StagedIntent;
+  onDetachStaged?: () => void;
+  note?: string;
+  /** The line's resting words; a composer without a slash menu says
+   * only how to send (playbook-library-54). */
+  hint?: string;
+}) {
+  return (
+    <div
+      data-testid="composer-caption"
+      className="flex min-h-6 shrink-0 items-center px-1 text-xs text-neutral-500 dark:text-neutral-400"
+    >
+      {staged ? (
+        <span
+          data-testid="staged-intent-chip"
+          className="flex min-w-0 max-w-full items-center gap-1 rounded-full border border-brand-300 bg-brand-50 pl-2.5 font-medium text-brand-700 dark:border-brand-700 dark:bg-brand-950 dark:text-brand-300"
+        >
+          <span className="min-w-0 truncate" title={staged.title}>
+            {i18n._({
+              id: "Starting: {title}",
+              values: { title: staged.title },
+              comment: "chip on the composer: the task this message will start",
+            })}
+          </span>
+          <button
+            type="button"
+            title={i18n._("Take the task out of the message")}
+            aria-label={i18n._("Take the task out of the message")}
+            onClick={onDetachStaged}
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full hover:bg-brand-100 dark:hover:bg-brand-900"
+          >
+            <Icon name="close" className="h-3 w-3" />
+          </button>
+        </span>
+      ) : note ? (
+        <span
+          data-testid="queued-intent-note"
+          role="status"
+          className="min-w-0 truncate"
+          title={note}
+        >
+          {note}
+        </span>
+      ) : (
+        <span className="min-w-0 truncate">{hint ?? composerHint()}</span>
+      )}
+    </div>
+  );
+}
+
+export function Composer({
+  view,
+  composer,
+  connected,
+  blockedReason,
+  error,
+  playbooks = [],
+  staged,
+  onCompileNew,
+  onDraftChange,
+  onSubmit,
+  onAbort,
+  onRemoveQueued,
+  onDismissError,
+  onDetachStaged,
+  onQueueInstead,
+  attachments,
+}: {
+  view: SessionView;
+  composer: ComposerState;
+  connected: boolean;
+  blockedReason?: string;
+  error?: string;
+  playbooks?: PlaybookSummary[];
+  /** The intent staged into this composer, worn as a chip (DR-035). */
+  staged?: StagedIntent;
+  onCompileNew?: () => void;
+  /** Persist the draft in the store (DR-010: drafts survive). */
+  onDraftChange?: (draft: string) => void;
+  onSubmit: (text: string) => Promise<void>;
+  onAbort: () => void;
+  onRemoveQueued: (index: number) => void;
+  onDismissError: () => void;
+  /** Detach the staged chip without sending (DR-035). */
+  onDetachStaged?: () => void;
+  /** Queue instead of send (DR-035): the typed text becomes a queued
+   * intent for this project; nothing is sent. */
+  onQueueInstead?: (text: string) => Promise<void>;
+  attachments?: ComposerAttachmentControls;
+}) {
+  const [localText, setLocalText] = useState("");
+  const text = onDraftChange ? (composer.draft ?? "") : localText;
+  const setText = onDraftChange ?? setLocalText;
+  const [sending, setSending] = useState(false);
+  const [aborting, setAborting] = useState(false);
+  /** Transient queue-instead-of-send acknowledgment (run-view-85). */
+  const [queuedNote, setQueuedNote] = useState<string>();
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const queueRef = useRef<HTMLDivElement>(null);
+  const slashItems = slashMatches(text, playbooks);
+  const slash = slashDismissed || view.turnActive ? undefined : slashItems;
+
+  function insertCommand(command: string) {
+    setText(`/${command} `);
+    setSlashIndex(0);
+    setSlashDismissed(false);
+    textareaRef.current?.focus();
+  }
+
+  const awaiting = view.pendingQuestion !== undefined;
+
+  // A delayed reply or settlement must not take focus from a control
+  // the reader selected while the update was in flight (run-view-8).
+  function restoreUnclaimedFocus() {
+    const field = textareaRef.current;
+    if (!field || field.disabled) return;
+    const document = field.ownerDocument;
+    const active = document.activeElement;
+    if (active && active !== field && active !== document.body && active !== document.documentElement) return;
+    field.focus();
+  }
+
+  useEffect(() => {
+    restoreUnclaimedFocus();
+  }, [awaiting, view.turnActive]);
+
+  // The newest queued message is the one the Boss just wrote, so the
+  // frame stays at its end as the queue grows (run-view-8).
+  useEffect(() => {
+    const el = queueRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [composer.queued.length]);
+
+  // "Aborting…" clears itself when the abort lands (turn ends) or
+  // the attempt failed and the error strip explains why.
+  useEffect(() => {
+    if (!view.turnActive) setAborting(false);
+  }, [view.turnActive]);
+  useEffect(() => {
+    if (error) setAborting(false);
+  }, [error]);
+
+  function submit() {
+    if (!canSubmitContent(text, attachments?.files) || sending || !connected || blockedReason || view.turnActive) return;
+    setSending(true);
+    onSubmit(text)
+      .then(() => setText(""))
+      .catch(() => {
+        // Draft is kept; the error strip explains what happened.
+      })
+      .finally(() => {
+        setSending(false);
+        restoreUnclaimedFocus();
+      });
+  }
+
+  const placeholder = !connected
+    ? i18n._("Connecting…")
+    : view.turnActive
+      ? i18n._("Captain is working…")
+      : awaiting
+        ? replyPlaceholder(view.pendingQuestionPlayer)
+        : i18n._("Message the Captain…");
+
+  return (
+    // The composer yields inside its column (DR-041 §9): what it holds
+    // scrolls in its own frame rather than pushing the transcript away
+    // and the action row out of the window.
+    <div className="flex min-h-min flex-col gap-1.5">
+      {error ? (
+        <div
+          data-testid="run-error"
+          role="status"
+          className="flex shrink-0 items-start gap-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300"
+        >
+          <span className="min-w-0 flex-1">{error}</span>
+          <button
+            type="button"
+            onClick={onDismissError}
+            className="flex h-6 w-6 items-center justify-center rounded text-red-600 hover:bg-red-100 dark:text-red-400 dark:hover:bg-red-900"
+            title={i18n._({ id: "Dismiss", comment: "act: close the error strip" })}
+            aria-label={i18n._("Dismiss error")}
+          >
+            <Icon name="close" className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ) : null}
+      {awaiting ? (
+        <div
+          data-testid="boss-reply-banner"
+          className="shrink-0 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+        >
+          {view.pendingQuestionPlayer ? (
+            // One sentence, with the asking player's name inside it, so
+            // a language may put the name where it belongs.
+            <Rich
+              text={i18n._(
+                "<0>{player}</0> is waiting. Answer or ask Captain to explain.",
+                { player: view.pendingQuestionPlayer },
+              )}
+              components={[
+                <span key="player" className="font-mono font-semibold" />,
+              ]}
+            />
+          ) : (
+            i18n._("A reply is needed. Answer or ask Captain to explain.")
+          )}
+        </div>
+      ) : null}
+      {composer.queued.length > 0 ? (
+        // A few entries tall, its own positioned scroll box, its end
+        // in view: the queue never grows the composer past its share
+        // of the column (run-view-8, DR-041 §9).
+        <div
+          ref={queueRef}
+          data-testid="queue-indicator"
+          className="relative flex max-h-40 min-h-0 flex-col items-end gap-1 overflow-y-auto"
+        >
+          {composer.queued.map((entry, index) => (
+            <div
+              key={index}
+              className="flex max-w-[85%] shrink-0 flex-col rounded-2xl rounded-br-md border border-brand-300 px-3 py-1.5 text-sm text-brand-700 dark:border-brand-700 dark:text-brand-300"
+            >
+              {/* An unbroken token breaks anywhere rather than
+                  widening the frame (run-view-3). */}
+              <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">
+                {entry.text || entry.attachments?.map((file) => file.name ?? i18n._("Attachment")).join(", ")}
+              </span>
+              <span className="mt-0.5 flex items-center gap-1 text-xs text-neutral-500">
+                {entry.intentId !== undefined ? (
+                  <span
+                    data-testid="queued-intent-chip"
+                    className="rounded-full border border-brand-300 px-1.5 font-medium text-brand-600 dark:border-brand-700 dark:text-brand-300"
+                  >
+                    {i18n._({
+                      id: "intent",
+                      comment: "chip on a queued message: it carries a queued intent",
+                    })}
+                  </span>
+                ) : null}
+                {i18n._("sends when this turn ends")}
+                <button
+                  type="button"
+                  title={i18n._("Remove this message")}
+                  aria-label={i18n._("Remove this queued message")}
+                  onClick={() => onRemoveQueued(index)}
+                  className="flex h-6 w-6 items-center justify-center rounded text-neutral-500 hover:bg-neutral-100 hover:text-red-500 dark:hover:bg-neutral-800"
+                >
+                  <Icon name="close" className="h-3 w-3" />
+                </button>
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <div className="relative flex min-h-min flex-col">
+        {slash ? (
+          <SlashMenuList
+            items={slash}
+            activeIndex={Math.min(slashIndex, slash.length - 1)}
+            onPick={(playbook) => insertCommand(playbook.command)}
+            onCompileNew={onCompileNew}
+          />
+        ) : null}
+        <ComposerBox
+          attachments={attachments ? { ...attachments, disabled: attachments.disabled || sending || !connected || view.turnActive } : undefined}
+          field={
+            <ComposerField
+              fieldRef={textareaRef}
+              data-testid="boss-composer"
+              autoFocus
+              value={text}
+              aria-controls={slash ? "slash-listbox" : undefined}
+              aria-activedescendant={
+                slash
+                  ? `slash-option-${Math.min(slashIndex, slash.length - 1)}`
+                  : undefined
+              }
+              onChange={(event) => {
+                setText(event.target.value);
+                setSlashIndex(0);
+                setSlashDismissed(false);
+                setQueuedNote(undefined);
+                // Emptying the composer detaches the staged intent
+                // (DR-035): sending something else stamps nothing.
+                if (staged && event.target.value.trim().length === 0 && !attachments?.files.length) {
+                  onDetachStaged?.();
+                }
+              }}
+              onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing || event.keyCode === 229)
+                  return;
+                if (slash) {
+                  if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    setSlashIndex((index) => (index + 1) % slash.length);
+                    return;
+                  }
+                  if (event.key === "ArrowUp") {
+                    event.preventDefault();
+                    setSlashIndex(
+                      (index) => (index - 1 + slash.length) % slash.length,
+                    );
+                    return;
+                  }
+                  if (event.key === "Tab" || event.key === "Enter") {
+                    event.preventDefault();
+                    insertCommand(
+                      slash[Math.min(slashIndex, slash.length - 1)].command,
+                    );
+                    return;
+                  }
+                  if (event.key === "Escape") {
+                    // Hide the menu, never the draft (DR-010 §4).
+                    event.preventDefault();
+                    setSlashDismissed(true);
+                    return;
+                  }
+                }
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  submit();
+                }
+              }}
+              placeholder={placeholder}
+              // The field closes only while a turn runs (DR-085); a
+              // block on sending — an uncertain turn awaiting Restore —
+              // keeps the draft typable (run-view-110).
+              disabled={!connected || view.turnActive}
+            />
+          }
+          caption={
+            <ComposerCaption
+              staged={staged}
+              onDetachStaged={onDetachStaged}
+              note={queuedNote}
+            />
+          }
+          secondary={
+            onQueueInstead && !staged ? (
+              <button
+                type="button"
+                data-testid="queue-intent-button"
+                title={i18n._("Add this to the project's Up next without sending it")}
+                onClick={() => {
+                  if (!canSubmitContent(text, attachments?.files) || sending) return;
+                  setSending(true);
+                  onQueueInstead(text)
+                    .then(() => {
+                      setText("");
+                      setQueuedNote(
+                        i18n._("Added to Up next — see the project's Overview."),
+                      );
+                    })
+                    .catch(() => {
+                      // Draft kept; the error strip explains.
+                    })
+                    .finally(() => {
+                      setSending(false);
+                      textareaRef.current?.focus();
+                    });
+                }}
+                disabled={!canSubmitContent(text, attachments?.files) || sending || !connected || !!blockedReason || view.turnActive}
+                className={SECONDARY_CLASS}
+              >
+                {i18n._("Add to Up next")}
+              </button>
+            ) : null
+          }
+          actions={
+            <>
+              {view.turnActive ? (
+                <button
+                  type="button"
+                  data-testid="abort-button"
+                  onClick={() => {
+                    setAborting(true);
+                    onAbort();
+                    // The control leaves with the turn it stops; focus
+                    // stays in the conversation, never on <body>
+                    // (run-view-50).
+                    textareaRef.current?.closest('[data-testid="captain-column"]')
+                      ?.querySelector<HTMLElement>('[data-testid="captain-pane"]')?.focus();
+                  }}
+                  disabled={aborting || !connected}
+                  title={!connected ? i18n._("Not connected") : undefined}
+                  className="rounded-md border border-red-300 px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 disabled:opacity-40 dark:border-red-800 dark:text-red-400 dark:hover:bg-red-950"
+                >
+                  {aborting
+                    ? i18n._("Aborting…")
+                    : i18n._({ id: "Abort", comment: "act: stop the running turn" })}
+                </button>
+              ) : null}
+              <button
+                type="button"
+                data-testid="send-button"
+                onClick={submit}
+                className={PRIMARY_CLASS}
+                disabled={!canSubmitContent(text, attachments?.files) || sending || !connected || !!blockedReason || view.turnActive}
+                title={
+                  !connected
+                    ? i18n._("Not connected")
+                    : view.turnActive
+                      ? i18n._("Captain is working…")
+                      : sendKeys()
+                }
+              >
+                {sending
+                  ? i18n._("Sending…")
+                  : i18n._({ id: "Send", comment: "act: send the typed message" })}
+              </button>
+            </>
+          }
+        />
+      </div>
+    </div>
+  );
+}

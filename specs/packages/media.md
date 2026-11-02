@@ -1,0 +1,151 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai> -->
+
+# media: Content Transfer and Browser Preparation
+
+## Intent
+
+This package defines Spex's application content boundary under [DR-097](../decisions/097-media-and-browser-tools-across-hosts.md): authenticated byte transfer, application asset ownership, and browser capability preparation.
+Playbook owns the shared immutable asset format and session content lifecycle; Cligent owns adapter capability facts and browser preparation.
+The public application vocabulary is the core WebSocket protocol, project intents, local authoring drafts, and session attachment references.
+
+## External Behavior
+
+### media-1
+
+When an authenticated client transfers a file through the core endpoint [[core-service-24](core-service.md#core-service-24)], the core shall accept its bytes through bounded upload commands rather than reading a client-supplied filesystem path:
+
+| Boundary | Limit |
+| --- | --- |
+| One file | 100 MiB |
+| One byte chunk | 64 KiB |
+| One accepted turn | 16 files and 256 MiB total |
+| Incomplete uploads in one core | 32 files and 1 GiB declared bytes |
+| Idle incomplete upload | expires after 30 minutes |
+
+### media-2
+
+When an upload operation is admitted, the core shall apply this transaction protocol:
+
+| Command or state | Outcome |
+| --- | --- |
+| Begin with client UUID, project or draft owner, display name, MIME type, and byte length | reserve one private staging file and return the upload ID and received offset |
+| Begin, first or repeated, naming an owner that does not stand — a project or session the core does not hold, or an authoring session whose file records another instance than the one named | reject as not found, reserving no staging file |
+| Repeated begin with identical ID and metadata | return the existing offset or completed reference |
+| Reused ID with different metadata | reject without modifying existing content |
+| Chunk at received offset | append validated base64 bytes and acknowledge the new offset |
+| Repeated prior chunk with identical bytes | acknowledge without duplicating bytes |
+| Gap, conflicting retry, malformed base64, or declared-length overflow | reject without advancing the offset |
+| Finish after exact declared length | publish the shared immutable owner asset before returning its reference |
+| Repeated finish | return the same completed reference |
+| Cancel or expiry | remove only incomplete staging bytes; completed owner assets remain |
+| Disconnect and reconnect to the same running core | permit the same begin request to resume within the expiry window |
+| Core restart | after acquiring the exclusive home lease and before accepting uploads, remove prior UUID staging lifetimes without following symbolic links or touching completed owner assets, refuse unsafe staging paths, and report incomplete transfer unavailable so the client can retry from its retained file |
+
+### media-3
+
+When a client reads a media asset, the core shall resolve the requested project, draft, or session owner and opaque content digest through the shared asset store, verify its stored identity and byte integrity, and return bounded byte ranges with its descriptor, rejecting unknown owners, missing or changed content, and filesystem escapes without fetching external URLs.
+
+### media-4
+
+When application content becomes durable, the core shall use the shared owner-scoped asset primitives through this ownership matrix:
+
+| Content | Owner and lifetime |
+| --- | --- |
+| Initial messages, session follow-ups before acceptance, queued intents | The intent's own asset directory beside its file [[storage-4](storage.md#storage-4)]; a session's first message before its intent exists under the spex repository's staging owner |
+| Authoring input and output | The authoring session's asset directory beside its file, the owner naming the session's instance [[storage-23](storage.md#storage-23)] |
+| Accepted session input and observed output | Playbook session asset bundle |
+| Intent-to-session handoff | Copy and validate bytes into the session before acknowledging acceptance; retain independent project ownership |
+| Edited intent | Keep the bytes its references still name; a removed intent's directory goes with its file |
+| Deleted owner | Remove its assets with that owner's guarded deletion; preserve copies in other owners |
+
+### media-5
+
+When a Boss submission, queued intent edit, or authoring queue entry contains attachments, the core shall preserve its exact text and ordered immutable references through admission, staging, dispatch, failure, retry, and recovery, accepting empty text only with at least one attachment and deriving a display title from attachment names without inventing prompt text:
+
+- an empty-text Boss submission naming a queued intent is admitted with that intent's own attachments, which the client need not send again, and is refused as an invalid request when the intent holds none;
+- admission accepts any valid media type without checking it against the acting adapter's attachment transport, so a turn carrying a type that adapter cannot take fails at that player's call with the adapter's attachment refusal reported through the ordinary failure path, while the contextual capability facts [[media-7](#media-7)] stay available to clients that warn earlier.
+
+### media-6
+
+When a record with durable input or output media reaches a client, the core shall expose the trusted asset reference and original actor/turn/call identity for presentation, preserving unavailable or external media as explicit states without promoting hidden controller traffic or reconstructing assets from Markdown paths.
+
+### media-7
+
+When a client requests agent capabilities, the core shall return Cligent's contextual attachment, browser, approval, and output transport facts for the proposed agent settings and selected project or draft context, without downloads, provider prompts, or inferring support from adapter names.
+
+### media-8
+
+When a client requests browser preparation, the core shall run Cligent's cancellable preparation with a fifteen-minute overall budget for the same settings and context, relay checking/installing/launching progress and the typed final result to that client, and abort the owned preparation when the client cancels or disconnects, without enabling browser access or changing configuration:
+
+- a request repeating the operation id of a preparation running joins it, answering with its result;
+- a request with another operation id runs its own preparation beside it, from the same client or another, the shared browser cache being Cligent's to keep.
+
+### media-9
+
+When browser access is configured for an agent, the core shall preserve its boolean setting through config edits and effective session settings for the next accepted turn, default omission to off, and allow a session override to be reset to configuration without changing structural session identity or weakening existing permissions.
+
+### media-17
+
+When content becomes an application owner's asset — a finished upload, attachments taken into an intent, or an authoring turn's output — the core shall prepare and verify it privately through the shared asset primitives, then publish it into the owner in one step at that instant, refusing it as unavailable where the owner no longer stands, or no longer lies in the clone it lay in at the upload's begin, and creating only folders beneath that clone, so that no publication recreates a removed or moved owner or writes into a successor ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)):
+
+- a file already in the owner stands, its name being its content's digest, and the content lands before its descriptor;
+- a session's own assets stay under Playbook's session lease, and historical project intent assets keep their retention [[media-4](#media-4)].
+
+### media-20
+
+When an application owner is removed, the core shall invalidate the owner's upload identities through their existing retry window and close its cached readers at the removal's own instant, waiting for no upload, validation or reader, while a removal its owner refuses invalidates nothing, leaving those uploads resumable ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)).
+
+## Verification
+
+### media-10
+
+When real WebSocket clients transfer fixture files to a temporary core home, integration verification shall assert authorization and byte limits [[media-1](#media-1)], resumable/idempotent upload transactions, cleanup after a terminated core restarts only with the home lease, and refusal of symbolic-link staging paths without changing their targets [[media-2](#media-2)], exact bounded reads and damaged-content refusal [[media-3](#media-3)], and independent owner copies through deletion [[media-4](#media-4)].
+
+### media-11
+
+When a fresh installed app submits files through initial, session, queued-intent, and authoring flows, acceptance verification shall assert preserved text and bytes through retry/reopen [[media-5](#media-5)] and authentic visible media with unavailable/external fallbacks and unchanged hidden-control visibility [[media-6](#media-6)].
+
+### media-12
+
+When macOS Electron and headless Linux hosts request capabilities and prepare their managed browser, acceptance verification shall assert side-effect-free contextual facts [[media-7](#media-7)], actual launch/screenshot readiness, progress, cancellation, actionable missing-prerequisite outcomes [[media-8](#media-8)], and next-turn browser settings with tool-free controls and legacy omission remaining off [[media-9](#media-9)].
+
+### media-13
+
+When a real WebSocket client uploads a project file and submits an attachment-only session turn, integration verification shall assert that session bytes are readable immediately after acceptance, survive a core restart, and can be deleted with the session while the independent project copy remains [[media-4](#media-4)], with the exact empty prompt and immutable reference preserved in replay and the attachment name used as the session title [[media-5](#media-5)].
+
+### media-19
+
+When a real WebSocket client queues an attachment-only intent and dispatches it by an empty-text session submission naming only that intent, integration verification shall assert the submission is accepted with the intent's attachment readable through the session and preserved in the turn's replayed start, while an empty-text submission naming a text-only intent is refused as an invalid request, starting no turn and leaving that intent queued [[media-5](#media-5)].
+
+### media-14
+
+When a real WebSocket client changes browser configuration and a mutable session override, integration verification shall assert the next working-agent call receives each effective setting, the override survives a core restart without editing configuration, clearing it restores inheritance, and clearing configuration restores off, while session identity, existing permissions, and tool-free controls remain intact [[media-9](#media-9)].
+
+### media-15
+
+When served UI journeys upload decodable fixture images through the real core with substituted provider replies, acceptance verification shall assert this content lifecycle matrix:
+
+- File picker, clipboard paste, and drag/drop: ordered attachment-only session admission preserves exact empty text, names, and bytes after a core restart [[media-5](#media-5)].
+- Lost chunk acknowledgement: the retained browser file retries with the same transfer identity after reconnect, without duplicating committed bytes [[media-2](#media-2)].
+- Queued follow-up: editing its text, removing it with Undo, and reopening preserves the attached asset [[media-5](#media-5)].
+- Authoring: attachment-only input and a native media event render from owned bytes after restart with recorded provenance and no inline binary transcript data [[media-4](#media-4)] [[media-6](#media-6)].
+
+### media-16
+
+When a fresh installed Desktop uses a signed-in native agent to inspect an owned loopback page, live acceptance verification shall assert this end-to-end evidence flow:
+
+- Explicit setup proves browser readiness without saving its choice, followed by a separate Browser enable/save for the Inspector [[media-8](#media-8)] [[media-9](#media-9)].
+- A real `/inspect` turn yields native screenshot bytes correlated to the successful screenshot call after navigation to the owned fixture and a substantive Captain explanation of an observable fixture issue, with authentic worker/invocation provenance beside the rendered figure [[media-6](#media-6)].
+- Reopening the app retains the same readable image asset and Captain explanation [[media-4](#media-4)] [[media-6](#media-6)], with a successful root terminal, a settled physical receipt reporting no change, and an independent unchanged fixture-repository comparison.
+- A second fresh session with Browser explicitly off receives an image through the file picker, preserving its exact bytes [[media-5](#media-5)], and the native Inspector's same working invocation finishes successfully and identifies a random visible alphanumeric token in its visible text, absent from the prompt and filename, with Captain relaying that token, the input image and explanation retained after reopening [[media-4](#media-4)] [[media-6](#media-6)], a successful root terminal, and another unchanged repository receipt.
+- A decoded, repainted, fitted Captain view keeps the image and substantive explanation visible within its scrollport and is retained as screenshot evidence outside the disposable app profile [[media-6](#media-6)].
+- The default live check starts with an empty owned browser cache; an explicitly selected installed cache supplies only the managed runtime's matching revisions as independent owned copies, records their versions and byte provenance with `freshBrowserCache: false`, and still performs real UI preparation [[media-8](#media-8)], without replacing separate cold-cache host acceptance.
+
+### media-18
+
+When real owner stores and authenticated core clients race media publication with owner removal and moves, integration verification shall assert that a removal completes while a publication's private preparation stands held [[media-20](#media-20)], the publication then refused and recreating nothing, another owner continuing [[media-17](#media-17)]; that a publication whose clone moved lands where the clone now lies without recreating the former one, one whose clone was replaced by a successor while it was prepared or before its finish is refused, a retried finish refused alike, leaving the successor untouched, and one whose clone went is refused [[media-17](#media-17)], a repeated begin naming the replaced owner refused [[media-2](#media-2)]; that an adoption into an intent whose clone was replaced while its copy was prepared is refused, leaving the successor untouched [[media-17](#media-17)]; that a removal completes while a validation and a reader's close stand held [[media-20](#media-20)], the validation recreating nothing [[media-17](#media-17)]; that old incomplete or completed upload identities cannot resume after their owner stands again [[media-20](#media-20)], nor a begin naming the former instance be admitted [[media-2](#media-2)]; that an authoring turn's output prepared while its session was deleted and made again under its id is refused, nothing landing in the successor and no private stage left [[media-17](#media-17)]; and that a removal its owner refuses leaves an in-flight upload resumable from its received offset to a successful finish [[media-20](#media-20)].
+
+### media-21
+
+When a real WebSocket client asks the core for browser preparation through a substitute adapter whose preparation can block until canceled, integration verification shall assert that a request repeating a running operation's id joins it with one preparation run, that a request with another id runs its own beside it, that the client's cancel ends its own preparation and a disconnect ends the rest, and that no configuration is written [[media-8](#media-8)].

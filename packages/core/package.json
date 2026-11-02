@@ -1,0 +1,61 @@
+{
+  "name": "@sublang/spex-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Spex core service: headless playbook host behind a typed WebSocket API",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sublang-ai/spex.git",
+    "directory": "packages/core"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./protocol": "./dist/protocol.js",
+    "./language": "./dist/language.js",
+    "./directives": "./dist/directives.js",
+    "./testing": "./dist/testing/index.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "!dist/**/*.test.js",
+    "dist/**/*.d.ts",
+    "!dist/**/*.test.d.ts",
+    "assets/"
+  ],
+  "scripts": {
+    "build": "npm run build -w @sublang/spex && npm run i18n:check && lingui compile --strict --typescript && node scripts/stage-academy.mjs && node scripts/stage-builtins.mjs && node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
+    "dev:fake": "npm run build && node dist/bin/dev-core.js --fake",
+    "i18n:extract": "lingui extract --clean",
+    "i18n:check": "node ../../scripts/i18n-check.mjs",
+    "test": "npm run i18n:check && node scripts/stage-academy.mjs && node scripts/stage-builtins.mjs && node scripts/run-tests.cjs",
+    "test:integration": "node scripts/run-tests.cjs \"\\.integration\\.test\\.js$\""
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "dependencies": {
+    "@lingui/core": "^6.7.0",
+    "@openclaw/fs-safe": "0.26.13",
+    "@sublang/cligent": "^0.36.2",
+    "@sublang/playbook": "^18.1.1",
+    "@sublang/spex": "*",
+    "better-sqlite3": "^12.11.1",
+    "esbuild": "^0.28.2",
+    "ws": "^8.18.0",
+    "yaml": "^2.8.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@lingui/cli": "^6.7.0",
+    "@lingui/format-po": "^6.7.0",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.4.0",
+    "@types/ws": "^8.18.0",
+    "typescript": "^7.0.2"
+  },
+  "optionalDependencies": {
+    "@vscode/windows-process-tree": "0.8.0"
+  }
+}

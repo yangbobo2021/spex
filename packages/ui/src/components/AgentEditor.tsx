@@ -1,0 +1,587 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// The one shared agent editor (DR-019): adapter (with readiness
+// dots), model and adapter-scoped effort on one row, a subagent model
+// and a subagent effort on the next where the adapter serves one
+// (DR-093, DR-095), a fast-mode switch where the
+// runtime declares it (DR-038), permission mode and writable paths.
+// It edits a local draft and emits a merge patch on save;
+// AgentEditorPopover wraps it for the at-hand flows (DR-007/009).
+
+import { useEffect, useId, useRef, useState, type RefObject } from "react";
+import {
+  adapterNameSchema,
+  type AdapterName,
+  type AgentBlockInput,
+  type ReadinessEntry,
+  type MediaUploadOwner,
+} from "@sublang/spex-core/protocol";
+
+import { agentChoosesLabel, useAgentOptions, modelTuning } from "../lib/agent-options.js";
+import { i18n } from "../i18n.js";
+import { ModelField } from "./ModelField.js";
+import { ModelDiscoveryStatus } from "./ModelDiscoveryStatus.js";
+import type { AgentPatch } from "../lib/config-ops.js";
+import { useFitInBox } from "../lib/popover-fit.js";
+import {
+  FAST_MODE_MARK,
+  noCheckNote,
+  readinessWord,
+  type ChipAgent,
+} from "./AgentChip.js";
+import { useBrowserTools } from "../lib/useBrowserTools.js";
+import { BrowserControl } from "./BrowserControl.js";
+import { Rich } from "./Rich.js";
+
+export const ADAPTERS = adapterNameSchema.options;
+
+const MODES = ["auto", "bypass", "none"] as const;
+type Mode = (typeof MODES)[number];
+
+/** What each permission mode means, in the reader's words
+ * (settings-10): the select alone says nothing about the stakes. Each
+ * is a thunk, never a string: a table read at module load would freeze
+ * the language the module was imported in (localization-4). */
+export const MODE_HELP: Record<Mode, () => string> = {
+  auto: () => i18n._("auto: the agent works on its own inside the repo, with the adapter's own protections on"),
+  bypass: () => i18n._("bypass: no permission prompts — sandboxed repos only"),
+  none: () => i18n._("none: the adapter's own default posture"),
+};
+
+function knownAdapter(adapter: string | undefined): AdapterName {
+  return (ADAPTERS as readonly string[]).includes(adapter ?? "")
+    ? (adapter as AdapterName)
+    : "claude";
+}
+
+/** The subagent model as the field holds it: "" for "Same as agent" —
+ * the omission and the literal `inherit` alike — `false` for "Off", or
+ * a model (DR-095). */
+function subagentModelOf(agent: ChipAgent | undefined): string | false {
+  const value = agent?.subagentModel;
+  return value === undefined || value === "inherit" ? "" : value;
+}
+
+function initialMode(agent: ChipAgent | undefined): Mode {
+  const mode = agent?.permissions?.mode;
+  return mode === "auto" || mode === "bypass" ? mode : "none";
+}
+
+type CarriedPermissions = Pick<
+  NonNullable<AgentBlockInput["permissions"]>,
+  "fileWrite" | "shellExecute" | "networkAccess"
+>;
+
+function carriedFrom(agent: AgentBlockInput | undefined): CarriedPermissions {
+  const permissions = agent?.permissions;
+  const carried: CarriedPermissions = {};
+  if (permissions?.fileWrite) carried.fileWrite = permissions.fileWrite;
+  if (permissions?.shellExecute)
+    carried.shellExecute = permissions.shellExecute;
+  if (permissions?.networkAccess)
+    carried.networkAccess = permissions.networkAccess;
+  return carried;
+}
+
+export interface AgentEditorProps {
+  /** The block the draft seeds from; a fresh assignment passes its
+   * default block. */
+  initial?: ChipAgent;
+  context?: MediaUploadOwner;
+  /** Adapter-keyed readiness entries; dots render when passed, and
+   * the fast-mode switch shows for adapters declaring it (DR-038). */
+  readiness?: ReadinessEntry[];
+  /** When set, offers "Same as Captain": copies the Captain's adapter,
+   * model, subagent model, effort, subagent effort, fast mode, and
+   * permissions into the draft. */
+  captain?: ChipAgent;
+  saveLabel?: string;
+  /** Creation forms save an untouched draft: the seeded block is
+   * already a deliberate choice, so there is nothing to dirty. */
+  allowUnchanged?: boolean;
+  onSave: (patch: AgentPatch) => Promise<unknown> | void;
+  onCancel?: () => void;
+}
+
+export function AgentEditor(props: AgentEditorProps) {
+  const { initial } = props;
+  const [adapter, setAdapter] = useState<AdapterName>(
+    knownAdapter(initial?.adapter),
+  );
+  const [model, setModel] = useState(initial?.model ?? "");
+  const [subagentModel, setSubagentModel] = useState<string | false>(subagentModelOf(initial));
+  const [subagentEffort, setSubagentEffort] = useState(initial?.subagentEffort ?? "");
+  const [effort, setEffort] = useState(initial?.effort ?? "");
+  const [fastMode, setFastMode] = useState(initial?.fastMode ?? false);
+  const [browser, setBrowser] = useState(initial?.browser ?? false);
+  const [mode, setMode] = useState<Mode>(initialMode(initial));
+  const [writablePaths, setWritablePaths] = useState(
+    (initial?.permissions?.writablePaths ?? []).join(", "),
+  );
+  // Unsurfaced permission policies ride along invisibly: the merge
+  // replaces the permissions object wholesale, so dropping them from
+  // the emitted patch would erase hand-written values.
+  const [carried, setCarried] = useState<CarriedPermissions>(() =>
+    carriedFrom(initial),
+  );
+  const [error, setError] = useState<string>();
+  const [busy, setBusy] = useState(false);
+
+  const paths = writablePaths.split(",").map((entry) => entry.trim()).filter(Boolean);
+  const permissions = {
+    ...carried,
+    ...(mode !== "none" ? { mode } : {}),
+    ...(paths.length ? { writablePaths: paths } : {}),
+  };
+  const browserTools = useBrowserTools({ adapter,
+    ...(model.trim() ? { model: model.trim() } : {}),
+    ...(subagentModel !== "" ? { subagentModel } : {}),
+    ...(subagentEffort ? { subagentEffort } : {}),
+    ...(effort ? { effort } : {}), ...(fastMode ? { fastMode } : {}),
+    ...(Object.keys(permissions).length > 0 || initial?.permissions ? { permissions } : {}),
+  }, props.context);
+
+  const readinessByAdapter = new Map(
+    (props.readiness ?? []).map((entry) => [entry.adapter, entry]),
+  );
+
+  const discovery = useAgentOptions(adapter);
+  const tuning = modelTuning(discovery.options, model);
+  const catalog = discovery.options?.discovery.status === "available" ? discovery.options.discovery : undefined;
+  const models = catalog?.models ?? [];
+  const modelLabelId = useId();
+  const subagentLabelId = useId();
+  const supportsFastMode = tuning.fastModeSupported ?? readinessByAdapter.get(adapter)?.fastModeSupported ?? false;
+  const invalidEffort = Boolean(discovery.options && effort && !tuning.efforts.includes(effort));
+  const invalidFastMode = Boolean(fastMode && discovery.options && !supportsFastMode);
+  // Offered where the adapter serves one or a choice stands, so a stale
+  // one is always clearable — fast mode's rule (DR-093).
+  const supportsSubagentModel = tuning.subagentModelSupported ?? readinessByAdapter.get(adapter)?.subagentModelSupported ?? false;
+  // The subagent effort stands where the subagent model does (DR-095).
+  const offersSubagent = supportsSubagentModel || subagentModel !== "" || Boolean(subagentEffort);
+  const invalidSubagentEffort = Boolean(discovery.options && subagentEffort && !tuning.subagentEfforts.includes(subagentEffort));
+
+  function pickAdapter(next: AdapterName): void {
+    if (next === adapter) return;
+    setAdapter(next);
+    setModel("");
+    setSubagentModel("");
+    setSubagentEffort("");
+    setEffort("");
+    setFastMode(false);
+  }
+
+  const dirty =
+    adapter !== knownAdapter(initial?.adapter) ||
+    model !== (initial?.model ?? "") ||
+    subagentModel !== subagentModelOf(initial) ||
+    subagentEffort !== (initial?.subagentEffort ?? "") ||
+    effort !== (initial?.effort ?? "") ||
+    fastMode !== (initial?.fastMode ?? false) ||
+    browser !== (initial?.browser ?? false) ||
+    mode !== initialMode(initial) ||
+    writablePaths !== (initial?.permissions?.writablePaths ?? []).join(", ");
+
+  // Unknown or unsupported support blocks only a browser this edit
+  // newly admits — turned on, or carried to another adapter — never a
+  // configured choice the reader keeps while saving other values
+  // (settings-44).
+  const browserUnadmitted = browser && !browserTools.supported &&
+    (!(initial?.browser ?? false) || adapter !== knownAdapter(initial?.adapter));
+
+  function save(): void {
+    // The emitted patch is the surfaced set only (DR-019): adapter,
+    // model, effort, permissions. `instruction` — and any other
+    // hand-written top-level key — is NEVER included; the core
+    // applies merge semantics, so absent keys survive as written.
+    // Permissions DO replace wholesale on merge, so the unsurfaced
+    // policies (fileWrite, shellExecute, networkAccess) are carried
+    // over from the source block. Clearing model or effort emits an
+    // explicit null, which unsets the key so the agent falls back to
+    // its adapter's default — blanking must mean what it shows.
+    const patch: AgentPatch = { adapter };
+    const trimmedModel = model.trim();
+    if (trimmedModel) patch.model = trimmedModel;
+    else if (initial?.model) patch.model = null;
+    // "Same as agent" is the omission, and "Off" the configured `false`
+    // kept only while it stands (DR-095): either is written only when it
+    // changes what the block holds.
+    if (subagentModel !== subagentModelOf(initial)) {
+      if (subagentModel === false) patch.subagentModel = false;
+      else if (subagentModel.trim()) patch.subagentModel = subagentModel.trim();
+      else patch.subagentModel = null;
+    }
+    if (subagentEffort) patch.subagentEffort = subagentEffort;
+    else if (initial?.subagentEffort) patch.subagentEffort = null;
+    if (effort) patch.effort = effort;
+    else if (initial?.effort) patch.effort = null;
+    // Fast mode is off by default, so the switch writes true or unsets
+    // the key (DR-038) — the same shape effort takes.
+    if (browser !== (initial?.browser ?? false)) patch.browser = browser;
+    if (fastMode) patch.fastMode = true;
+    else if (initial?.fastMode) patch.fastMode = null;
+    const permissions: NonNullable<AgentPatch["permissions"]> = {
+      ...carried,
+    };
+    if (mode !== "none") permissions.mode = mode;
+    const paths = writablePaths
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    if (paths.length > 0) permissions.writablePaths = paths;
+    if (Object.keys(permissions).length > 0 || initial?.permissions) {
+      patch.permissions = permissions;
+    }
+    setBusy(true);
+    setError(undefined);
+    Promise.resolve(props.onSave(patch))
+      .catch((cause: Error) => setError(cause.message))
+      .finally(() => setBusy(false));
+  }
+
+  return (
+    <div
+      data-testid="agent-editor"
+      className="flex flex-col gap-2 rounded-lg border border-brand-200 bg-brand-50/40 p-3 dark:border-brand-900 dark:bg-brand-950/30"
+    >
+      <div className="flex flex-col gap-0.5 text-sm">
+        <span className="text-xs text-neutral-500">{i18n._({ id: "Adapter", comment: "which agent runtime an agent runs on" })}</span>
+        <div role="radiogroup" aria-label={i18n._({ id: "Adapter", comment: "which agent runtime an agent runs on" })} className="flex flex-wrap gap-1">
+          {ADAPTERS.map((name) => {
+            const entry = readinessByAdapter.get(name);
+            return (
+              <button
+                key={name}
+                type="button"
+                role="radio"
+                aria-checked={adapter === name}
+                data-testid={`agent-adapter-${name}`}
+                onClick={() => pickAdapter(name)}
+                className={`flex items-center gap-1 rounded-md border px-2 py-1 text-xs ${
+                  adapter === name
+                    ? "border-brand-400 bg-brand-100 font-medium text-brand-700 dark:border-brand-700 dark:bg-brand-950 dark:text-brand-300"
+                    : "border-neutral-300 text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                }`}
+              >
+                {/* An adapter's id is its name; what the dot says about
+                    it is a text, and its requirement is the core's. */}
+                {name}
+                {entry ? (
+                  entry.ready === true ? (
+                    <span aria-hidden className="text-emerald-500" title={readinessWord(true)}>
+                      ●
+                    </span>
+                  ) : entry.ready === false ? (
+                    <span
+                      aria-hidden
+                      className="text-red-500"
+                      title={entry.requirement ?? readinessWord(false)}
+                    >
+                      ●
+                    </span>
+                  ) : (
+                    <span
+                      aria-hidden
+                      className="text-neutral-500"
+                      title={entry.requirement ?? noCheckNote()}
+                    >
+                      ●
+                    </span>
+                  )
+                ) : null}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      {/* A model and its effort share a row, the subagent model and its
+          effort the next — each pair the chip's own "model @ effort" —
+          and each pair stacks where the editor is narrower than the
+          row needs, as at the 320-pixel floor (settings-1, DR-095,
+          DR-041). Not <label>s: a model's list sits inside its field,
+          and a label would pass every press on the list to the trigger. */}
+      <div className="@container">
+        <div data-testid="agent-tuning-rows" className="grid grid-cols-1 gap-2 text-sm @xs:grid-cols-2">
+          <div data-testid="agent-model-cell" className="flex min-w-0 flex-col gap-0.5">
+            <span id={modelLabelId} className="text-xs text-neutral-500">{i18n._("Model (optional)")}</span>
+            <ModelField
+              // Another adapter is another catalog: the field starts over
+              // on the default its switch reset the model to (settings-34).
+              key={adapter}
+              value={model}
+              models={models}
+              {...(catalog?.defaultModel ? { defaultModel: catalog.defaultModel } : {})}
+              onChange={setModel}
+              labelId={modelLabelId}
+              testId="agent-model"
+            />
+          </div>
+          <label data-testid="agent-effort-cell" className="flex min-w-0 flex-col gap-0.5">
+            <span className="text-xs text-neutral-500">{i18n._("Reasoning effort")}</span>
+            <select
+              data-testid="agent-effort"
+              value={effort}
+              onChange={(event) => setEffort(event.target.value)}
+              className="w-full min-w-0 rounded border border-neutral-300 bg-white px-2 py-1 dark:border-neutral-700 dark:bg-neutral-900"
+            >
+              {/* An effort key is the adapter's wire word; only what
+                  stands beside it is a text. */}
+              <option value="">{i18n._({ id: "(default)", comment: "effort choice: leave the adapter's own default" })}</option>
+              {effort && !tuning.efforts.includes(effort) && <option value={effort}>{discovery.options ? i18n._("{effort} (unsupported)", { effort }) : i18n._("{effort} (current)", { effort })}</option>}
+              {tuning.efforts.map((name) => (
+                <option key={name} value={name}>
+                  {tuning.additionalEfforts.includes(name) ? i18n._("{effort} (adapter-wide)", { effort: name }) : name}
+                </option>
+              ))}
+            </select>
+          </label>
+          {offersSubagent ? (
+            <>
+              <div data-testid="agent-subagent-model-cell" className="flex min-w-0 flex-col gap-0.5">
+                <span id={subagentLabelId} className="text-xs text-neutral-500">{i18n._({ id: "Subagent model", comment: "the field choosing the model an agent's subagents run on" })}</span>
+                {/* The same list as the model, under "Same as agent" —
+                    the agent's own model, so no default model beside it —
+                    and "Off" only while a `false` stands, in the block or
+                    in the draft, as a copied Captain's may. */}
+                <ModelField
+                  key={adapter}
+                  value={subagentModel === false ? "" : subagentModel}
+                  models={models}
+                  onChange={setSubagentModel}
+                  labelId={subagentLabelId}
+                  testId="agent-subagent-model"
+                  subagent="empty"
+                  {...(initial?.subagentModel === false || subagentModel === false
+                    ? { off: { selected: subagentModel === false, onSelect: () => setSubagentModel(false) } }
+                    : {})}
+                />
+              </div>
+              <label data-testid="agent-subagent-effort-cell" className="flex min-w-0 flex-col gap-0.5">
+                <span className="text-xs text-neutral-500">{i18n._({ id: "Subagent effort", comment: "the field choosing the reasoning effort an agent's subagents run at" })}</span>
+                <select
+                  data-testid="agent-subagent-effort"
+                  value={subagentEffort}
+                  onChange={(event) => setSubagentEffort(event.target.value)}
+                  className="w-full min-w-0 rounded border border-neutral-300 bg-white px-2 py-1 dark:border-neutral-700 dark:bg-neutral-900"
+                >
+                  <option value="">{agentChoosesLabel()}</option>
+                  {subagentEffort && !tuning.subagentEfforts.includes(subagentEffort) && <option value={subagentEffort}>{discovery.options ? i18n._("{effort} (unsupported)", { effort: subagentEffort }) : i18n._("{effort} (current)", { effort: subagentEffort })}</option>}
+                  {tuning.subagentEfforts.map((name) => <option key={name} value={name}>{name}</option>)}
+                </select>
+              </label>
+            </>
+          ) : null}
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-2 text-sm">
+        {(supportsFastMode || fastMode) ? (
+          <label className="col-span-2 flex items-center gap-2">
+            <input
+              type="checkbox"
+              data-testid="agent-fast-mode"
+              checked={fastMode}
+              onChange={(event) => setFastMode(event.target.checked)}
+              className="accent-brand-600"
+            />
+            {/* The label carries the mark inside it, so a translation
+                places the mark rather than being assembled around it. */}
+            <span>
+              <Rich
+                text={
+                  invalidFastMode
+                    ? i18n._("Fast mode <0/> (unsupported)")
+                    : i18n._("Fast mode <0/>")
+                }
+                components={[<span aria-hidden key="mark">{FAST_MODE_MARK}</span>]}
+              />
+            </span>
+            <span className="text-xs text-neutral-500">
+              {tuning.fastModeKnown ? (supportsFastMode ? i18n._("Supported by this model") : i18n._("Not supported by this model")) : i18n._("Adapter option; model support unverified")}
+            </span>
+          </label>
+        ) : null}
+        <label className="flex flex-col gap-0.5">
+          <span className="text-xs text-neutral-500">{i18n._("Permission mode")}</span>
+          <select
+            data-testid="agent-mode"
+            value={mode}
+            onChange={(event) => setMode(event.target.value as Mode)}
+            className="rounded border border-neutral-300 bg-white px-2 py-1 dark:border-neutral-700 dark:bg-neutral-900"
+          >
+            {/* A mode's own word is what the config file carries; the
+                gloss beside it is a text. */}
+            <option value="auto">{i18n._("auto (protected)")}</option>
+            <option value="bypass">{i18n._({ id: "bypass", comment: "permission mode: no prompts at all" })}</option>
+            <option value="none">{i18n._("none (adapter default)")}</option>
+          </select>
+          <span
+            data-testid="agent-mode-help"
+            className="text-xs text-neutral-500"
+          >
+            {MODE_HELP[mode]()}
+          </span>
+        </label>
+        <label className="flex flex-col gap-0.5">
+          <span className="text-xs text-neutral-500">
+            {i18n._("Writable paths (comma-separated)")}
+          </span>
+          <input
+            data-testid="agent-paths"
+            value={writablePaths}
+            onChange={(event) => setWritablePaths(event.target.value)}
+            placeholder={i18n._({ id: "e.g. .git, docs/generated", comment: "placeholder of the writable-paths field; the paths are examples" })}
+            className="rounded border border-neutral-300 bg-white px-2 py-1 dark:border-neutral-700 dark:bg-neutral-900"
+          />
+          <span className="text-xs text-neutral-500">
+            <Rich
+              text={i18n._(
+                "Repo-relative paths the agent may write under auto mode beyond its usual set — e.g. <0>.git</0> for commits",
+              )}
+              components={[<span className="font-mono" key="path" />]}
+            />
+          </span>
+        </label>
+      </div>
+      <BrowserControl enabled={browser} supported={browserTools.supported}
+        unsupportedReason={browserTools.unsupportedReason} outputNote={browserTools.outputNote} approvalNote={browserTools.approvalNote} preparation={browserTools.preparation}
+        disabled={busy} onChange={setBrowser} onPrepare={browserTools.prepare} onCancel={browserTools.cancel} />
+      {browserTools.capabilityError && <button type="button" onClick={browserTools.refresh} className="self-start text-xs underline">{i18n._("Retry browser support check")}</button>}
+      <ModelDiscoveryStatus state={discovery} />
+      {!tuning.effortKnown && <p className="text-xs text-neutral-500">{i18n._("Effort options apply to the adapter; support for this model is unverified.")}</p>}
+      {invalidEffort && <p role="alert" className="text-xs text-red-600">{i18n._("Choose a listed effort or the provider default.")}</p>}
+      {invalidSubagentEffort && <p role="alert" className="text-xs text-red-600">{i18n._("Choose a listed subagent effort, or let the agent choose.")}</p>}
+      {invalidFastMode && <p role="alert" className="text-xs text-red-600">{i18n._("Turn off fast mode for this selection.")}</p>}
+      {error ? (
+        <div className="rounded border border-red-300 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
+          {error}
+        </div>
+      ) : null}
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          data-testid="agent-save"
+          disabled={busy || browserUnadmitted || invalidEffort || invalidSubagentEffort || invalidFastMode || (!dirty && !props.allowUnchanged)}
+          onClick={save}
+          className="rounded-md bg-brand-600 px-3 py-1 text-sm font-medium text-white hover:bg-brand-500 disabled:opacity-40"
+        >
+          {busy ? i18n._({ id: "Saving…", comment: "a save is in flight" }) : (props.saveLabel ?? i18n._({ id: "Save", comment: "commit the edits in this editor" }))}
+        </button>
+        {props.onCancel ? (
+          <button
+            type="button"
+            data-testid="agent-cancel"
+            onClick={props.onCancel}
+            className="rounded-md px-3 py-1 text-sm text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200"
+          >
+            {i18n._({ id: "Cancel", comment: "leave an editor without saving" })}
+          </button>
+        ) : null}
+        {props.captain ? (
+          <button
+            type="button"
+            data-testid="agent-same-as-captain"
+            title={i18n._("Copies the Captain's adapter, model, effort, subagent model, subagent effort, fast mode, browser, and permissions")}
+            onClick={() => {
+              const captain = props.captain!;
+              const nextAdapter = knownAdapter(captain.adapter);
+              setAdapter(nextAdapter);
+              setModel(captain.model ?? "");
+              setSubagentModel(subagentModelOf(captain));
+              setSubagentEffort(captain.subagentEffort ?? "");
+              setEffort(captain.effort ?? "");
+              setFastMode(Boolean(captain.fastMode));
+              setBrowser(Boolean(captain.browser));
+              setMode(initialMode(captain));
+              setWritablePaths(
+                (captain.permissions?.writablePaths ?? []).join(", "),
+              );
+              setCarried(carriedFrom(captain));
+            }}
+            className="ml-auto rounded-md border border-neutral-300 px-2.5 py-1 text-xs text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+          >
+            {i18n._("Same as Captain")}
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+export interface AgentEditorPopoverProps extends AgentEditorProps {
+  title: string;
+  /** Open downward instead of upward (for anchors near a scroll top). */
+  direction?: "up" | "down";
+  /** The trigger element; clicks inside it are not outside-closes. */
+  anchorRef?: RefObject<HTMLElement | null>;
+  onClose: () => void;
+}
+
+/** The at-hand agent editor (DR-007/009): an anchored popover
+ * carrying the full editor, so tuning an agent never forces a
+ * surface switch. Focus discipline per DR-010 §6: focus moves into
+ * the dialog on mount and returns to the opener on unmount; Escape
+ * and outside clicks close. It lies inside the box that must show it
+ * at every width, however small the anchor it hangs from
+ * (settings-33). */
+export function AgentEditorPopover({
+  title,
+  direction,
+  anchorRef,
+  onClose,
+  ...editorProps
+}: AgentEditorPopoverProps) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  useFitInBox(rootRef);
+
+  useEffect(() => {
+    const opener =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const target = rootRef.current?.querySelector<HTMLElement>(
+      "button, input, select",
+    );
+    target?.focus();
+    return () => opener?.focus();
+  }, []);
+
+  useEffect(() => {
+    const close = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (rootRef.current?.contains(target)) return;
+      if (anchorRef?.current?.contains(target)) return;
+      onClose();
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", escape);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", escape);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div
+      ref={rootRef}
+      role="dialog"
+      aria-label={title}
+      data-testid="agent-popover"
+      // The width is a wish, not a demand: the box that must show it
+      // bounds both axes, and the editor scrolls its own content
+      // rather than leaving the box (settings-33, DR-041 §9).
+      className={`absolute right-0 z-20 w-96 max-w-[calc(100vw-1rem)] overflow-y-auto rounded-lg border border-neutral-200 bg-white p-2 text-sm shadow-lg dark:border-neutral-700 dark:bg-neutral-900 ${
+        direction === "down" ? "top-full mt-1" : "bottom-full mb-1"
+      }`}
+    >
+      <div className="px-1 pb-1 text-xs font-semibold text-neutral-500">
+        {title}
+      </div>
+      <AgentEditor {...editorProps} onCancel={onClose} />
+    </div>
+  );
+}

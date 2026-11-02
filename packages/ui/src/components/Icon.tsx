@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// One icon language (DR-010 §8): inline SVG on currentColor, so every
+// glyph inherits the surrounding text color and weight. Replaces the
+// mixed emoji/text glyphs whose rendering varies per platform.
+
+import type { ReactNode } from "react";
+
+const PATHS: Record<string, ReactNode> = {
+  folder: (
+    <path d="M2.5 4.5A1.5 1.5 0 0 1 4 3h3l1.7 1.8H12A1.5 1.5 0 0 1 13.5 6.3v5.2A1.5 1.5 0 0 1 12 13H4a1.5 1.5 0 0 1-1.5-1.5v-7Z" />
+  ),
+  gear: (
+    <>
+      <circle cx="8" cy="8" r="2.2" />
+      <path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6 11 5M5 11l-1.4 1.4" />
+    </>
+  ),
+  // The gear names the Settings surface; an in-place editor wears the
+  // pencil, so one glyph never means two things (DR-010 §8).
+  edit: (
+    <path d="M11.4 2.6a1.5 1.5 0 0 1 2 2L6 12l-3 1 1-3 7.4-7.4Z" />
+  ),
+  close: <path d="M4 4l8 8M12 4l-8 8" />,
+  // Closing files a thing away; deleting destroys it, so the bin is
+  // its own glyph (DR-038, DR-010 §8).
+  trash: (
+    <path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.5 8a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1l.5-8M6.8 7v4M9.2 7v4" />
+  ),
+  refresh: (
+    <path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.8v2.7h-2.7" />
+  ),
+  // The Groups surface (DR-103): people sharing what is kept.
+  people: (
+    <>
+      <circle cx="6" cy="5.5" r="2" />
+      <path d="M2.5 13c0-2.2 1.6-3.8 3.5-3.8S9.5 10.8 9.5 13" />
+      <path d="M10.5 3.8a2 2 0 0 1 0 3.6M11.5 9.4c1.2.4 2 1.7 2 3.6" />
+    </>
+  ),
+  caretDown: <path d="M4 6.5 8 10.5 12 6.5" />,
+  caretRight: <path d="M6.5 4 10.5 8 6.5 12" />,
+  arrowDown: <path d="M8 3v10M4 9l4 4 4-4" />,
+  plus: <path d="M8 3v10M3 8h10" />,
+  grid: (
+    <>
+      <rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1" />
+      <rect x="9" y="2.5" width="4.5" height="4.5" rx="1" />
+      <rect x="2.5" y="9" width="4.5" height="4.5" rx="1" />
+      <rect x="9" y="9" width="4.5" height="4.5" rx="1" />
+    </>
+  ),
+  book: (
+    <path d="M3 3.5h4a2 2 0 0 1 2 2v7a1.6 1.6 0 0 0-1.6-1.6H3v-7ZM13 3.5H9.6A1.6 1.6 0 0 0 8 5.1v7.4a1.6 1.6 0 0 1 1.6-1.6H13v-7Z" />
+  ),
+  sidebar: (
+    <>
+      <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
+      <path d="M6.5 3v10" />
+    </>
+  ),
+  // A left pane folding left, or opening right (spec-view-20).
+  paneFold: <path d="M8 4 4 8l4 4M12 4 8 8l4 4" />,
+  paneOpen: <path d="M4 4l4 4-4 4M8 4l4 4-4 4" />,
+  // Every row at once, apart from one row's disclosure chevron.
+  expandAll: <path d="M5 6 8 3l3 3M5 10l3 3 3-3" />,
+  collapseAll: <path d="M5 3l3 3 3-3M5 13l3-3 3 3" />,
+  // The house names the Space surface — the Spex home (DR-057).
+  home: (
+    <path d="M2.5 8.2 8 3.2l5.5 5M4 6.9V13h8V6.9M6.6 13V9.6h2.8V13" />
+  ),
+  // Two sheets: a copy control's icon-only form (space-26).
+  copy: (
+    <>
+      <rect x="5.5" y="5.5" width="7.5" height="7.5" rx="1" />
+      <path d="M3 10.5V4a1 1 0 0 1 1-1h6.5" />
+    </>
+  ),
+  // An arrow leaving a box: opens something elsewhere in the app — a
+  // session as its tab (space-7) — never the web, which links do.
+  open: (
+    <path d="M9.5 2.5h4v4M13.5 2.5 7.5 8.5M11 9v3.5a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1H7" />
+  ),
+  // Two columns of lines: a text diff (space-10).
+  diff: (
+    <path d="M3 3.5v9M13 3.5v9M5.5 5.5h2M5.5 8h2M8.5 10.5h2M8.5 5.5h2" />
+  ),
+  // A square stops the running transport step (space-16).
+  stop: <rect x="3.5" y="3.5" width="9" height="9" rx="1.5" />,
+  play: <path d="M5 3.5v9l7.5-4.5Z" fill="currentColor" stroke="none" />,
+  // A tick marks a step done (space-12).
+  check: <path d="M3 8.5 6.5 12 13 4.5" />,
+  // The authoring workspace's tabs below the @xs step
+  // (playbook-library-52): a page for Source, rows for Gears, a
+  // hexagon for Machine, a check for Register.
+  file: (
+    <>
+      <path d="M4.5 2.5h5l3 3v8a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1Z" />
+      <path d="M9.5 2.5v3h3M6 8.5h4M6 11h4" />
+    </>
+  ),
+  list: <path d="M3 4.5h10M3 8h10M3 11.5h10" />,
+  hexagon: <path d="M8 2 13.2 5v6L8 14 2.8 11V5Z" />,
+};
+
+export type IconName = keyof typeof PATHS;
+
+/** 16x16 stroke icon inheriting currentColor. Decorative by default
+ * (aria-hidden); the enclosing control carries the accessible name. */
+export function Icon({
+  name,
+  className,
+}: {
+  name: IconName;
+  className?: string;
+}) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className={className ?? "h-4 w-4"}
+    >
+      {PATHS[name]}
+    </svg>
+  );
+}

@@ -1,0 +1,603 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// A session end to end (run-view-98, run-view-99, server-shell-21): the
+// served page, its token gone from the address bar, running the
+// scripted Captain's narration through the real core.
+
+import { createSessionStore } from "@sublang/playbook/session-store";
+
+import { test, expect, open, send, settled } from "../src/harness";
+
+test.use({ appOptions: { project: true, agentDelayMs: 1500 } });
+
+test("server-shell-21: the token URL connects, scrubs, and reloads", async ({
+  page,
+  app,
+}) => {
+  await open(page, app);
+  await expect(page).toHaveURL(`${app.origin}/`);
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Dashboard" })).toBeVisible();
+  await expect(page.getByText(/reconnecting to the spex core/i)).toHaveCount(0);
+  // The overrides drive the served core: the fake environment is ready.
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.getByText(/claude/).first()).toBeVisible();
+  await expect(page.getByText(/not ready|aren't ready/i)).toHaveCount(0);
+});
+
+test("run-view-98: the first task runs, settles, and accepts a follow-up", async ({ page, app }) => {
+  await open(page, app);
+  const home = page.getByTestId("captain-home");
+  await expect(home).toContainText("demo-project");
+
+  app.holdPlayer("dev.coder");
+  app.holdPlayer("dev.reviewer");
+  await send(page, "Fix the token refresh in auth.ts");
+
+  // The tab and the sidebar row carry the task as the title.
+  const tab = page.getByRole("tab", { name: /fix the token refresh/i });
+  await expect(tab).toBeVisible();
+  const tree = page.getByRole("tree", { name: "Projects and sessions" });
+  await expect(tree).toContainText(/fix the token refresh/i);
+
+  // The Captain narrates; the machine card draws the code run with
+  // its nested review.
+  const captain = page.getByTestId("captain-pane");
+  await expect(captain).toContainText("/code started");
+  const machines = page.getByTestId("live-machines");
+  await expect(machines).toContainText(/code/i);
+
+  // A lane appears with its first call (run-view-7): the coder's
+  // while it streams and uses tools, the reviewer's only once the
+  // nested review calls it, after the coder's.
+  const coder = page.getByTestId("player-pane-dev.coder");
+  const reviewer = page.getByTestId("player-pane-dev.reviewer");
+  await expect(coder).toBeVisible();
+  await expect(coder).toContainText("coder running");
+  await expect(reviewer).toHaveCount(0);
+  await expect(coder).toContainText(/editing/i);
+  await expect(coder).toContainText(/Edit|Read/);
+  app.releasePlayer("dev.coder");
+  await expect(reviewer).toBeVisible();
+  await expect(page.locator('[data-testid^="player-pane-"]')).toHaveCount(2);
+  expect(await page.locator('[data-testid^="player-pane-"]').evaluateAll(
+    (panes) => panes.map((pane) => pane.getAttribute("data-testid")),
+  )).toEqual(["player-pane-dev.coder", "player-pane-dev.reviewer"]);
+
+  // Input is unavailable while work runs, then the same composer accepts a follow-up.
+  const box = page.getByTestId("boss-composer");
+  await expect(box).toHaveAttribute("placeholder", "Captain is working…");
+  await expect(box).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+  await expect(page.getByTestId("queue-indicator")).toHaveCount(0);
+  app.releasePlayer("dev.reviewer");
+  await expect(captain).toContainText("/code finished");
+  await expect(box).toBeEnabled();
+  await box.fill("Also add a test for expiry skew");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(captain.getByTestId("boss-bubble").filter({ hasText: /expiry skew/i })).toBeVisible();
+  await expect(box).toBeEnabled();
+  await expect(captain).toContainText(/review/i);
+  await expect(coder).toContainText(/\$0\.12|2,?400/);
+
+  // Text shelved instead of sent (run-view-85): the control and its
+  // note name where it went, and the Overview's Up next holds it.
+  await box.fill("Later: tighten the expiry tests");
+  await page.getByRole("button", { name: "Add to Up next", exact: true }).click();
+  await expect(page.getByTestId("queued-intent-note")).toHaveText(
+    "Added to Up next — see the project's Overview.",
+  );
+  await expect(box).toHaveValue("");
+  await page.getByRole("tab", { name: "Overview" }).click();
+  await expect(page.getByTestId(`upnext-${app.projectId}`)).toContainText(
+    /tighten the expiry tests/i,
+  );
+  await tab.click();
+  await expect(box).toHaveAttribute("placeholder", "Message the Captain…");
+
+  // The turn settled: the runtime is held only for a turn (DR-051), so
+  // nothing ends — no end control, no notice, the composer ready, and
+  // the sidebar row reading idle (run-view-69, run-view-73).
+  await expect(page.getByTestId("end-session")).toHaveCount(0);
+  await expect(page.getByTestId("history-notice")).toHaveCount(0);
+  await expect(page.getByTestId("boss-composer")).toBeEnabled();
+  await expect(page.getByRole("button", { name: "New session", exact: true })).toHaveCount(0);
+  await expect(tree).toContainText(/fix the token refresh/i);
+  await expect(page.getByTestId(/^sidebar-mark-/).first()).toHaveAttribute("data-life", "idle");
+
+  // The tab switch above, a fresh page replay, and a restarted shell
+  // retain the same called lanes and their first-call order (run-view-7).
+  const laneIds = ["player-pane-dev.coder", "player-pane-dev.reviewer"];
+  const expectLanes = async () => {
+    await expect.poll(() => page.locator('[data-testid^="player-pane-"]').evaluateAll(
+      (panes) => panes.map((pane) => pane.getAttribute("data-testid")),
+    )).toEqual(laneIds);
+  };
+  await expectLanes();
+  await page.reload();
+  // A fresh page starts at New task; reopening the saved session from
+  // the sidebar is what reconstructs its view from persisted records.
+  await expect(page.getByTestId("start-composer")).toBeEnabled();
+  await tree.getByRole("treeitem", { name: /^Fix the token refresh in auth\.ts —/ }).click();
+  await expect(box).toBeEnabled();
+  await expectLanes();
+  await app.stop();
+  await expect(page.getByText(/reconnecting to the spex core/i).first()).toBeVisible();
+  await app.start();
+  await expect(page.getByText(/reconnecting to the spex core/i)).toHaveCount(0);
+  await expect(tab).toBeVisible();
+  await expect(box).toBeEnabled();
+  await expectLanes();
+});
+
+test("run-view-99: a player question parks the session until the Boss replies", async ({
+  page,
+  app,
+}) => {
+  await open(page, app);
+  await send(page, "ask before migrating");
+
+  const question = page.getByTestId("question-bubble");
+  await expect(question).toContainText(/migrate the legacy sessions/i);
+  await expect(question).toContainText(/coder/i);
+  const chip = page.getByTestId("state-chip");
+  await expect(chip).toContainText(/wait/i);
+  // No call has reached a player: the Captain stands alone, with no
+  // grid and no divider (run-view-7).
+  await expect(page.getByTestId("player-grid")).toHaveCount(0);
+  await expect(page.getByTestId("captain-divider")).toHaveCount(0);
+  const box = page.getByTestId("boss-composer");
+  await expect(box).toHaveAttribute("placeholder", /reply to coder/i);
+  // A question is visible before the Boss turn's checkpoint settles.
+  // The settled composer, not the text alone, authorizes the reply.
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+  await expect(box).toBeEnabled();
+  await expect(page.getByTestId("session-external-owner")).toHaveCount(0);
+
+  await box.fill("Captain, explain the question. I am not answering yet.");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByTestId("captain-pane")).toContainText("The question is still open.");
+  await expect(box).toBeEnabled();
+  await expect(page.getByTestId("boss-reply-banner")).toBeVisible();
+  await box.fill("Yes, migrate them too");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const captain = page.getByTestId("captain-pane");
+  await expect(captain).toContainText("/code finished");
+  await expect(chip).not.toContainText(/wait/i);
+});
+
+// The working lane comes into view (run-view-7): stacked at a narrow
+// width, the coder's pane starts below the fold and the grid scrolls
+// to it when its call opens.
+test("run-view-7: a lane's pane scrolls into view when its call opens", async ({
+  page,
+  app,
+}) => {
+  await page.setViewportSize({ width: 600, height: 500 });
+  await open(page, app);
+  await send(page, "Fix the token refresh in auth.ts");
+  const grid = page.getByTestId("player-grid");
+  const coder = page.getByTestId("player-pane-dev.coder");
+  await expect(coder).toContainText("coder running");
+  await expect
+    .poll(async () => {
+      const g = await grid.boundingBox();
+      const p = await coder.boundingBox();
+      if (!g || !p) return false;
+      return p.y + 40 <= g.y + g.height && p.y >= g.y - 1;
+    })
+    .toBe(true);
+});
+
+// A lane folds to a rail and returns for its call (run-view-118): the
+// reviewer's lane, left standing by the first task's review, collapses,
+// and unfolds itself when the follow-up's nested review calls it.
+test("run-view-118: a collapsed lane unfolds when its call opens", async ({
+  page,
+  app,
+}) => {
+  await open(page, app);
+  await send(page, "Fix the token refresh in auth.ts");
+  await expect(page.getByTestId("captain-pane")).toContainText("/code finished");
+  await expect(page.getByTestId("boss-composer")).toBeEnabled();
+
+  const coder = page.getByTestId("player-pane-dev.coder");
+  const reviewer = page.getByTestId("player-pane-dev.reviewer");
+  const wholeWidth = (await coder.boundingBox())!.width;
+  await page.getByRole("button", { name: "Collapse reviewer" }).click();
+  // The rail: narrow, named within its box, its expand control focused
+  // — and the coder's pane took the freed width (run-view-116).
+  await expect(page.getByRole("button", { name: "Expand reviewer" })).toBeFocused();
+  await expect(reviewer).toHaveAttribute("data-collapsed", "true");
+  const rail = (await reviewer.boundingBox())!;
+  expect(rail.width).toBeLessThanOrEqual(40);
+  const name = (await page.getByTestId("player-name-dev.reviewer").boundingBox())!;
+  expect(name.x).toBeGreaterThanOrEqual(rail.x - 1);
+  expect(name.x + name.width).toBeLessThanOrEqual(rail.x + rail.width + 1);
+  expect(name.y).toBeGreaterThanOrEqual(rail.y - 1);
+  expect(name.y + name.height).toBeLessThanOrEqual(rail.y + rail.height + 1);
+  expect((await coder.boundingBox())!.width).toBeGreaterThan(wholeWidth);
+
+  // The follow-up runs the code narration again: the coder works in
+  // view, then the nested review calls the reviewer and its lane
+  // unfolds itself (run-view-7, run-view-117).
+  app.holdPlayer("dev.coder");
+  app.holdPlayer("dev.reviewer");
+  await page.getByTestId("boss-composer").fill("Also add a test for expiry skew");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(coder).toContainText("coder running");
+  await expect(coder).toBeInViewport();
+  app.releasePlayer("dev.coder");
+  await expect(reviewer).not.toHaveAttribute("data-collapsed", "true");
+  await expect(page.getByRole("button", { name: "Collapse reviewer" })).toBeVisible();
+  await expect(reviewer).toContainText(/Review/);
+  app.releasePlayer("dev.reviewer");
+  await expect(page.getByTestId("captain-pane").getByTestId("system-line")
+    .filter({ hasText: "/code finished" })).toHaveCount(2);
+});
+
+// A pane appearing or brought into view leaves the reader's place
+// (run-view-176, DR-146): side by side and stacked, the reply sent from
+// the keyboard calls the coder and then the reviewer, and neither the
+// page nor the split moves, the composer stays in the window, and focus
+// never enters the grid.
+for (const layout of [
+  { name: "side by side", width: 1024, height: 800 },
+  { name: "stacked", width: 600, height: 500 },
+] as const) {
+  test(`run-view-176: a lane appearing leaves the reader's place — ${layout.name}`, async ({
+    page,
+    app,
+  }) => {
+    await page.setViewportSize({ width: layout.width, height: layout.height });
+    await open(page, app);
+    await send(page, "ask before migrating");
+    await expect(page.getByTestId("question-bubble")).toBeVisible();
+    await expect(page.getByTestId("player-grid")).toHaveCount(0);
+    await expect(page.getByTestId("captain-divider")).toHaveCount(0);
+
+    const box = page.getByTestId("boss-composer");
+    await expect(box).toBeEnabled();
+    await box.fill("Yes, migrate them too");
+    app.holdPlayer("dev.coder");
+    app.holdPlayer("dev.reviewer");
+
+    // Watch before submitting, so even the first lane's arrival is
+    // sampled. The player gates keep each live phase until inspected.
+    // Sampled every frame until the run finishes: what moved
+    // that a lane's arrival must not move.
+    const watch = await page.evaluateHandle(() => {
+      // Every box around the Captain column and the grid, up to the
+      // page: none of them may move, whichever one could scroll.
+      const around: HTMLElement[] = [];
+      for (let el = document.querySelector<HTMLElement>('[data-testid="captain-column"]')!.parentElement; el; el = el.parentElement) {
+        around.push(el);
+      }
+      const start = around.map((el) => [el.scrollTop, el.scrollLeft]);
+      const seen = { boxScroll: 0, composerOut: 0, focusInGrid: 0, frames: 0, done: false };
+      const step = () => {
+        if (seen.done) return;
+        seen.frames += 1;
+        around.forEach((el, index) => {
+          const moved = Math.abs(el.scrollTop - start[index][0]) + Math.abs(el.scrollLeft - start[index][1]);
+          seen.boxScroll = Math.max(seen.boxScroll, moved);
+        });
+        const composer = document.querySelector<HTMLElement>('[data-testid="boss-composer"]');
+        if (composer) {
+          const rect = composer.getBoundingClientRect();
+          if (rect.top < -1 || rect.bottom > window.innerHeight + 1) seen.composerOut += 1;
+        }
+        const grid = document.querySelector('[data-testid="player-grid"]');
+        if (grid && grid.contains(document.activeElement)) seen.focusInGrid += 1;
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+      return seen;
+    });
+    await box.press("Enter");
+
+    const grid = page.getByTestId("player-grid");
+    const inGrid = async (testId: string) => {
+      const g = await grid.boundingBox();
+      const p = await page.getByTestId(testId).boundingBox();
+      if (!g || !p) return false;
+      return p.x >= g.x - 1 && p.x < g.x + g.width - 20 && p.y >= g.y - 1 && p.y < g.y + g.height;
+    };
+    const coder = page.getByTestId("player-pane-dev.coder");
+    const reviewer = page.getByTestId("player-pane-dev.reviewer");
+    await expect(coder).toContainText("coder running");
+    await expect(reviewer).toHaveCount(0);
+    await expect.poll(() => inGrid("player-pane-dev.coder")).toBe(true);
+    app.releasePlayer("dev.coder");
+    await expect(reviewer).toContainText("reviewer running");
+    await expect.poll(() => inGrid("player-pane-dev.reviewer")).toBe(true);
+    // The two lanes overflow the grid, so showing the reviewer took the
+    // grid's own scroll (run-view-7).
+    expect(await grid.evaluate((el) => el.scrollWidth > el.clientWidth + 1 && el.scrollLeft > 0)).toBe(true);
+    expect(await page.locator('[data-testid^="player-pane-"]').evaluateAll(
+      (panes) => panes.map((pane) => pane.getAttribute("data-testid")),
+    )).toEqual(["player-pane-dev.coder", "player-pane-dev.reviewer"]);
+    app.releasePlayer("dev.reviewer");
+    await expect(page.getByTestId("captain-pane")).toContainText("/code finished");
+
+    const seen = await watch.evaluate((state) => {
+      state.done = true;
+      return { ...state };
+    });
+    expect(seen.frames).toBeGreaterThan(0);
+    expect(seen.boxScroll, "a box around the Captain column and the grid scrolled").toBe(0);
+    expect(seen.composerOut, "frames with the composer out of the window").toBe(0);
+    expect(seen.focusInGrid, "frames with focus inside the grid").toBe(0);
+  });
+}
+
+// Chrome that moves with no window resize behind it (run-view-121):
+// showing the sidebar narrows the panes, so the draft rewraps to more
+// lines than the field was fitted for and the transcript's content
+// grows taller than the box it was pinned in.
+test("run-view-121: showing the sidebar keeps the draft whole and the thread at its end", async ({
+  page,
+  app,
+}) => {
+  // Short enough that the thread outgrows its pane and has an end to
+  // keep following.
+  await page.setViewportSize({ width: 1000, height: 420 });
+  await open(page, app);
+  await send(page, "Fix the token refresh in auth.ts");
+  const captain = page.getByTestId("captain-pane");
+  await expect(captain).toContainText("/code finished");
+  await page.getByRole("button", { name: "Collapse the sidebar" }).click();
+
+  const thread = captain.locator("div.overflow-y-auto").first();
+  const bottomGap = () =>
+    thread.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
+  await expect.poll(bottomGap).toBeLessThan(40);
+
+  const field = page.getByTestId("boss-composer");
+  // Long enough that the sidebar's 224px costs the draft two lines.
+  await field.fill(
+    "Fix the token refresh in auth.ts and update the docs so the next reader knows why the refresh window is ninety seconds and not five minutes, then note the same reasoning in the migration guide and in the changelog entry so nobody reopens this thread to find it.",
+  );
+  const settle = () =>
+    page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+  await settle();
+  const shortfall = () =>
+    field.evaluate((el) => {
+      const kept = el.style.height;
+      el.style.height = "auto";
+      const needed = el.scrollHeight;
+      el.style.height = kept;
+      return needed - (parseFloat(kept) || 0);
+    });
+  expect(await shortfall()).toBeLessThanOrEqual(1);
+
+  // The one gesture, and no window resize to repair either box.
+  await page.getByRole("button", { name: "Show the sidebar" }).click();
+  await settle();
+  expect(await shortfall()).toBeLessThanOrEqual(1);
+  expect(await bottomGap()).toBeLessThan(40);
+
+  // Reader input detaches the same pane: chrome reflow and another
+  // real turn must preserve that choice until Latest is activated.
+  const box = (await thread.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.wheel(0, -500);
+  await expect.poll(bottomGap).toBeGreaterThan(40);
+  await page.getByRole("button", { name: "Collapse the sidebar" }).click();
+  await settle();
+  expect(await bottomGap()).toBeGreaterThan(40);
+  await field.fill("Also add a test for expiry skew");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(captain.getByTestId("boss-bubble")).toHaveCount(2);
+  await expect(field).toBeEnabled();
+  await expect(captain.getByRole("button", { name: "↓ Latest" })).toBeVisible();
+  expect(await bottomGap()).toBeGreaterThan(40);
+  await captain.getByRole("button", { name: "↓ Latest" }).click();
+  await expect.poll(bottomGap).toBeLessThan(40);
+});
+
+// A queue the Boss keeps filling while a turn runs (run-view-106): it
+// used to push the transcript to two pixels and carry the composer out
+// of the window with the page growing behind it. The turn is long
+// enough that every message queues.
+test.describe("a long active turn", () => {
+  test.use({ appOptions: { project: true, agentDelayMs: 120_000 } });
+
+  test("run-view-106: disabled input stays in the window during a long turn", async ({
+    page,
+    app,
+  }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 900, height: 700 });
+    await open(page, app);
+    await send(page, "/code add a hello world function");
+    await expect(page.getByTestId("abort-button")).toBeVisible();
+    // The coder's long call is under way, so the layout is read in the
+    // long turn itself and the Abort below reaches a call in flight: on a
+    // loaded runner an abort landing before the turn's first call had
+    // begun missed it, leaving the call running past the core's stop
+    // bound when the fixture stopped the core.
+    await expect(page.getByTestId("player-pane-dev.coder")).toContainText(/editing/i, { timeout: 60_000 });
+
+    await expect(page.getByTestId("boss-composer")).toBeDisabled();
+    await expect(page.getByTestId("send-button")).toBeDisabled();
+    await expect(page.getByTestId("queue-indicator")).toHaveCount(0);
+
+    // The transcript keeps a readable share, and the action row is
+    // still in the window with the page unmoved (DR-041 §9), once the
+    // layout has settled around the running turn.
+    await expect(async () => {
+      const pane = (await page.getByTestId("captain-pane").boundingBox())!;
+      expect(pane.height).toBeGreaterThan(40);
+      for (const control of ["abort-button", "send-button"]) {
+        const rect = (await page.getByTestId(control).boundingBox())!;
+        expect(rect.y + rect.height, control).toBeLessThanOrEqual(700);
+      }
+      expect(
+        await page.evaluate(() => [
+          document.documentElement.scrollHeight,
+          document.documentElement.clientHeight,
+        ]),
+      ).toEqual([700, 700]);
+    }).toPass({ timeout: 30_000 });
+
+    // The turn ends here, where a loaded runner may take its time to
+    // settle the aborted call, not in the core's bounded stop at teardown.
+    await page.getByTestId("abort-button").click();
+    await expect(page.getByTestId("abort-button")).toHaveCount(0, { timeout: 60_000 });
+  });
+});
+
+test.describe("run-view-141: an agent's settings for one conversation", () => {
+  test("each agent is changed from its own chip, and stays where it was changed", async ({ page, app }) => {
+    // The Captain runs the provider's default: its block sets no model.
+    await app.core.command("config.edit", { op: { kind: "captain.set", patch: { model: null } } });
+    await open(page, app);
+    await send(page, "Fix the token refresh in auth.ts");
+    await expect(page.getByTestId("player-pane-dev.coder")).toBeVisible();
+    await settled(app);
+
+    const configBefore = app.readConfig();
+    // Nothing offers a roster, a count, or a name for the act.
+    await expect(page.getByTestId("session-tuning-control")).toHaveCount(0);
+
+    // The coder's own chip opens the coder's own settings.
+    await page.getByTestId("agent-chip-dev.coder").click();
+    const coder = page.getByTestId("agent-settings-dev.coder");
+    await expect(coder).toBeVisible();
+    await expect(coder).toContainText("This conversation only");
+    await expect(page.getByTestId("agent-settings-captain")).toHaveCount(0);
+    // What it inherits is named by the display rule: the configured
+    // canonical pin, which the runtime lists only through an alias,
+    // reads as itself.
+    await expect(coder.getByTestId("agent-dev.coder-model-mode").locator("option").first())
+      .toHaveText("from Settings (claude-opus-5-5)");
+    // An effort the configuration leaves unset takes the same
+    // provider-default words, never a bare "from Settings".
+    await expect(coder.getByTestId("agent-dev.coder-effort-mode").locator("option").first())
+      .toHaveText("from Settings (Provider default)");
+    await coder.getByTestId("agent-dev.coder-model-mode").selectOption("pin");
+    // The pinned seed is listed through an alias, so a hand-typed id
+    // goes through the list's custom entry.
+    await coder.getByTestId("agent-dev.coder-model-value-trigger").click();
+    await coder.getByTestId("agent-dev.coder-model-value-listbox").getByRole("option", { name: "Custom model…" }).click();
+    await coder.getByTestId("agent-dev.coder-model-value").fill("claude-tuned-coder");
+    await coder.getByTestId("agent-save-dev.coder").click();
+    await expect(coder).toHaveCount(0);
+
+    // The Captain's own chip opens the Captain's.
+    await page.getByTestId("agent-chip-captain").click();
+    const captain = page.getByTestId("agent-settings-captain");
+    // An unset model is inherited as the provider's default, named as
+    // the model field names it: the words, then the model the runtime
+    // reports running by default, itself by the display rule.
+    await expect(captain.getByTestId("agent-captain-model-mode").locator("option").first())
+      .toHaveText("from Settings (Provider default · Opus · claude-opus-5-5)");
+    await expect(captain.getByTestId("agent-captain-effort-mode").locator("option").first())
+      .toHaveText("from Settings (Provider default)");
+    await captain.getByTestId("agent-captain-model-mode").selectOption("pin");
+    // Pinning from the provider's default seeds no model, so the typed
+    // field stands open at once.
+    await captain.getByTestId("agent-captain-model-value").fill("claude-tuned-captain");
+    await captain.getByTestId("agent-save-captain").click();
+    await expect(captain).toHaveCount(0);
+
+    // The coder's subagent model and subagent effort are chosen in the
+    // same editor (DR-093, DR-095), each unset in the configuration and
+    // so inherited as "Same as agent" and "Agent chooses", the effort
+    // listing no orchestration value; a reload finds the choices where
+    // they were made.
+    await page.getByTestId("agent-chip-dev.coder").click();
+    const subagent = page.getByTestId("agent-settings-dev.coder");
+    await expect(subagent.getByTestId("agent-dev.coder-subagent-model-mode").locator("option").first())
+      .toHaveText("from Settings (Same as agent)");
+    await expect(subagent.getByTestId("agent-dev.coder-subagent-effort-mode").locator("option").first())
+      .toHaveText("from Settings (Agent chooses)");
+    await subagent.getByTestId("agent-dev.coder-subagent-model-mode").selectOption("pin");
+    await subagent.getByTestId("agent-dev.coder-subagent-model-value").fill("claude-sub-coder");
+    await subagent.getByTestId("agent-dev.coder-subagent-effort-mode").selectOption("pin");
+    const efforts = subagent.getByTestId("agent-dev.coder-subagent-effort-value");
+    await expect(efforts.locator("option", { hasText: "medium" })).toHaveCount(1);
+    await expect(efforts.locator("option", { hasText: "ultracode" })).toHaveCount(0);
+    await efforts.selectOption("medium");
+    await subagent.getByTestId("agent-save-dev.coder").click();
+    await expect(subagent).toHaveCount(0);
+    await page.reload();
+    await page.getByRole("tree", { name: "Projects and sessions" })
+      .getByText(/fix the token r/i).click();
+    await page.getByTestId("agent-chip-dev.coder").click();
+    await expect(subagent.getByTestId("agent-dev.coder-subagent-model-mode")).toHaveValue("pin");
+    await expect(subagent.getByTestId("agent-dev.coder-subagent-model-value")).toHaveValue("claude-sub-coder");
+    await expect(subagent.getByTestId("agent-dev.coder-subagent-effort-value")).toHaveValue("medium");
+    await subagent.getByRole("button", { name: "Cancel" }).click();
+    await expect(subagent).toHaveCount(0);
+    // The chip reads adapter, model and effort, never the subagent model.
+    await expect(page.getByTestId("agent-chip-dev.coder")).not.toContainText("claude-sub-coder");
+    await expect(page.getByTestId("agent-chip-dev.coder")).not.toContainText("medium");
+
+    // A chip is a setting: both read the choice before any message.
+    await expect(page.getByTestId("agent-chip-dev.coder")).toContainText("claude-tuned-coder");
+    await expect(page.getByTestId("agent-chip-captain")).toContainText("claude-tuned-captain");
+    await expect(page.getByTestId("agent-chip-dev.coder")).toHaveAttribute("data-changed", "true");
+    await expect(page.getByTestId("agent-chip-dev.reviewer")).not.toHaveAttribute("data-changed", "true");
+
+    // The next turn runs on them, and the shared config never moved.
+    const listed = await app.core.command("session.list", {});
+    const session = listed.find((entry) => (entry.title ?? "").startsWith("Fix the token refresh"))!;
+    const sessionId = session.id;
+    expect(session.agentSettings, JSON.stringify(listed.map((e) => [e.id, e.title, e.agentSettings])))
+      .toMatchObject({ captain: { model: "claude-tuned-captain" }, "dev.coder": { model: "claude-tuned-coder", subagentModel: "claude-sub-coder", subagentEffort: "medium" } });
+    await send(page, "And once more");
+    await expect
+      .poll(async () => (await app.core.command("session.list", {})).find((e) => e.id === sessionId)?.turns ?? 0, { timeout: 30_000 })
+      .toBe(2);
+    await settled(app);
+    const applied = (await createSessionStore({ sessionsDir: app.sharedSessionsDir }).read(sessionId))
+      .lastAppliedExecutionProjection;
+    expect(applied.captain.model.value).toBe("claude-tuned-captain");
+    expect(applied.catalog.code?.roles.coder?.model.value).toBe("claude-tuned-coder");
+    expect(applied.catalog.code?.roles.coder?.subagentModel).toBe("claude-sub-coder");
+    expect(applied.catalog.code?.roles.coder?.subagentEffort).toBe("medium");
+    expect(app.readConfig()).toBe(configBefore);
+
+    // Settings still shows the configured values.
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(page.getByText("Session players")).toBeVisible();
+    await expect(page.getByText("claude-tuned-captain")).toHaveCount(0);
+    await expect(page.getByText("claude-tuned-coder")).toHaveCount(0);
+
+    // A second session of the project opens on them: the first
+    // conversation's choices stay where they were made. The Captain,
+    // on the provider's default, reads its adapter.
+    await page.getByTestId(`sidebar-new-${app.projectId}`).click();
+    await expect(page.getByTestId("captain-home")).toBeVisible();
+    await send(page, "Tighten the retry backoff");
+    await expect(page.getByTestId("player-pane-dev.coder")).toBeVisible();
+    await expect(page.getByTestId("agent-chip-captain")).toHaveText("claude");
+    await expect(page.getByTestId("agent-chip-dev.coder")).toHaveText("claude-opus-5-5");
+    for (const agent of ["captain", "dev.coder"]) {
+      await expect(page.getByTestId(`agent-chip-${agent}`)).not.toHaveAttribute("data-changed", "true");
+    }
+    await settled(app);
+
+    // And each agent goes back from its own chip, both panes reading
+    // the configured values again.
+    await page.getByRole("tree", { name: "Projects and sessions" })
+      .getByText(/fix the token r/i).click();
+    for (const agent of ["dev.coder", "captain"]) {
+      await page.getByTestId(`agent-chip-${agent}`).click();
+      await page.getByTestId(`agent-default-${agent}`).click();
+      await page.getByTestId(`agent-save-${agent}`).click();
+      await expect(page.getByTestId(`agent-settings-${agent}`)).toHaveCount(0);
+      await expect(page.getByTestId(`agent-chip-${agent}`)).not.toHaveAttribute("data-changed", "true");
+    }
+    await expect(page.getByTestId("agent-chip-captain")).toHaveText("claude");
+    await expect(page.getByTestId("agent-chip-dev.coder")).toHaveText("claude-opus-5-5");
+  });
+});

@@ -1,0 +1,628 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// SET coverage for the DR-019 surfaces: the Captain's row opening the
+// shared agent editor and writing merge patches, and the per-adapter
+// readiness panel naming the positions each adapter serves.
+
+import { afterEach, beforeEach, describe, expect, onTestFinished, test, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+
+afterEach(cleanup);
+
+const { commandMock } = vi.hoisted(() => ({ commandMock: vi.fn() }));
+
+vi.mock("../state/store.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../state/store.js")>();
+  return { ...actual, getClient: () => ({ command: commandMock }) };
+});
+
+import { SettingsSurface } from "./SettingsSurface.js";
+import {
+  setClientForTests,
+  useAppStore,
+  safeStorageRemove,
+  LANGUAGE_KEY,
+} from "../state/store.js";
+import { activateLanguage, i18n } from "../i18n.js";
+import { keyLabel } from "../lib/shortcuts.js";
+import type { ConfigState, ReadinessEntry } from "@sublang/spex-core/protocol";
+import { OWN_KEY, PROJECT, home } from "../fixtures/playbooks.js";
+
+// The language control writes the real store, which mirrors the choice
+// and activates the catalog: put both back so no later test inherits a
+// language it did not ask for.
+afterEach(() => {
+  setClientForTests(undefined);
+  safeStorageRemove(LANGUAGE_KEY);
+  useAppStore.setState({ language: { choice: null, resolved: "en" } });
+  activateLanguage("en");
+});
+
+const CONFIG: ConfigState = {
+  status: "valid",
+  seeded: false,
+  summary: {
+    path: "/tmp/playbook.config.yaml",
+    captain: {
+      adapter: "claude",
+      model: "claude-opus-4-8",
+      effort: "high",
+      permissions: { mode: "auto" },
+    },
+    players: [
+      {
+        id: "dev.coder",
+        agent: { adapter: "claude", model: "claude-opus-5[1m]" },
+        display: "claude-opus-5[1m]",
+        boundBy: ["code.coder"],
+      },
+      {
+        id: "dev.reviewer",
+        agent: { adapter: "codex", model: "gpt-5.6-sol" },
+        display: "gpt-5.6-sol",
+        boundBy: ["code.reviewer"],
+      },
+    ],
+    playbooks: [
+      {
+        id: "code",
+        from: "@sublang/playbook/code/registry",
+        command: "code",
+        intent: "software development workflow",
+        roles: {
+          coder: { playerId: "dev.coder", display: "claude-opus-5[1m]" },
+          reviewer: { playerId: "dev.reviewer", display: "gpt-5.6-sol" },
+        },
+      },
+    ],
+  },
+};
+
+const READINESS: ReadinessEntry[] = [
+  {
+    adapter: "claude",
+    ready: true,
+    usedBy: ["captain", "dev.coder (code.coder)"],
+    fastModeSupported: true, subagentModelSupported: true,
+  },
+  {
+    adapter: "codex",
+    ready: false,
+    requirement: "set OPENAI_API_KEY or sign in with the Codex CLI",
+    usedBy: ["dev.reviewer (code.reviewer)"],
+    fastModeSupported: false, subagentModelSupported: false,
+  },
+];
+
+function renderSettings() {
+  useAppStore.setState({
+    configState: CONFIG,
+    readiness: READINESS,
+    refreshReadiness: vi.fn(async () => {}),
+  });
+  return render(<SettingsSurface />);
+}
+
+beforeEach(() => {
+  commandMock.mockReset();
+  commandMock.mockResolvedValue(CONFIG);
+  // The surface acts through the client of the place it shows
+  // (run-view-168), this computer's here: the store's own client, which
+  // the module mock cannot reach.
+  setClientForTests({ command: commandMock } as never);
+});
+
+describe("SET: the Captain's row and its agent editor", () => {
+  test("the captain renders as a chip on a collapsed row with no removal", () => {
+    renderSettings();
+    const section = screen.getByTestId("captain-section");
+    expect(section.textContent).toContain("claude");
+    expect(section.textContent).toContain("claude-opus-4-8");
+    expect(section.textContent).toContain("high");
+    // The row wears the players' shape (settings-1): an edit toggle,
+    // no editor until it is asked for, and never a remove control.
+    expect(within(section).queryByTestId("agent-editor")).toBeNull();
+    const toggle = within(section).getByTestId("captain-edit");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(
+      within(section).queryByRole("button", { name: /^Remove/ }),
+    ).toBeNull();
+  });
+
+  test("editing the model writes a captain.set merge patch, closes the editor, and ticks on the row", async () => {
+    renderSettings();
+    const section = screen.getByTestId("captain-section");
+    expect(within(section).queryByRole("status")).toBeNull();
+    fireEvent.click(within(section).getByTestId("captain-edit"));
+    expect(
+      within(section).getByTestId("captain-edit").getAttribute("aria-expanded"),
+    ).toBe("true");
+    fireEvent.change(within(section).getByTestId("agent-model"), {
+      target: { value: "claude-opus-4-8[1m]" },
+    });
+    fireEvent.click(within(section).getByTestId("agent-save"));
+    await vi.waitFor(() => expect(commandMock).toHaveBeenCalled());
+    const [type, payload] = commandMock.mock.calls.find(([type]) => type === "config.edit")!;
+    expect(type).toBe("config.edit");
+    expect(payload.op.kind).toBe("captain.set");
+    expect(payload.op.patch.model).toBe("claude-opus-4-8[1m]");
+    // A merge patch never carries hand-written fields it did not edit.
+    expect(payload.op.patch).not.toHaveProperty("instruction");
+    // Saved, the editor folds back into the row, the row ticks in a
+    // live region (settings-6), and the toggle takes the keyboard
+    // (DR-010 §6).
+    await vi.waitFor(() =>
+      expect(within(section).queryByTestId("agent-editor")).toBeNull(),
+    );
+    expect(within(section).getByRole("status").textContent).toBe("Saved ✓");
+    expect(document.activeElement).toBe(
+      within(section).getByTestId("captain-edit"),
+    );
+  });
+
+  test("Cancel and Escape close the Captain's editor without a write", () => {
+    renderSettings();
+    const section = screen.getByTestId("captain-section");
+    fireEvent.click(within(section).getByTestId("captain-edit"));
+    fireEvent.change(within(section).getByTestId("agent-model"), {
+      target: { value: "claude-sonnet-5" },
+    });
+    fireEvent.click(within(section).getByTestId("agent-cancel"));
+    expect(within(section).queryByTestId("agent-editor")).toBeNull();
+    expect(commandMock.mock.calls.filter(([type]) => type !== "agent.capabilities")).toEqual([]);
+    expect(document.activeElement).toBe(
+      within(section).getByTestId("captain-edit"),
+    );
+    // Reopened, the draft starts from the file again.
+    fireEvent.click(within(section).getByTestId("captain-edit"));
+    expect(
+      (within(section).getByTestId("agent-model") as HTMLInputElement).value,
+    ).toBe("claude-opus-4-8");
+    fireEvent.keyDown(within(section).getByTestId("agent-model"), {
+      key: "Escape",
+    });
+    expect(within(section).queryByTestId("agent-editor")).toBeNull();
+    expect(commandMock.mock.calls.filter(([type]) => type !== "agent.capabilities")).toEqual([]);
+  });
+
+  test("one row's editor stands open at a time, the Captain's and the players' alike", () => {
+    renderSettings();
+    fireEvent.click(screen.getByTestId("captain-edit"));
+    expect(screen.getAllByTestId("agent-editor")).toHaveLength(1);
+    fireEvent.click(screen.getByTestId("player-edit-dev.coder"));
+    expect(screen.getAllByTestId("agent-editor")).toHaveLength(1);
+    expect(
+      within(screen.getByTestId("player-row-dev.coder")).getByTestId(
+        "agent-editor",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByTestId("captain-edit").getAttribute("aria-expanded"),
+    ).toBe("false");
+    fireEvent.click(screen.getByTestId("captain-edit"));
+    expect(
+      within(screen.getByTestId("captain-section")).getByTestId("agent-editor"),
+    ).toBeTruthy();
+    expect(
+      within(screen.getByTestId("player-row-dev.coder")).queryByTestId(
+        "agent-editor",
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("SET: adapter readiness panel", () => {
+  test("one row per adapter, with requirement and the positions it serves", () => {
+    renderSettings();
+    const claude = screen.getByTestId("agent-row-claude");
+    expect(claude.textContent).toContain("claude");
+    // Positions render per DR-019: the Captain and each playbook role.
+    expect(claude.textContent).toMatch(/Captain/i);
+    expect(claude.textContent).toMatch(/coder/i);
+
+    const codex = screen.getByTestId("agent-row-codex");
+    expect(codex.textContent).toContain(
+      "set OPENAI_API_KEY or sign in with the Codex CLI",
+    );
+    expect(codex.textContent).toMatch(/reviewer/i);
+    // Deduped: no third row for an adapter used twice.
+    expect(screen.queryAllByTestId(/^agent-row-/)).toHaveLength(2);
+  });
+
+  test("re-check triggers a readiness refresh", () => {
+    const refreshReadiness = vi.fn(async () => {});
+    useAppStore.setState({
+      configState: CONFIG,
+      readiness: READINESS,
+      refreshReadiness,
+    });
+    render(<SettingsSurface />);
+    fireEvent.click(screen.getByRole("button", { name: /Re-check readiness/i }));
+    expect(refreshReadiness).toHaveBeenCalled();
+  });
+});
+
+describe("SET: the session-player roster", () => {
+  test("each lane prints its id, its agent, and the roles it answers", () => {
+    renderSettings();
+    const row = screen.getByTestId("player-row-dev.coder");
+    // Its name and mark, its id in the tooltip (run-view-177).
+    expect(screen.getByTestId("player-name-dev.coder").textContent).toBe("Ccoder");
+    expect(screen.getByTestId("player-name-dev.coder").getAttribute("title")).toBe("dev.coder");
+    // The lane's own agent, with the adapter's readiness (DR-032).
+    expect(
+      within(row).getByLabelText(
+        "dev.coder: claude · claude-opus-5[1m] (ready)",
+      ),
+    ).toBeTruthy();
+    expect(within(row).getByTestId("player-bound-dev.coder").textContent).toBe(
+      "code.coder",
+    );
+  });
+
+  test("editing a lane writes a player.set merge patch", async () => {
+    renderSettings();
+    fireEvent.click(screen.getByTestId("player-edit-dev.coder"));
+    const row = screen.getByTestId("player-row-dev.coder");
+    fireEvent.change(within(row).getByTestId("agent-model"), {
+      target: { value: "claude-opus-5" },
+    });
+    fireEvent.click(within(row).getByTestId("agent-save"));
+    await vi.waitFor(() =>
+      expect(commandMock).toHaveBeenCalledWith("config.edit", {
+        op: {
+          kind: "player.set",
+          playerId: "dev.coder",
+          // Identity keys only: a lane's adapter and permissions live
+          // here, never in a role binding (DR-032).
+          patch: expect.objectContaining({ model: "claude-opus-5" }),
+        },
+      }),
+    );
+  });
+
+  test("removing a bound lane is refused in the core's own words", async () => {
+    commandMock.mockImplementation(async (_type: string, payload: unknown) => {
+      const op = (payload as { op: { kind: string } }).op;
+      if (op.kind === "player.delete") {
+        throw new Error("dev.coder still answers code.coder");
+      }
+      return CONFIG;
+    });
+    renderSettings();
+    fireEvent.click(screen.getByTestId("player-delete-dev.coder"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await vi.waitFor(() =>
+      expect(
+        screen.getByTestId("player-error-dev.coder").textContent,
+      ).toContain("dev.coder still answers code.coder"),
+    );
+  });
+
+  test("adding a lane names it and gives it a whole block", async () => {
+    renderSettings();
+    fireEvent.click(screen.getByTestId("player-add"));
+    fireEvent.change(screen.getByTestId("player-add-id"), {
+      target: { value: "dev.docs" },
+    });
+    const form = screen.getByTestId("player-add-form");
+    fireEvent.click(within(form).getByTestId("agent-save"));
+    await vi.waitFor(() =>
+      expect(commandMock).toHaveBeenCalledWith("config.edit", {
+        op: {
+          kind: "player.set",
+          playerId: "dev.docs",
+          patch: expect.objectContaining({ adapter: "claude" }),
+        },
+      }),
+    );
+  });
+});
+
+describe("settings-46: your own group's file, and the players a project names", () => {
+  afterEach(() => useAppStore.setState({ projects: [], space: undefined }));
+
+  test("a player a project names and the roster lacks reads so, and Add creates it from the neutral block", async () => {
+    useAppStore.setState({ projects: [PROJECT], space: home() });
+    useAppStore.setState({
+      configState: {
+        ...CONFIG,
+        missingPlayers: [
+          { player: "dev.triager", repository: PROJECT.id, roles: [{ playbook: "triage", role: "triager" }] },
+          // One the roster already holds is no longer missing.
+          { player: "dev.coder", repository: PROJECT.id, roles: [{ playbook: "code", role: "coder" }] },
+        ],
+      } as ConfigState,
+      readiness: READINESS,
+      refreshReadiness: vi.fn(async () => {}),
+    });
+    render(<SettingsSurface />);
+    const row = screen.getByTestId("player-missing-dev.triager");
+    expect(within(row).getByTestId("player-missing-note-dev.triager").textContent).toBe(
+      "Named by demo, not set up here",
+    );
+    expect(within(row).getByTestId("player-missing-note-dev.triager").title).toBe("Answers triage.triager");
+    expect(screen.queryByTestId("player-missing-dev.coder")).toBeNull();
+    fireEvent.click(within(row).getByTestId("player-missing-add-dev.triager"));
+    await vi.waitFor(() =>
+      expect(commandMock).toHaveBeenCalledWith("config.edit", {
+        op: {
+          kind: "player.set",
+          playerId: "dev.triager",
+          patch: { adapter: "claude", model: "claude-opus-5-5", effort: "high", permissions: { mode: "auto" } },
+        },
+      }),
+    );
+  });
+
+  test("the surface names the file it writes by its path alone, offering no project's file as editable here", () => {
+    useAppStore.setState({ space: home() });
+    renderSettings();
+    // No spex repository named, and no sentence about a project's file:
+    // a project's playbooks and bindings are its Playbooks tab's.
+    expect(screen.queryByTestId("settings-scope")).toBeNull();
+    expect(document.body.textContent).not.toContain(OWN_KEY);
+    expect(document.body.textContent).not.toContain("Your own group's config");
+    expect(document.body.innerHTML).not.toContain("A project's playbooks and role bindings are edited in Playbooks");
+    expect(screen.getByTitle("Shared with the playbook CLI — edits made outside appear here").textContent).toBe(CONFIG.summary!.path);
+  });
+});
+
+describe("settings-6: every edit acknowledges in place", () => {
+  test("a notification select is disabled in flight, then ticks", async () => {
+    let land!: (value: unknown) => void;
+    commandMock.mockImplementation(
+      () => new Promise((resolve) => (land = resolve)),
+    );
+    renderSettings();
+    const [select] = within(
+      screen.getByTestId("notifications-section"),
+    ).getAllByRole("combobox") as HTMLSelectElement[];
+    fireEvent.change(select, { target: { value: "bell" } });
+    expect(select.disabled).toBe(true);
+    expect(
+      screen.queryByTestId("notification-saved-player_finished"),
+    ).toBeNull();
+    land(CONFIG);
+    await vi.waitFor(() => expect(select.disabled).toBe(false));
+    expect(
+      screen.getByTestId("notification-saved-player_finished").textContent,
+    ).toBe("Saved ✓");
+  });
+
+  test("the language control lists the three choices, shows the home's, and ticks", async () => {
+    let land!: (value: unknown) => void;
+    commandMock.mockImplementation(
+      () => new Promise((resolve) => (land = resolve)),
+    );
+    // The language write goes through a store action, which resolves
+    // the module-local client the module mock cannot reach.
+    setClientForTests({ command: commandMock } as never);
+    useAppStore.setState({ language: { choice: "en", resolved: "en" } });
+    renderSettings();
+    const section = screen.getByTestId("language-section");
+    // System, English and 简体中文 — the two languages in their own
+    // words (settings-37).
+    expect(
+      within(section)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["System", "English", "简体中文"]);
+    const select = within(section).getByTestId(
+      "language-select",
+    ) as HTMLSelectElement;
+    // The home's stored choice, not the language the page resolved to.
+    expect(select.value).toBe("en");
+    fireEvent.change(select, { target: { value: "zh" } });
+    expect(commandMock).toHaveBeenCalledWith("language.set", {
+      language: "zh",
+    });
+    expect(select.disabled).toBe(true);
+    expect(within(section).queryByTestId("language-saved")).toBeNull();
+    land({ language: "zh" });
+    await vi.waitFor(() => expect(select.disabled).toBe(false));
+    // The page is in 简体中文 by the time it ticks, so the tick is read
+    // from the catalog rather than pinned to the English words.
+    expect(within(section).getByTestId("language-saved").textContent).toBe(
+      i18n._("Saved ✓"),
+    );
+    expect(select.value).toBe("zh");
+  });
+});
+
+describe("settings-9: a seeded starter config says so once", () => {
+  test("the header names the created file; a loaded one says nothing", () => {
+    useAppStore.setState({
+      configState: { ...CONFIG, seeded: true },
+      readiness: READINESS,
+      refreshReadiness: vi.fn(async () => {}),
+    });
+    const { unmount } = render(<SettingsSurface />);
+    expect(screen.getByTestId("config-seeded").textContent).toContain(
+      "Created a starter config at /tmp/playbook.config.yaml",
+    );
+    unmount();
+    // A reseed reads as an update, never a creation (DR-156).
+    useAppStore.setState({ configState: { ...CONFIG, seeded: false, reseeded: true } });
+    const reseeded = render(<SettingsSurface />);
+    expect(screen.getByTestId("config-seeded").textContent).toBe(
+      "Updated the starter config at /tmp/playbook.config.yaml for the current sign-ins",
+    );
+    reseeded.unmount();
+    renderSettings();
+    expect(screen.queryByTestId("config-seeded")).toBeNull();
+  });
+});
+
+describe("settings-10: the shortcut sheet and the mode guidance", () => {
+  test("the sheet lists every binding with this platform's modifier", () => {
+    renderSettings();
+    const sheet = screen.getByTestId("shortcuts-section");
+    const rows = within(sheet).getAllByRole("row").slice(1);
+    expect(rows.length).toBeGreaterThan(8);
+    expect(rows[0].textContent).toContain(keyLabel("P"));
+    expect(rows[0].textContent).toContain("Switch or add a project");
+    expect(sheet.textContent).toContain("Escape");
+    expect(sheet.textContent).toContain("Shift+Enter");
+    // The box the sheet scrolls in is itself a named keyboard stop
+    // (run-view-50): at a phone's width it overflows sideways.
+    const box = within(sheet).getByRole("group", { name: "Keyboard shortcuts" });
+    expect(box.getAttribute("tabindex")).toBe("0");
+    expect(box.className).toContain("overflow-x-auto");
+  });
+
+  test("the permission mode explains its stakes", () => {
+    renderSettings();
+    const section = screen.getByTestId("captain-section");
+    fireEvent.click(within(section).getByTestId("captain-edit"));
+    expect(within(section).getByTestId("agent-mode-help").textContent).toMatch(
+      /^auto:/,
+    );
+    fireEvent.change(within(section).getByTestId("agent-mode"), {
+      target: { value: "bypass" },
+    });
+    expect(within(section).getByTestId("agent-mode-help").textContent).toBe(
+      "bypass: no permission prompts — sandboxed repos only",
+    );
+  });
+});
+
+describe("settings-24: a missing config names the remedy and retries", () => {
+  test("the copy names the path, the folder, and a Retry that refreshes", async () => {
+    const refresh = vi.fn(async () => {});
+    useAppStore.setState({
+      configState: { status: "missing", path: "/tmp/playbook.config.yaml" },
+      readiness: [],
+      refreshReadiness: vi.fn(async () => {}),
+      refresh,
+    });
+    render(<SettingsSurface />);
+    const box = screen.getByTestId("config-broken");
+    expect(box.textContent).toContain(
+      "Spex could not create a starter config at /tmp/playbook.config.yaml — check the folder is writable, then retry.",
+    );
+    expect(box.textContent).not.toContain("Fix the file in your editor");
+    fireEvent.click(screen.getByTestId("config-retry"));
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+});
+
+describe("settings-1, DR-038: fast mode is visible and switchable", () => {
+  test("the captain chip wears the mark and the editor offers the switch", () => {
+    useAppStore.setState({
+      configState: {
+        ...CONFIG,
+        summary: {
+          ...CONFIG.summary,
+          captain: { ...CONFIG.summary.captain, fastMode: true },
+        },
+      },
+      readiness: READINESS,
+      refreshReadiness: vi.fn(async () => {}),
+    });
+    render(<SettingsSurface />);
+    const section = screen.getByTestId("captain-section");
+    const chip = within(section).getByTestId("agent-chip");
+    expect(within(chip).getByTitle("fast mode").textContent).toBe("⚡");
+    expect(chip.getAttribute("aria-label")).toContain("fast mode");
+    fireEvent.click(within(section).getByTestId("captain-edit"));
+    expect(
+      (within(section).getByTestId("agent-fast-mode") as HTMLInputElement)
+        .checked,
+    ).toBe(true);
+    // A lane not in fast mode wears no mark; codex declares none, so
+    // its editor offers no switch.
+    const reviewer = screen.getByTestId("player-row-dev.reviewer");
+    expect(within(reviewer).queryByTitle("fast mode")).toBeNull();
+    fireEvent.click(screen.getByTestId("player-edit-dev.reviewer"));
+    expect(within(reviewer).queryByTestId("agent-fast-mode")).toBeNull();
+  });
+});
+
+describe("settings-1, DR-093: the Captain's subagent model", () => {
+  test("the editor offers it where the adapter serves one and writes it in the captain.set patch", async () => {
+    renderSettings();
+    // codex serves none, so its lane's editor offers no field.
+    const reviewer = screen.getByTestId("player-row-dev.reviewer");
+    fireEvent.click(screen.getByTestId("player-edit-dev.reviewer"));
+    expect(within(reviewer).queryByTestId("agent-subagent-model")).toBeNull();
+
+    const section = screen.getByTestId("captain-section");
+    fireEvent.click(within(section).getByTestId("captain-edit"));
+    fireEvent.change(within(section).getByTestId("agent-subagent-model"), {
+      target: { value: "claude-sonnet-5-5" },
+    });
+    fireEvent.click(within(section).getByTestId("agent-save"));
+    await vi.waitFor(() =>
+      expect(commandMock).toHaveBeenCalledWith("config.edit", expect.objectContaining({
+        op: expect.objectContaining({ kind: "captain.set", patch: expect.objectContaining({ subagentModel: "claude-sonnet-5-5" }) }),
+      })),
+    );
+  });
+});
+
+describe("settings-1, DR-095: the Captain's subagent effort", () => {
+  test("the editor pairs it with the subagent model, offers Agent chooses first, and writes it in the captain.set patch", async () => {
+    const load = useAppStore.getState().loadAgentOptions;
+    onTestFinished(() => useAppStore.setState({ loadAgentOptions: load }));
+    useAppStore.setState({ loadAgentOptions: async (adapter) => ({
+      adapter, effortValues: ["low", "high", "ultracode"], fastModeSupported: true, subagentModelSupported: adapter === "claude",
+      subagentEffortValues: adapter === "claude" ? ["low", "high"] : [], discovery: { status: "unavailable", reason: "Fixture" },
+    }) });
+    renderSettings();
+    const section = screen.getByTestId("captain-section");
+    fireEvent.click(within(section).getByTestId("captain-edit"));
+    const effort = within(section).getByTestId("agent-subagent-effort") as HTMLSelectElement;
+    await vi.waitFor(() =>
+      expect([...effort.options].map((option) => option.textContent)).toEqual(["Agent chooses", "low", "high"]),
+    );
+    expect((within(section).getByTestId("agent-subagent-model") as HTMLInputElement).placeholder).toBe("Same as agent");
+    fireEvent.change(effort, { target: { value: "high" } });
+    fireEvent.click(within(section).getByTestId("agent-save"));
+    await vi.waitFor(() =>
+      expect(commandMock).toHaveBeenCalledWith("config.edit", expect.objectContaining({
+        op: expect.objectContaining({ kind: "captain.set", patch: expect.objectContaining({ subagentEffort: "high" }) }),
+      })),
+    );
+  });
+});
+
+describe("settings-53: Settings opened at an agent's row", () => {
+  function renderAt(agentRow: string, onAgentRowShown = vi.fn()) {
+    useAppStore.setState({
+      configState: CONFIG,
+      readiness: READINESS,
+      refreshReadiness: vi.fn(async () => {}),
+    });
+    Element.prototype.scrollIntoView = vi.fn();
+    return { onAgentRowShown, ...render(<SettingsSurface agentRow={agentRow} onAgentRowShown={onAgentRowShown} />) };
+  }
+  const expanded = (testId: string) => screen.getByTestId(testId).getAttribute("aria-expanded");
+
+  test("the Captain's row opens, every other stays closed", async () => {
+    const { onAgentRowShown } = renderAt("captain");
+    await vi.waitFor(() => expect(expanded("captain-edit")).toBe("true"));
+    expect(expanded("player-edit-dev.coder")).toBe("false");
+    expect(expanded("player-edit-dev.reviewer")).toBe("false");
+    expect(onAgentRowShown).toHaveBeenCalledTimes(1);
+  });
+
+  test("a player's row opens and comes into view", async () => {
+    renderAt("dev.reviewer");
+    await vi.waitFor(() => expect(expanded("player-edit-dev.reviewer")).toBe("true"));
+    expect(expanded("captain-edit")).toBe("false");
+    await vi.waitFor(() => expect(Element.prototype.scrollIntoView).toHaveBeenCalled());
+  });
+
+  test("a player the roster lacks opens no editor, and the ask is taken once", async () => {
+    const { onAgentRowShown, unmount } = renderAt("docs.reviewer");
+    await vi.waitFor(() => expect(onAgentRowShown).toHaveBeenCalledTimes(1));
+    expect(expanded("captain-edit")).toBe("false");
+    expect(expanded("player-edit-dev.coder")).toBe("false");
+    unmount();
+    // A later visit asks for nothing and opens as the reader left it.
+    render(<SettingsSurface />);
+    expect(expanded("player-edit-dev.reviewer")).toBe("false");
+  });
+});

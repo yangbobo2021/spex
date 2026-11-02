@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ui-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "-w", "packages/ui", "--", "--port", "5173", "--strictPort"],
+      "port": 5173
+    },
+    {
+      "name": "core-fake",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev:fake", "-w", "packages/core"],
+      "port": 8137
+    },
+    {
+      "name": "ui-dist",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["--yes", "serve", "-l", "4173", "apps/desktop/ui-dist"],
+      "port": 4173
+    },
+    {
+      "name": "spex-server",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "start", "-w", "apps/server", "--", "--token=dev"],
+      "port": 8137
+    }
+  ]
+}

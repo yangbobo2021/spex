@@ -1,0 +1,560 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// The authoring workspace (DR-058, playbook-library-52): in place of
+// the playbook list, a header with the way back, the playbook's id
+// with its spec package's name, and its state chip; the conversation
+// on the left; on the right a pane of four tabs — Source, Gears,
+// Machine, Enable — with the Compile
+// control at the strip's end and the compile watched in a band under
+// it. The house divider stands between the panes from the @2xl step
+// and turns into the horizontal grip once they stack (DR-030,
+// DR-041 §9); each pane scrolls in its own box and the page never
+// does. Both splits are app preferences.
+
+import { useEffect, useRef, useState } from "react";
+import type {
+  CommandResults,
+  DraftInfo,
+  PlaybookArtifacts,
+} from "@sublang/spex-core/protocol";
+
+import {
+  DRAFT_SPLIT_DEFAULT,
+  DRAFT_SPLIT_MAX,
+  DRAFT_SPLIT_MIN,
+  DRAFT_STACK_DEFAULT,
+  DRAFT_STACK_MAX,
+  DRAFT_STACK_MIN,
+  isLocalPlace,
+  type DraftRegisterForm,
+  type DraftSourceMode,
+} from "../state/store.js";
+import { usePlaceStore } from "../state/place-context.js";
+import { draftChipTitle, draftChipTone, draftChipWord, draftMediaOwner, draftPackagePath } from "../lib/drafts.js";
+import type { SpecEditorState } from "../lib/spec-view-model.js";
+import { i18n } from "../i18n.js";
+import { useClock } from "../lib/useClock.js";
+import { CompileBand } from "./CompileBand.js";
+import { DraftConversation } from "./DraftConversation.js";
+import { DraftRegisterTab } from "./DraftRegisterTab.js";
+import { DraftSourceTab } from "./DraftSourceTab.js";
+import { Icon, type IconName } from "./Icon.js";
+import { GearsItems, StageBox, StateList } from "./PlaybookStages.js";
+import { RunningMark } from "./RunningMark.js";
+import { SplitDivider } from "./RunView.js";
+import { draftAttachmentKey, useComposerAttachments } from "../lib/useComposerAttachments.js";
+
+type Toolchain = CommandResults["compile.check"];
+type Tab = "source" | "gears" | "machine" | "enable";
+
+/** The four tabs. Each label and hint is read when the strip draws,
+ * never when this module loads, so the table never freezes the
+ * language it was imported in (localization-4). */
+const TABS: readonly { key: Tab; label: string; icon: IconName; hint: string }[] = [
+  {
+    key: "source",
+    get label() {
+      return i18n._({ id: "Source", comment: "pipeline stage: the authored workflow" });
+    },
+    icon: "file",
+    get hint() {
+      return i18n._("The draft's markdown as it stands on disk");
+    },
+  },
+  {
+    key: "gears",
+    get label() {
+      return i18n._({
+        id: "Gears",
+        comment: "pipeline stage: the compiler's normative spec items (a proper name)",
+      });
+    },
+    icon: "list",
+    get hint() {
+      return i18n._("One spec item per state behavior, from the last compile");
+    },
+  },
+  {
+    key: "machine",
+    get label() {
+      return i18n._({ id: "Machine", comment: "tab: the compiled state machine" });
+    },
+    icon: "hexagon",
+    get hint() {
+      return i18n._("The compiled state machine, from the last compile");
+    },
+  },
+  {
+    key: "enable",
+    get label() {
+      return i18n._({ id: "Enable", comment: "enable this playbook in this config" });
+    },
+    icon: "check",
+    get hint() {
+      return i18n._("Confirm the command, intent, players and where to enable it");
+    },
+  },
+];
+
+const TONE_CLASSES: Record<string, string> = {
+  amber: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-200",
+  red: "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300",
+  emerald: "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300",
+  neutral: "bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400",
+};
+
+/** The draft's state chip (playbook-library-50): one word within the
+ * budget, the details in its title, the running mark on a live
+ * compile — worn by the list's rows and the workspace header alike. */
+export function DraftStateChip({ draft }: { draft: DraftInfo }) {
+  const now = useClock(draft.state === "compiling");
+  const word = draftChipWord(draft);
+  return (
+    <span
+      data-testid="draft-chip"
+      data-state={draft.sourceMissing ? "source-missing" : draft.state}
+      title={draftChipTitle(draft, now)}
+      className={`inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs whitespace-nowrap ${TONE_CLASSES[draftChipTone(draft)]}`}
+    >
+      {draft.state === "compiling" && !draft.sourceMissing ? (
+        <RunningMark running title={i18n._({ id: "Compiling", comment: "the draft's compile is running" })} />
+      ) : null}
+      {word}
+    </span>
+  );
+}
+
+export function AuthoringWorkspace({
+  draftId,
+  onBack,
+  onNavigate,
+}: {
+  draftId: string;
+  /** Back to the list; the session stays open in the core. */
+  onBack: () => void;
+  /** The host's surface navigation, where it offers one: Sign in to
+   * publish leads to Space (playbook-library-93). */
+  onNavigate?: (surface: "Settings" | "Space") => void;
+}) {
+  const store = usePlaceStore();
+  const draft = store((state) => state.drafts[draftId]);
+  const media = useComposerAttachments(
+    draftAttachmentKey(draftId),
+    draft ? draftMediaOwner(draft) : undefined,
+  );
+  const draftView = store((state) => state.draftViews[draftId]);
+  const source = store((state) => state.draftSources[draftId]);
+  const artifacts = store((state) => state.draftArtifacts[draftId]);
+  const composer = store((state) => state.draftComposers[draftId]);
+  const sourceMode = store((state) => state.draftSourceModes[draftId]);
+  const editor = store((state) => state.draftEditors[draftId]);
+  const form = store((state) => state.draftForms[draftId]);
+  const error = store((state) => state.draftErrors[draftId]);
+  const lines = store((state) => state.compileProgress[draftId]);
+  const times = store((state) => state.compileProgressAt[draftId]);
+  const configState = store((state) => state.configState);
+  const readiness = store((state) => state.readiness);
+  const connection = store((state) => state.connection);
+  const draftSplit = store((state) => state.draftSplit);
+  const draftStackSplit = store((state) => state.draftStackSplit);
+  const setDraftSplit = store((state) => state.setDraftSplit);
+  const setDraftStackSplit = store((state) => state.setDraftStackSplit);
+  const sendDraft = store((state) => state.sendDraft);
+  const abortDraft = store((state) => state.abortDraft);
+  const writeDraftSource = store((state) => state.writeDraftSource);
+  const refreshDraftSource = store((state) => state.refreshDraftSource);
+  const compileDraft = store((state) => state.compileDraft);
+  const abortDraftCompile = store((state) => state.abortDraftCompile);
+  const registerDraft = store((state) => state.registerDraft);
+  const setDraftPlayer = store((state) => state.setDraftPlayer);
+  const loadDraftArtifacts = store((state) => state.loadDraftArtifacts);
+  const setDraftComposer = store((state) => state.setDraftComposer);
+  const setDraftSourceMode = store((state) => state.setDraftSourceMode);
+  const setDraftEditor = store((state) => state.setDraftEditor);
+  const setDraftForm = store((state) => state.setDraftForm);
+  const clearDraftError = store((state) => state.clearDraftError);
+  const reportDraftError = store((state) => state.reportDraftError);
+
+  const [tab, setTab] = useState<Tab>("source");
+  const [toolchain, setToolchain] = useState<Toolchain>();
+  const [artifactsError, setArtifactsError] = useState<string>();
+  const [registerSeen, setRegisterSeen] = useState<string>();
+  const splitRef = useRef<HTMLDivElement>(null);
+  const connected = connection === "open";
+
+  useEffect(() => {
+    if (connected) {
+      store.getClient().command("compile.check", {}).then(setToolchain).catch(() => {});
+    }
+  }, [connected]);
+
+  // The compiled tabs draw the outputs the folder holds after each
+  // settled compile (playbook-library-60): a failed run's, possibly
+  // partial, read as not compiled (playbook-library-58).
+  const compileAt = draft?.compile?.at;
+  const compileOutcome = draft?.compile?.outcome;
+  useEffect(() => {
+    if (!connected || compileAt === undefined || compileOutcome === "running") return;
+    loadDraftArtifacts(draftId)
+      .then(() => setArtifactsError(undefined))
+      .catch((cause: Error) => setArtifactsError(cause.message));
+  }, [connected, draftId, compileAt, compileOutcome, loadDraftArtifacts]);
+
+  const compiledOk = draft?.compile?.outcome === "ok";
+  // What the folder holds: a registry never written resolves to every
+  // stage absent, which is nothing to show — the tabs stay disabled
+  // until a compile succeeds or a run leaves outputs, a failed run's
+  // shown as it left them (playbook-library-58, playbook-library-60).
+  const hasArtifacts = artifacts !== undefined && (artifacts.gears !== null || artifacts.fsm !== null);
+  const artifactsReady = compiledOk || hasArtifacts;
+  // The Enable tab's dot stays until it is opened after the agent's
+  // proposal lands (playbook-library-60).
+  const registerKey =
+    draft && compiledOk
+      ? `${draft.compile?.at}:${JSON.stringify(draft.proposal ?? null)}`
+      : undefined;
+  useEffect(() => {
+    if (tab === "enable" && registerKey !== undefined) setRegisterSeen(registerKey);
+  }, [tab, registerKey]);
+  useEffect(() => {
+    // A tab that stops being available yields to Source.
+    if ((tab === "gears" || tab === "machine") && !artifactsReady) setTab("source");
+    if (tab === "enable" && !compiledOk) setTab("source");
+  }, [tab, artifactsReady, compiledOk]);
+
+  if (!draft) return null;
+  // What a control does once its command answered reaches only the
+  // session it was shown for: a session made again under the id keeps
+  // its own composer, Source tab and form (playbook-library-62).
+  const shown = draft.instance;
+  const forShown = <A extends unknown[]>(effect: (...args: A) => void) => (...args: A): void => {
+    if (shown === undefined || store.getState().drafts[draftId]?.instance === shown) effect(...args);
+  };
+  const summary = configState?.status === "valid" ? configState.summary : undefined;
+  // Its compile, whatever turn runs beside it (core-service-96).
+  const compiling = draft.compiling ?? draft.activity === "compiling";
+  // A diagnostic and the toolchain's guidance are the core's own
+  // words; the rest is ours.
+  const compileReason = draft.diagnostic
+    ? draft.diagnostic
+    : !source
+    ? i18n._("No source yet")
+    : compiling
+        ? i18n._({ id: "Compiling", comment: "why a control is held: the draft's compile is running" })
+        : toolchain && !toolchain.node.ok
+          ? toolchain.node.guidance
+          : toolchain?.slc.guidance && !toolchain.slc.ok
+            ? toolchain.slc.guidance
+            : undefined;
+  const staleCaption =
+    draft.state === "changed"
+      ? i18n._("from the compile before this change")
+      : !compiledOk && hasArtifacts
+        ? i18n._("as the last run left them, not compiled")
+        : undefined;
+  const sourceDot = Boolean(source) && (!compiledOk || draft.state === "changed");
+  const registerDot = registerKey !== undefined && registerSeen !== registerKey;
+  const enabled: Record<Tab, boolean> = {
+    source: true,
+    gears: artifactsReady,
+    machine: artifactsReady,
+    enable: compiledOk,
+  };
+  const mode = sourceMode ?? { mode: "view" as const, pasteText: "", pastePath: "" };
+  // A picked file and a pasted path name this computer's disk: a remote
+  // place's draft is on its server, so neither is offered there
+  // (run-view-169).
+  const local = isLocalPlace(store.place);
+  const pickFile = local && window.spexNative?.pickFile
+    ? () => window.spexNative!.pickFile!()
+    : undefined;
+
+  const artifactPanel = (kind: "gears" | "machine", loaded: PlaybookArtifacts | undefined) => {
+    if (artifactsError && !loaded) {
+      return <div className="text-xs text-red-500">{artifactsError}</div>;
+    }
+    if (!loaded) return <div className="text-xs text-neutral-500">{i18n._({ id: "loading…", comment: "a request for this pane's content is in flight" })}</div>;
+    return (
+      <div className="flex flex-col gap-2">
+        {staleCaption ? (
+          <span data-testid="artifact-caption" className="text-xs text-amber-700 dark:text-amber-300">
+            {staleCaption}
+          </span>
+        ) : null}
+        {kind === "gears" ? (
+          <StageBox id={`draft-${draftId}`} stage={i18n._({ id: "Gears", comment: "pipeline stage: the compiled spec items" })}>
+            {loaded.gearsItems ? (
+              <GearsItems id={`draft-${draftId}`} file={loaded.gearsItems} />
+            ) : loaded.gears ? (
+              <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-neutral-700 dark:text-neutral-300">
+                {loaded.gears}
+              </pre>
+            ) : (
+              <div className="text-xs text-neutral-500">{i18n._("this stage was not found for this draft")}</div>
+            )}
+          </StageBox>
+        ) : (
+          <StageBox
+            id={`draft-${draftId}`}
+            stage={i18n._({ id: "Machine", comment: "pipeline stage: the compiled state machine" })}
+            header={
+              loaded.stateIds ? <StateList id={`draft-${draftId}`} states={loaded.stateIds} /> : undefined
+            }
+          >
+            {loaded.fsm ? (
+              <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-neutral-700 dark:text-neutral-300">
+                {loaded.fsm}
+              </pre>
+            ) : (
+              <div className="text-xs text-neutral-500">{i18n._("this stage was not found for this draft")}</div>
+            )}
+          </StageBox>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div data-testid="authoring-workspace" className="flex min-h-0 flex-1 flex-col">
+      <header className="@container flex shrink-0 items-center gap-2 border-b border-neutral-200 px-4 py-1.5 text-sm dark:border-neutral-800">
+        <button
+          type="button"
+          data-testid="workspace-back"
+          onClick={onBack}
+          title={i18n._("Back to the playbook list — the session stays as it is")}
+          className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-neutral-600 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
+        >
+          <span aria-hidden="true">‹</span>
+          {i18n._({ id: "Playbooks", comment: "back to the project's Playbooks tab, listing its playbooks" })}
+        </button>
+        <span className="min-w-0 truncate font-mono font-semibold" title={draft.id}>
+          {draft.id}
+        </span>
+        {/* The spec package under development the playbook lives in
+            (playbook-library-52): an at-a-glance extra, so it yields
+            first in a narrow pane (DR-041 §9). */}
+        <span
+          data-testid="workspace-package"
+          className="hidden min-w-0 truncate font-mono text-xs text-neutral-500 @md:inline"
+          title={draftPackagePath(draft)}
+        >
+          {draft.package ?? draftPackagePath(draft)}
+        </span>
+        <DraftStateChip draft={draft} />
+      </header>
+      {/* The split is layout by its own width: side by side with the
+          divider from 42rem, stacked beneath with the grip between. */}
+      <div data-testid="workspace-split" className="@container flex min-h-0 flex-1 flex-col">
+        <div
+          ref={splitRef}
+          style={
+            {
+              "--draft-split": `${draftSplit}%`,
+              "--draft-stack": `${draftStackSplit}%`,
+            } as React.CSSProperties
+          }
+          className="flex min-h-0 flex-1 flex-col gap-3 p-3 @2xl:flex-row"
+        >
+          <div
+            data-testid="conversation-pane"
+            className="flex h-(--draft-stack) min-h-0 min-w-0 flex-none flex-col @2xl:h-auto @2xl:w-(--draft-split) @2xl:min-w-[280px]"
+          >
+            <DraftConversation
+              draft={draft}
+              draftView={draftView}
+              players={summary?.players ?? []}
+              captain={summary?.captain}
+              readiness={readiness}
+              connected={connected}
+              composerText={composer?.draft ?? ""}
+              attachments={media.controls}
+              error={error}
+              onComposerChange={forShown((text: string) => setDraftComposer(draftId, text))}
+              onSend={async (text) => {
+                await sendDraft(draftId, text, media.assets);
+                forShown(media.consume)();
+              }}
+              onAbort={() => void abortDraft(draftId)}
+              onPickAgent={(playerId) => setDraftPlayer(draftId, playerId)}
+              onDismissError={() => clearDraftError(draftId)}
+              onOpenRegister={() => setTab("enable")}
+              onUseSkill={async () => {
+                // playbook-library-84: a picked file is the source when
+                // the draft has none, else the paste mode's path for
+                // "Use as source" to confirm; with no pick to run, the
+                // paste mode with its text focused.
+                if (!pickFile) {
+                  setDraftSourceMode(draftId, { mode: "paste" });
+                  setTab("source");
+                  return "paste";
+                }
+                const picked = await pickFile();
+                if (!picked) return null;
+                setTab("source");
+                if (draft.state === "no-source") {
+                  try {
+                    await writeDraftSource(draftId, { sourcePath: picked });
+                  } catch (cause) {
+                    forShown(reportDraftError)(draftId, (cause as Error).message);
+                  }
+                  return "field";
+                }
+                forShown(setDraftSourceMode)(draftId, { mode: "paste", pastePath: picked, pasteText: "" });
+                return "paste";
+              }}
+            />
+          </div>
+          <div className="hidden @2xl:contents">
+            <SplitDivider
+              percent={draftSplit}
+              onChange={setDraftSplit}
+              containerRef={splitRef}
+              label={i18n._("Resize the conversation pane")}
+              testId="authoring-divider"
+              min={DRAFT_SPLIT_MIN}
+              max={DRAFT_SPLIT_MAX}
+              defaultPercent={DRAFT_SPLIT_DEFAULT}
+            />
+          </div>
+          <div className="contents @2xl:hidden">
+            <SplitDivider
+              orientation="horizontal"
+              percent={draftStackSplit}
+              onChange={setDraftStackSplit}
+              containerRef={splitRef}
+              label={i18n._("Resize the conversation pane")}
+              testId="authoring-grip"
+              min={DRAFT_STACK_MIN}
+              max={DRAFT_STACK_MAX}
+              defaultPercent={DRAFT_STACK_DEFAULT}
+            />
+          </div>
+          <section
+            data-testid="artifacts-pane"
+            aria-label={i18n._("Draft artifacts")}
+            className="@container flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border border-neutral-200 bg-white @2xl:min-w-[280px] dark:border-neutral-800 dark:bg-neutral-900"
+          >
+            {/* The strip: the tab list, then the Compile control at its
+                right end — a sibling, since a tab list holds tabs alone. */}
+            <div className="flex flex-wrap items-center gap-1 border-b border-neutral-200 px-2 py-1.5 dark:border-neutral-800">
+              <div
+                role="tablist"
+                aria-label={i18n._("Draft artifacts")}
+                className="flex flex-wrap items-center gap-1"
+              >
+              {TABS.map((entry) => {
+                const on = tab === entry.key;
+                const label = entry.label;
+                const dot =
+                  entry.key === "source" ? sourceDot : entry.key === "enable" ? registerDot : false;
+                return (
+                  <button
+                    key={entry.key}
+                    type="button"
+                    role="tab"
+                    id={`draft-tab-${entry.key}`}
+                    data-testid={`tab-${entry.key}`}
+                    aria-selected={on}
+                    aria-controls="draft-tabpanel"
+                    aria-label={label}
+                    aria-disabled={!enabled[entry.key]}
+                    disabled={!enabled[entry.key]}
+                    title={enabled[entry.key] ? entry.hint : i18n._({ id: "Compiles first", comment: "why a tab is disabled: nothing to show until a compile succeeds" })}
+                    onClick={() => setTab(entry.key)}
+                    className={`inline-flex min-h-6 items-center gap-1 rounded-md px-1.5 text-xs @xs:px-2 ${
+                      on
+                        ? "bg-brand-100 font-medium text-brand-700 dark:bg-brand-950 dark:text-brand-300"
+                        : "text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 disabled:hover:bg-transparent dark:text-neutral-300 dark:hover:bg-neutral-800"
+                    }`}
+                  >
+                    {/* Below @xs the tab is its icon and tooltip, its
+                        padding tightened so the strip keeps one line in
+                        the narrowest pane beneath the project's tabs;
+                        the accessible name never changes (DR-041 §9). */}
+                    <Icon name={entry.icon} className="h-3.5 w-3.5 @xs:hidden" />
+                    <span className="hidden @xs:inline">{label}</span>
+                    {dot ? (
+                      <span
+                        data-testid={`tab-dot-${entry.key}`}
+                        aria-hidden="true"
+                        className="h-1.5 w-1.5 rounded-full bg-amber-500"
+                      />
+                    ) : null}
+                  </button>
+                );
+              })}
+              </div>
+              <span className="ml-auto" />
+              <button
+                type="button"
+                data-testid="compile-button"
+                disabled={compiling || compileReason !== undefined || !connected}
+                title={
+                  !connected
+                    ? i18n._({ id: "Not connected", comment: "why a control is held: the page has no core" })
+                    : (compileReason ?? i18n._("Runs slc over the draft's source — a few minutes, longer for many roles"))
+                }
+                onClick={() => void compileDraft(draftId)}
+                className="rounded-md bg-brand-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-brand-500 disabled:opacity-40"
+              >
+                {compiling ? i18n._({ id: "Compiling…", comment: "a compile is in flight" }) : i18n._({ id: "Compile", comment: "start a compile of the draft's source" })}
+              </button>
+            </div>
+            <CompileBand
+              draftId={draftId}
+              draft={draft}
+              lines={lines ?? []}
+              times={times ?? []}
+              connected={connected}
+              onCancel={() => void abortDraftCompile(draftId)}
+            />
+            <div
+              role="tabpanel"
+              id="draft-tabpanel"
+              aria-labelledby={`draft-tab-${tab}`}
+              data-testid={`panel-${tab}`}
+              className={`relative flex min-h-0 flex-1 flex-col p-3 ${
+                mode.mode === "edit" && tab === "source" ? "" : "overflow-y-auto"
+              }`}
+            >
+              {tab === "source" ? (
+                <DraftSourceTab
+                  draftId={draftId}
+                  draft={draft}
+                  source={source}
+                  mode={mode}
+                  editor={editor}
+                  connected={connected}
+                  pickFile={pickFile}
+                  pathEntry={local}
+                  onMode={forShown((next: Partial<DraftSourceMode>) => setDraftSourceMode(draftId, next))}
+                  onEditor={forShown((next: SpecEditorState | undefined) => setDraftEditor(draftId, next))}
+                  onWrite={(input) => writeDraftSource(draftId, input)}
+                  onRead={() => refreshDraftSource(draftId)}
+                />
+              ) : tab === "gears" ? (
+                artifactPanel("gears", artifacts)
+              ) : tab === "machine" ? (
+                artifactPanel("machine", artifacts)
+              ) : (
+                <DraftRegisterTab
+                  draft={draft}
+                  source={source}
+                  players={summary?.players ?? []}
+                  captain={summary?.captain}
+                  readiness={readiness}
+                  form={form}
+                  connected={connected}
+                  onForm={forShown((next: DraftRegisterForm) => setDraftForm(draftId, next))}
+                  onRegister={(input) => registerDraft(draftId, input)}
+                  onNavigate={onNavigate}
+                />
+              )}
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}

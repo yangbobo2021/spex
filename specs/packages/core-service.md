@@ -1,0 +1,1351 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai> -->
+
+# core-service: Core Service
+
+## Intent
+
+This spec covers the Spex core service — the headless Node service in `packages/core` (the private workspace package `@sublang/spex-core`): its observable behavior, its implementation requirements, and its end-to-end integration coverage.
+The service owns config, project sessions, the intent ledger, the embedded playbook runtime, and persistence behind one WebSocket API: it embeds the headless cligent runtime and the playbook captain shell, and it shares the playbook launcher's config file, its session store ([DR-036](../decisions/036-file-state-store.md)), and its adapter readiness rules.
+Every behavior in this package is observable over the WebSocket protocol; the service serves no HTML, and integration coverage runs end to end against a scripted fake adapter.
+A **runtime** is one core on one home, named by the home's `device` [[storage-2](storage.md#storage-2)], with a label for display; a session or an intent **assigned** to a runtime is executed by that runtime alone ([DR-134](../decisions/134-execution-ownership.md)).
+
+## External Behavior
+
+### Endpoint
+
+#### core-service-89
+
+When started on a native platform other than macOS, Linux or Windows, the core service shall refuse before creating or migrating config or storage, naming the supported hosts ([DR-178](../decisions/178-native-windows-private-storage.md)):
+
+- Windows storage admission verifies the private-storage policy before config or storage is created or migrated.
+
+- Supported hosts require a filesystem that enforces the shared store's private permissions [[1]].
+
+#### core-service-1
+
+Where the core service is started by a host shell, when startup completes, the core service shall accept WebSocket connections on its endpoint — a loopback-only socket the service binds itself by default, or a shell-supplied HTTP server the service attaches to, leaving binding and transport security to that shell ([DR-033](../decisions/033-remote-gui-serving.md)) — at the path `/`, and on the relay paths of its open seats [[core-service-129](#core-service-129)], answer HTTP reads under `/applets/` for its open applets [[applets-4](applets.md#applets-4)] ([DR-161](../decisions/161-an-applet-is-a-page-the-ide-serves.md)), refusing any other path, and report the endpoint address to the host:
+
+- When a client connects, the core service sends a hello message naming the protocol version, and no client, before any other message, so clients can detect a protocol mismatch before issuing commands.
+
+#### core-service-24
+
+The core package shall reject WebSocket handshakes that do not present the service's session token, and handshakes whose Origin header names a foreign web origin, so that neither arbitrary local web pages nor remote pages can drive the control plane; embedding shells receive the token at startup and pass it to the UI:
+
+An Origin is not foreign only in these cases:
+
+| Origin | Admitted as |
+| --- | --- |
+| absent | a non-browser client |
+| `null`, or a `file://` origin | the packaged renderer |
+| `http(s)://localhost` or `http(s)://127.0.0.1`, any port | a local dev page |
+| the host the handshake request itself addressed | a page the embedding shell serves ([DR-033](../decisions/033-remote-gui-serving.md)) |
+
+- A relay path of an open seat [[core-service-129](#core-service-129)] admits exactly as the path `/` does: the same token, the same origins ([DR-133](../decisions/133-one-desktop-over-several-cores.md)).
+
+### Configuration
+
+#### core-service-2
+
+Where your own group's spex repository holds its `config/playbook.config.yaml` [[storage-1](storage.md#storage-1)], when the core service starts, the core service shall load and validate the config, composing a session's configuration from your own group's file with the session's spex repository's file on top [[storage-7](storage.md#storage-7)], reloading and revalidating without a restart whenever either file's content changes on disk while the service runs ([DR-103](../decisions/103-the-home-and-its-groups.md)).
+
+On every load and reload:
+
+- Your own group's file holds the captain, the players with what each runs on, the playbooks it enables with the player each role uses, notifications, theme and layout; a project's or another group's file holds only the playbooks it enables with the player each role uses, by name, and an option slice per playbook — a `captain`, `players` or model field in it, a `from` in any file, or a `skills` list at the top of your own group's file, on its Captain or on a player, is a config error naming the entry.
+- A player the project's file names and your own group's lacks is reported before a session of that project starts, as a config error that names the player and offers to add it [[settings-46](settings.md#settings-46)]; sessions of other spex repositories are unaffected.
+
+- On success, the resulting config state is broadcast to all connected clients.
+- On failure, a config error naming the offending entry and the violated rule is broadcast, and session creation requests are rejected while no valid config is active.
+- A turn in flight keeps the config it opened with; the next message opens with the current config, or is refused naming the config error [[core-service-73](#core-service-73)] ([DR-051](../decisions/051-runtime-held-for-a-turn.md)).
+- The state is a cache of the files it was composed from — both config files, the environments' locks and install records, the presence of selected registry and Git files that establishes module availability [[environments-9](environments.md#environments-9)], each module entry those locks place an enabled playbook at, a missing one as absent, and the home's pairing where a selected project's folder supplies option context — at the versions read: a command, turn or compile taking anything from it checks them first and reads again where one changed, with or without a watcher's notice, while what was already broadcast stays as broadcast ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)).
+- A project config write or new-session admission whose selected pairing changes during validation is refused as `conflict` before the config is written or the session host opens.
+- A load, composition, broadcast or readiness probe whose files changed while it ran publishes nothing it read, valid or not: it may read once more, else the command is refused as `conflict`, "changed meanwhile; retry".
+- Where the file is a profiles-era config, the load migrates it in place per the launcher's semantics ([DR-019](../decisions/019-inline-agent-configuration.md)): named profiles inline into agent blocks, the `profiles` map is deleted, the pre-migration file is backed up beside the config with comments surviving, and a `profile` naming a missing entry is a config error that leaves the file untouched.
+- Validation fails closed on the same defect classes as the playbook launcher [[core-service-16](#core-service-16)].
+
+#### core-service-3
+
+Where no config file exists at the shared config path, when the core service starts, the core service shall write the installed playbook package's own seed for the core's environment and home to that path, adopt it as the active config, and report the seeding to connected clients ([DR-037](../decisions/037-playbook-12-adoption.md); [DR-154](../decisions/154-the-seed-follows-playbooks-rule.md)):
+
+- The text is what `@sublang/playbook/seed-config` returns for that environment and home, with every `playbooks.<id>.from` removed; the core chooses no adapter, model, effort or writable path itself.
+- That seed reads credentials alone — an agent's API key or token form in the environment, or the `.claude` and `.codex` folders in the home; on a seat, the environment its credentials were read into first [[core-service-126](#core-service-126)] — so the Captain's and each player's `adapter`, `model`, `effort` and `writablePaths` equal the `playbook` CLI's seed under the same credentials and home, while the two files may differ:
+
+| Credentials | Seeded agents |
+| --- | --- |
+| Claude only, or neither | every agent as the template writes it, on `claude` |
+| Codex only | every agent on `codex` / `gpt-6-sol` with `writablePaths: ['.git']` |
+| both | `dev.reviewer` on `codex` / `gpt-6-sol` with `writablePaths: ['.git']`, every other agent as the template writes it |
+
+- The file is created exclusively, and the seed's version is recorded [[storage-5](storage.md#storage-5)]; an existing config file is never overwritten, and only the reseed of [[core-service-137](#core-service-137)] rewrites the seeded file afterwards.
+
+#### core-service-137
+
+Where the recorded seed names the shared config path [[storage-5](storage.md#storage-5)], when the core service starts, and on a seat when the member sets or removes an agent credential [[settings-48](settings.md#settings-48)], the core service shall reseed that file while it stands at the recorded version ([DR-156](../decisions/156-an-untouched-seed-follows-the-credentials.md)):
+
+| The file | Outcome |
+| --- | --- |
+| at the recorded version, the seed of [[core-service-3](#core-service-3)] for the environment and home now the same bytes | left as it is |
+| at the recorded version, that seed different | written as one versioned write, its permission bits kept, the new version recorded, adopted as the active config and reported as reseeded to connected clients |
+| at any other version, absent, or changed before the write | left as it is, and the record removed, so the file is never reseeded again |
+
+- A config with no record, or a record naming another path, is never reseeded.
+
+#### core-service-66
+
+Where the shared config path is the default one and holds nothing, when the core service starts and a config file exists at a former location — the home's `playbook/playbook.config.yaml`, or, where that path holds nothing, the previous XDG location — the core service shall relocate it once into the shared config path before seeding — bytes and permission bits preserved, published with an exclusive link so a canonical file appearing concurrently wins ([DR-037](../decisions/037-playbook-12-adoption.md); [DR-080](../decisions/080-the-config-directory-is-named-config.md)):
+
+- An explicit config path given by the shell moves nothing.
+- A former file inside the home is removed once the canonical file is published, and its directory with it when that leaves the directory empty; the XDG file is left in place.
+- A former file whose path-shaped `playbooks.<id>.from` or relative `sessions` locator would resolve to a different target from the shared path's directory is left where it is and reported, since moving it would retarget the locator; the shared config path is your own group's clone's [[storage-1](storage.md#storage-1)].
+
+### Sessions
+
+#### core-service-4
+
+Where a project is registered ([DR-006](../decisions/006-projects-and-forge.md)) and the active config is valid, when a client requests a session for that project, the core service shall create a live session whose embedded runtime is initialized with the project directory as its working directory, and shall report the new session to subscribed clients:
+
+- After waiting for any settlement in progress [[core-service-91](#core-service-91)], while a session of the project remains live or another host holds one, a further session request for the same project is rejected `busy` naming that session, and creates no session ([DR-051](../decisions/051-runtime-held-for-a-turn.md)).
+- Local admission and recovery reservations keep the project exclusive while ownership is revalidated [[core-service-73](#core-service-73)] or a recovery's released ownership is published [[core-service-83](#core-service-83)]; a refused request releases only its own reservation.
+- A Space operation running on the project's spex repository refuses no request [[space-21](space.md#space-21)].
+- Live sessions for distinct projects run concurrently.
+- A session is assigned to this runtime at creation: the core appends its runtime record [[storage-43](storage.md#storage-43)] before its first turn is admitted, with this runtime's label — the server's name on a seat, else the host name ([DR-134](../decisions/134-execution-ownership.md)).
+- While a session is live, a client's disposal request aborts its turn, persists the session's Captain snapshot [[core-service-72](#core-service-72)], disposes the session's runtime, and reports the session as no longer live; a Boss message continues it [[core-service-73](#core-service-73)].
+- Where disposal fails, the core reports the error and retains the session's lease and project reservation until cleanup is confirmed; stopping the owning process allows later recovery through the shared lease checks ([DR-048](../decisions/048-failed-session-cleanup.md)).
+
+#### core-service-91
+
+When a Boss turn settles on a live session, the core service shall release the session's runtime — the Playbook lease with it — and report the session as no longer live, so the runtime is held only for a turn and every later message opens it again with the current config [[core-service-73](#core-service-73)] ([DR-051](../decisions/051-runtime-held-for-a-turn.md), [DR-074](../decisions/074-a-parked-run-survives.md)):
+
+- unresolved repository effects hold nothing back: the settled checkpoint releases with them recorded, because reopening the session fences them [[1]];
+- the release first records what a run of that session standing parked on the Boss advertises — its own actions and the shell's ending, this being the only moment they can be read without opening the session — and records nothing where no run stands parked [[core-service-32](#core-service-32)];
+- a failed or aborted turn the shared lifecycle settled at its saved progress releases as a settled one does, its parked run's controls recorded; one left uncertain releases the runtime with its recovery reported and no parked controls kept [[core-service-32](#core-service-32)];
+- the release preserves the local provider hints written at settlement, so the next open resumes the Captain's and the players' provider conversations where they exist;
+- session and project admission wait through release and the resulting stored-summary refresh and publication, on successful and failed turns alike.
+
+#### core-service-92
+
+When a session's runtime is opened for a message [[core-service-73](#core-service-73)], the core service shall project the current config onto the session's stored members — the playbooks of its stored structure, and its referenced players in stored order — and shall compare that projection's structure with the stored one before opening ([DR-051](../decisions/051-runtime-held-for-a-turn.md)):
+
+| Case | Outcome |
+| --- | --- |
+| Same structure, same tuning | the runtime opens on the stored projection |
+| Same structure, changed model, subagent model, effort, subagent effort, fast mode, or browser access [[media-9](media.md#media-9)] | the runtime opens on the new projection, applied from the next call |
+| A stored playbook disabled, or changed in its source, command, options, or a binding's player; the Captain's or a stored player's adapter, instruction, or permissions changed; a stored player gone | refused `invalid_config` naming each changed field and offering a new session, the runtime never opened |
+
+- a playbook or player the session never had is left out of the projection and changes nothing;
+- a pending config reload is awaited before the projection is taken, so the settings applied are the file's latest;
+- the session's own tuning is applied onto the projection after the config's [[core-service-100](#core-service-100)] — at the Captain's block, at each tuned player's block, and at every role binding naming a tuned player, since a role's provider call is built from its binding — so a tuned session changes no other session and no config file ([DR-067](../decisions/067-tuning-for-one-conversation.md)).
+
+#### core-service-100
+
+When a client sends `session.agent.set` naming a session, one of its agents — the reserved `captain`, or a player of its bound roster — and a change to that agent's model, subagent model, effort, subagent effort, fast mode, or browser access, the core service shall accept the change only if the projection the session's next message would open on validates with it applied, then persist the session's own agent settings [[storage-5](storage.md#storage-5)] and republish the session's summary [[core-service-32](#core-service-32)] ([DR-067](../decisions/067-tuning-for-one-conversation.md), [DR-068](../decisions/068-an-agents-settings-where-the-agent-is.md): the same act as the configuration's own agent edits, at a different scope):
+
+| The field's value is | The agent runs |
+| --- | --- |
+| a string | that value, above the config's role binding and player alike |
+| `false` | the provider's current default for tuning; off for browser access |
+| `true` for browser | managed browser tools on the next accepted turn [[media-9](media.md#media-9)] |
+| `null` | the configured value — the session's tuning of that field is cleared |
+| absent | what the session's tuning already held for it |
+
+- validation composes the projection and applies the shared execution validator's own adapter-scoped rules, so a model, subagent model, effort, subagent effort, or fast mode the agent's adapter cannot enforce — a subagent effort beside an Off among them, whether the session, the agent's configuration or a binding naming it sets that Off [[core-service-16](#core-service-16)] — is refused `invalid_config` naming it, with nothing written;
+- an unknown session, or an agent outside the session's stored members, is refused `invalid_request` naming it;
+- runtime discovery narrows a client's choices [[settings-34](settings.md#settings-34)] and gates no save here, so tuning stays available while discovery is unavailable ([DR-052](../decisions/052-runtime-model-options.md));
+- a session whose tuning holds nothing carries none, and deleting a session drops its tuning with the rest of its per-session state [[core-service-70](#core-service-70)].
+
+#### core-service-93
+
+When a client requests the session list or the ledger, the core service shall derive each project's current conversation from stored state — its live session, else its most recently active session that continues [[core-service-32](#core-service-32)] or still carries a recovery boundary, and that no other host owns — and shall fold that conversation as the project's lane: its standing conditions and stand-ins [[core-service-49](#core-service-49)] ([DR-051](../decisions/051-runtime-held-for-a-turn.md), [DR-077](../decisions/077-up-next-is-a-committed-queue.md)):
+
+- a disposal trace the runtime emits outside a turn — carrying no turn id — is a pause, never the Captain dismissing a parked run, so a question parked at that moment stands until the runtime reports it gone ([DR-085](../decisions/085-boss-talks-through-captain.md));
+- a session assigned to another runtime [[storage-43](storage.md#storage-43)] is never the project's lane here and never holds the project, so this runtime may start a session of its own beside it ([DR-134](../decisions/134-execution-ownership.md)).
+
+#### core-service-72
+
+When a Boss turn or live session ends, the core service shall checkpoint through Playbook's shared lifecycle [[1]], preserving its token-free recovery journal, snapshot, effect ledger, uncertainty and durable replay binding in the shared manifest ([DR-045](../decisions/045-unified-session-storage.md)):
+
+- the pre-effect write-ahead boundary remains authoritative; inability to export or settle leaves that evidence intact and never fabricates success;
+- provider continuity is optional local hint state; missing hints use Captain's journal or the player's complete task, while ambiguous failures never auto-retry;
+- a session without supported recovery remains history-only, with the reason reported by continuation admission [[core-service-73](#core-service-73)].
+
+#### core-service-70
+
+When a client sends `session.delete` for a stored session, the core service shall delete the session's files and every in-memory trace of it — its records, turns, usage, viewed marker, tuning [[core-service-100](#core-service-100)] and the controls its parked run advertised [[core-service-32](#core-service-32)] — and broadcast the removal to subscribed clients, announcing `intents.changed` for its project [[core-service-51](#core-service-51)] ([DR-038](../decisions/038-history-is-done-work.md)):
+
+- a live session is refused with a `busy` error naming it: its turn finishes or is aborted first [[core-service-4](#core-service-4)] ([DR-051](../decisions/051-runtime-held-for-a-turn.md));
+- a session from either interface is deleted through the same shared-store operation and lease check [[core-service-75](#core-service-75)];
+- an open intent the session served re-derives as queued, and a closed one keeps its verdict [[core-service-49](#core-service-49)].
+
+#### core-service-75
+
+When a client requests deletion of any stored session, the core service shall obtain Playbook's exclusive session lease through the shared deletion operation [[1]] and refuse `busy` on active ownership or a diagnostic refusal on unprovable ownership before changing files:
+
+- deletion removes replay, hints, active legacy sidecar and derived state, then the manifest last; incomplete cleanup is retryable;
+- retired lease guards remain; the core never recursively clears a session lock directory to force admission.
+
+#### core-service-32
+
+When a client requests the session list, the core service shall reply with every stored session's lifecycle fields and its conversation summary ([DR-029](../decisions/029-session-history-home.md)):
+
+- each entry carries the session's resolved project, its creation time, its last activity — the wire field `endedAt`, null while live and otherwise the latest time its own records carry, its manifest's last update only where none carries one — liveness and `turnActive`, which stays true until the turn transaction settles or fails; host of origin is not an admission condition;
+- a non-live session has no active turn; historical records alone never establish liveness, and a session acquired by this core is never reported as externally owned;
+- each entry says whether a Boss message continues it, using the shared checkpoint, replay and execution checks [[core-service-73](#core-service-73)], with a reason when history-only;
+- an entry whose session is assigned to another runtime [[storage-43](storage.md#storage-43)] carries `runsOn` with that runtime's label, is not continuable, with the reason "Runs on <label>", and carries no `recovery`, whatever its checkpoint holds ([DR-134](../decisions/134-execution-ownership.md));
+- a settled checkpoint whose current working-folder binding or stored-member configuration refuses continuation is history-only with that refusal's reason; listing and reporting this reading open no runtime, acquire no session lease, consume no provider hints and change no session files;
+- this reading follows current bindings and configuration, including changes since the preceding listing or report; unprovable current inputs produce no positive reading, compatible tuning changes and unrelated enabled playbooks remain continuable [[core-service-92](#core-service-92)], and submission still checks admission afresh [[core-service-73](#core-service-73)];
+- each uncertain entry carries `recovery: {state: "uncertain", input, discardable}` with the exact saved input and whether Playbook's shared discard predicate [[2]] allows Discard — no recorded step, no abandonment, unchanged repository evidence ([DR-088](../decisions/088-playbook-17-slc-0-12-cligent-0-27-adoption.md)); uncertainty is never reported as normal continuability;
+- while this core runs a turn of the session — from its acceptance until the turn transaction settles or fails — the entry carries no `recovery` and no continuation reason: Playbook marks the checkpoint uncertain as the turn begins and settles it only with the turn, the evidence a turn cut off leaves, so the uncertain entry is one whose last turn was cut off with no turn running ([DR-047](../decisions/047-explicit-session-recovery.md));
+- external session leases are observed through Playbook's shared API [[1]]: an active writer reports liveness, and active or unprovable ownership reports `externalWriter` and withholds recovery controls until ownership is idle;
+- each entry carries a title — the first Boss turn's text — absent when the session held no turn;
+- each entry carries a `workTitle` — the text of the Boss turn that opened the work the session is doing, traced back from its latest turn as its stand-in entries' titles are [[core-service-49](#core-service-49)], so an answer sent while a question stood never names it ([DR-119](../decisions/119-an-answer-continues-its-intent.md)) — absent when the session held no turn;
+- each entry carries its turn count and whether a failure still stands, read from its visible records ([DR-061](../decisions/061-run-state-from-frames.md)): a run remains parked on a failure [[core-service-107](#core-service-107)], or a `runtime_error` other than the one an intentional stop leaves [[core-service-6](#core-service-6)] [[core-service-39](#core-service-39)] was recorded in a turn — one naming no turn counting as recorded in the latest turn started before it, and ahead of every turn where none had started — and no turn started after that one, a restore's report among them [[core-service-82](#core-service-82)], has since settled without such a record;
+- each entry carries cumulative active time from complete stored history for every agent with a measured finished call [[core-service-102](#core-service-102)];
+- each entry carries, for every agent whose runtime reported a call's model, the latest such report with the settings its call began under [[core-service-115](#core-service-115)], which a client compares with what the agent is set to run ([DR-091](../decisions/091-models-named-by-the-runtime.md));
+- each entry carries the session's own agent settings [[core-service-100](#core-service-100)], which a client reads over the config's to say what each of the session's agents is set to run ([DR-067](../decisions/067-tuning-for-one-conversation.md));
+- each entry whose last settlement found a run parked on the Boss carries that park [[core-service-91](#core-service-91)] — its reason, the run's failure state or its question; every action that run advertised, in order; and the ending the shell advertised, each control by id and Boss-facing label with any standing the runtime reported for it — so a client draws one control per action and names the one it activates [[core-service-98](#core-service-98)] ([DR-074](../decisions/074-a-parked-run-survives.md)); the reading is this host's own, kept with its preferences [[storage-5](storage.md#storage-5)], absent where that settlement found no parked run advertising anything, and a question's leaves when a turn of the session is accepted, that turn answering it ([DR-119](../decisions/119-an-answer-continues-its-intent.md)) and its own settlement reading the run afresh.
+
+#### core-service-102
+
+When the core service folds a session's conversation summary, it shall carry cumulative completed-call active time as an optional `agentActiveMs` map keyed by the reserved `captain` id and by session player id, derived solely from the stored record stream and its persisted completeness state so the same complete history yields the same map after a restart [[core-service-10](#core-service-10)] ([DR-070](../decisions/070-agent-active-time.md), [DR-071](../decisions/071-active-time-follows-held-calls.md), [DR-072](../decisions/072-backward-call-time-is-zero.md)):
+
+- reading records in order, each `player_finished` closes the oldest unmatched `player_prompt` with the same `turnId` and string `playerId`, and each `captain_finished` closes the oldest unmatched `captain_prompt` with the same `turnId`; their timestamp difference clamped to zero contributes once to that player across every role the lane served [[core-service-36](#core-service-36)] or to `captain`, including where the Captain records are hidden [[core-service-10](#core-service-10)];
+- every matched finished call contributes regardless of outcome, while terminal event durations, tool-result durations, turn spans, and time between calls contribute nothing;
+- only records with finite numeric timestamps can open or close a pair; an invalid-timestamp record, open prompt, or unmatched finish contributes nothing, creates no entry by itself, consumes no valid counterpart, and never removes an earlier measured span;
+- a matched finish earlier than its prompt closes and consumes that pair, contributing a measured zero;
+- an agent has a map entry, including a measured zero, after at least one matched prompt/finish pair;
+- a session whose stored stream is marked incomplete carries no `agentActiveMs`, because its retained prefix cannot establish any agent's cumulative session figure [[core-service-10](#core-service-10)];
+- each agent's spans sum independently without removing overlap between calls, and `agentActiveMs` is absent when no agent has a measured figure.
+
+#### core-service-115
+
+When the core service folds a session's conversation summary, it shall carry, as an optional `agentReportedModels` map keyed by the reserved `captain` id and by session player id, the model the runtime reported for each agent's latest call to report one together with the settings that call began under, derived solely from the stored record stream so the same history yields the same map after a restart [[core-service-10](#core-service-10)] ([DR-091](../decisions/091-models-named-by-the-runtime.md)):
+
+- a call reports its model as its `init` event's `reportedModel`, a non-empty string kept as the runtime sent it — a player's in its `player_event`, the Captain's in its `captain_event`, including where the Captain's records are hidden [[core-service-10](#core-service-10)];
+- the settings that call began under are its agent's adapter and model setting in the execution context the stream recorded for it — the `session_context` record whose sequence number the reporting record's `contextSeq` names, else the latest one before it — the model a pinned value or `false` for the provider's default; effort and fast mode are not kept, since neither changes which model the runtime runs;
+- an agent whose context holds no readable block for it, and a player that some role binding in that context runs on a model other than its own block's, have no entry, because no one report names what they run;
+- a session whose stored stream is marked incomplete carries no `agentReportedModels` [[core-service-10](#core-service-10)], and the map is absent when no agent has an entry.
+
+#### core-service-34
+
+When the core service reports a session's state to subscribed clients — at each turn's start and end, after any stored record or stream-completeness change alters its active-time or reported-model fold [[core-service-102](#core-service-102)] [[core-service-115](#core-service-115)], when its runtime is released [[core-service-91](#core-service-91)] or opened by a message [[core-service-73](#core-service-73)], and after recovery [[core-service-82](#core-service-82)] [[core-service-83](#core-service-83)] — the report shall carry that session's conversation summary as the listing carries it [[core-service-32](#core-service-32)] ([DR-029](../decisions/029-session-history-home.md)), never the summary the session was created with:
+
+- A session is named from the turn that starts, not the turn that finishes, so a running session is never listed as having said nothing.
+
+#### core-service-87
+
+When a rescan replaces an indexed session's history, the core shall publish `session.history-replaced` with its `sessionId` before its updated summary, allowing clients to reload instead of combining incompatible histories [[storage-11](storage.md#storage-11)].
+
+#### core-service-85
+
+When a client sends `project.rebind` with `projectId`, local `path`, optional recorded `aliases` and optional Git `revision`, the core shall apply the existing-identity binding rules [[storage-6](storage.md#storage-6)] after verifying that the path is a repository root and the project has no live session — no turn in flight ([DR-051](../decisions/051-runtime-held-for-a-turn.md)).
+
+#### core-service-86
+
+When a client sends `storage.diagnostics`, the core shall report each unresolved binding or invalid stored file as `{file, reason, blocking}`, carrying the repair a local folder would make where one would, preserving the data and distinguishing history-only limitations from write-blocking damage [[storage-12](storage.md#storage-12)] ([DR-063](../decisions/063-space-setup-and-repair.md)):
+
+- after verified migration, damaged application or session files do not refuse startup; affected commands return `invalid_request` with the failing file and reason, while unrelated operations remain available;
+- a diagnostic a local folder would repair carries that repair's own facts — the project it names with that project's registered name, the working directories recorded for it, how many sessions record them, what the core found about each folder it names, and the one folder it proposes where exactly one qualifies [[space-53](space.md#space-53)] — so a client offers the repair, and its proposal, from the data rather than from the reason's wording;
+- a diagnostic no local folder repairs carries none, and a project is named by its registered name rather than by its identifier wherever a repair names it.
+
+### Boss Turns
+
+#### core-service-5
+
+While a session is live and no boss turn is active on it, when a client submits Boss composer text for that session, the core service shall start a boss turn on the session's runtime and stream the turn-started record to subscribed clients:
+
+- While a boss turn is active on a session, a further Boss submission for that session is rejected with a busy error and starts no turn, so boss turns on one session run strictly one at a time.
+- A submission for a session that is not live opens its runtime first [[core-service-73](#core-service-73)], then starts the turn as above.
+- A refused attachment handoff [[media-4](media.md#media-4)] starts no turn and leaves the already-live runtime owned as before.
+
+#### core-service-135
+
+When the core records a runtime failure of its own, it shall name the turn responsible for that failure:
+
+- a Captain call ending in error names that call's turn;
+- a turn, control or restore rejecting names the turn its attempt started, including a restore's report;
+- a rejection before its attempt started any turn names none.
+
+#### core-service-73
+
+While a session is not live, when a client submits Boss text for it, the core service shall request continuation through Playbook's shared lifecycle [[1]] with the current config projected onto the session's stored members [[core-service-92](#core-service-92)], restore the same logical session identity and checkpoint [[core-service-74](#core-service-74)], and report it live before starting the turn [[core-service-34](#core-service-34)], or refuse by these cases:
+
+| Case | Reply |
+| --- | --- |
+| Another session of the project is live, or a session lease is active | `busy`, naming the session working or the holder |
+| Unsupported recovery, no checkpoint, incomplete stream or digest mismatch | `invalid_request`, history-only with the failing condition |
+| Uncertain work | `invalid_request`, restore it first [[core-service-82](#core-service-82)] |
+| The session is assigned to another runtime [[storage-43](storage.md#storage-43)] | `invalid_request`, "Runs on <label>", with `runsOn` in its details, so a client acts without parsing the words ([DR-134](../decisions/134-execution-ownership.md)) |
+| The spex repository's working folder is not paired on this device, or the session's recorded working directory is not that folder [[storage-6](storage.md#storage-6)] — an alias keeps the session's history readable, while Playbook's relocation rule refuses to continue it until the folder is the recorded one | `invalid_request`, continue it on the computer whose folder it ran in ([DR-103](../decisions/103-the-home-and-its-groups.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)) |
+| Changed checkpoint repository/module paths | `invalid_request`, relocation unsupported; history remains readable |
+| Missing or invalid config | `invalid_config`, as for creation |
+| Structural or runtime mismatch | `invalid_config`, naming each changed field and offering a new session [[core-service-92](#core-service-92)] |
+
+- desktop and CLI checkpoints use the same cases; missing provider hints and recorded repository effects alone do not refuse continuation ([DR-074](../decisions/074-a-parked-run-survives.md));
+- a cached external holder is revalidated through the shared lease API before admission: only idle ownership clears it, active or unprovable ownership remains `busy`, and local opening, runtime and recovery reservations stand across that revalidation;
+- parked questions resume in their retained frames; a refusal starts no turn and stamps no intent [[core-service-47](#core-service-47)];
+- a submission refused after opening, including a failed attachment handoff [[media-4](media.md#media-4)], releases the runtime it opened before replying.
+
+#### core-service-6
+
+While a boss turn is active on a session, when a client requests an abort for that session, the core service shall abort the active turn, stream the turn-aborted record to subscribed clients, and admit further input once the shared lifecycle has settled the stopped turn at its saved progress [[core-service-91](#core-service-91)] ([DR-088](../decisions/088-playbook-17-slc-0-12-cligent-0-27-adoption.md)):
+
+- the turn is active from its acceptance, while the shared lifecycle prepares it — the lease marked, the repository reconciled — before the runtime has begun it: an abort requested in that window is held and applied as the runtime begins the turn, so no agent call starts under a live signal, and the stop settles as one taken during a call does.
+
+#### core-service-82
+
+When a client sends `session.restore` with only a `sessionId`, the core shall restore that session's uncertain turn through Playbook's shared recovery [[2]] under the same project and session admission checks as continuation [[core-service-73](#core-service-73)], as one turn that reports what was recorded and repeats nothing ([DR-047](../decisions/047-explicit-session-recovery.md), [DR-088](../decisions/088-playbook-17-slc-0-12-cligent-0-27-adoption.md)):
+
+- refuse a session whose summary holds no interrupted turn with `invalid_request` and its cause before opening anything, writing no record, and one assigned to another runtime [[storage-43](storage.md#storage-43)] with `invalid_request`, "Runs on <label>", whatever its checkpoint holds ([DR-134](../decisions/134-execution-ownership.md));
+- acquire the exclusive session lease and re-read the saved uncertainty before any effects, releasing the session with the same refusal where it no longer stands;
+- open the session in Playbook's recover mode [[2]] on the exact attempted configuration, then append one visible `captain_telemetry` record with topic `spex.session.restoring` and no turn id, carrying the saved input, which names the next turn to start with that input as the report — unless a failure is recorded first;
+- reconcile repository evidence and restore the saved position — the pre-turn checkpoint where nothing was recorded — reporting it through the Captain without re-running the recorded input or calling an agent;
+- relay a refusal from Playbook's opening or recovery — a relocated checkpoint among them — with its cause, starting no turn and leaving the uncertainty standing;
+- after the report settles, append one visible `captain_telemetry` record with topic `spex.session.restored` and the report's turn id, whose `runs` lists every run the settled position holds engaged, root to leaf — its trace session, playbook, depth, parent, state, pending questions, and the structured cause its checkpointed failure carries — and is empty where the Captain is back in chat, since the report traces no move;
+- where the core stopped between the report's settlement and that record, the next open of the session, or the next core on its runtime [[storage-43](storage.md#storage-43)] to read it — at start or as it joins the listing — appends the record once from the settled checkpoint, another runtime leaving the session as it is, while the report is still the session's last turn, and a release that cannot append it reads the park from that checkpoint instead;
+- every ledger reading takes the report — the turn its marker or its record names — as the stop of the turn it reports, never as finished work — it finishes no intent, raises no review, and reads `stopped` [[core-service-107](#core-service-107)] — while a run the recorded position moves into its failure state, one the stream did not already show parked there, is a failure in that turn's range [[core-service-49](#core-service-49)]; the turn creates no intent dispatch;
+- publish records and the resulting session state, the parked run's controls recorded at that settlement [[core-service-91](#core-service-91)], retaining uncertainty if the report does not settle.
+
+#### core-service-98
+
+When a client sends `session.control` with a `sessionId`, a control kind and optionally the id of an advertised action [[core-service-32](#core-service-32)], the core shall run that control as the session's next turn through Playbook's shared lifecycle [[1]] under the same project and session admission checks as continuation [[core-service-73](#core-service-73)] ([DR-062](../decisions/062-ending-a-failed-workflow.md), [DR-074](../decisions/074-a-parked-run-survives.md)):
+
+| Kind | What runs |
+| --- | --- |
+| a recovery | the named action of the session's parked run, else the first that run advertises |
+| an ending | the named control of the shell's own, else the first it advertises, which ends the run and spends no model call |
+
+- the core shall open the session before reading what it advertises, because the runtime is held only for a turn [[core-service-91](#core-service-91)] and a settled session holds no shell to ask;
+- a kind the opened session advertises nothing for, or a named action that session no longer advertises, shall be refused with its cause, starting no turn and releasing the runtime this command opened [[core-service-91](#core-service-91)];
+- the turn carries the control's own Boss-facing label as its text, creates no intent dispatch, and stamps none [[core-service-47](#core-service-47)];
+- records and the resulting session state publish as a continued turn's do [[core-service-5](#core-service-5)].
+
+#### core-service-83
+
+When a client sends `session.discard` with only a `sessionId`, the core shall discard that session's uncertain attempt through Playbook's shared lifecycle [[1]] under its exclusive lease, without loading configuration, modules or agents ([DR-047](../decisions/047-explicit-session-recovery.md), [DR-088](../decisions/088-playbook-17-slc-0-12-cligent-0-27-adoption.md)):
+
+- refuse live or unprovably owned sessions, a session assigned to another runtime [[storage-43](storage.md#storage-43)] with `invalid_request`, "Runs on <label>" ([DR-134](../decisions/134-execution-ownership.md)), and any attempt Playbook's shared discard predicate [[2]] refuses — a recorded step, an abandonment, or changed repository evidence — with Playbook's cause;
+- restore the exact preceding settled checkpoint, or remove a never-settled fresh session when Playbook authorizes removal;
+- publish the restored summary or session removal and refreshed intent state; a refusal preserves evidence and reports its cause;
+- after success or refusal, refresh and publish the shared ownership reading before releasing the local recovery reservation, without consuming unannounced foreign replay records; a refresh failure preserves the original refusal and its evidence.
+
+### Playbook Drafts
+
+#### core-service-96
+
+The core service shall accept the authoring command family — `draft.list`, `draft.defaults`, `draft.create`, `draft.open`, `draft.send`, `draft.abort`, `draft.source.write`, `draft.compile`, `draft.register`, `draft.player.set`, `draft.delete`, `draft.artifacts` — each naming the project whose spex repository holds the authoring session [[storage-23](storage.md#storage-23)], validated as every command is [[core-service-13](#core-service-13)], stream a session's records as `draft.record` messages to the subscribers of its `draft` channel and its state as `draft.state` to every client, and run at most one turn per authoring session instance, refusing a command because other work runs only as the table and the cases below say ([DR-058](../decisions/058-chat-assisted-playbook-authoring.md), [DR-104](../decisions/104-spec-package-format-and-client-environments.md), [DR-111](../decisions/111-the-core-coordinates-as-git-does.md)):
+
+| Command | While a turn runs | While a compile runs |
+| --- | --- | --- |
+| `draft.send` | accepted, queued | accepted, queued |
+| `draft.abort` | ends the turn | `{aborted: false}` where no turn runs beside it |
+| `draft.compile` | admitted | `busy`, the compile writing the session's artifact folder [[playbook-library-99](playbook-library.md#playbook-library-99)] |
+| every other command | admitted | admitted |
+
+- a draft compile is an ordinary process with a cancel handle of its instance's, running beside a turn, a source write or a deletion; a `compile.abort` naming the instance cancels its compile and replies `not_found` where none runs, one naming no instance cancelling one-shot compiles alone [[core-service-25](#core-service-25)]; its `compile.progress` lines name the instance;
+- a session made again under an id is another session, whose turn may run beside a former instance's in the same working folder;
+- `draft.compile` and `draft.register` are refused `busy`, naming the folder and the work running there, while another job of the core writes the session's artifact folder — a former instance's compile, a one-shot compile of its id, or an enabling's repackaging — whatever turn runs [[playbook-library-99](playbook-library.md#playbook-library-99)];
+- a session's state carries its recorded instance [[storage-23](storage.md#storage-23)], or, where its file will not read, that file's version instead, and its `activity` — `turn` while its turn runs, else `compiling` while its compile runs, else `idle` — beside `compiling`, true while its compile runs, so a turn and a compile running at once are each reported; `draft.record` and `draft.source` name the instance, and `draft.removed` names it where the file read; every command but `draft.list`, `draft.defaults`, `draft.create`, `draft.open` and `draft.artifacts` names the instance it read, `draft.delete` the version where it read none, and replies `conflict`, changed meanwhile, where the session's file no longer records it;
+- `draft.create` names the new spec package's `org` and `license` and replies `invalid_request` for an id a playbook of the project's or your own group's environment holds, an org outside the manifest's name rule [[environments-1](environments.md#environments-1)], an empty license, or a project with no working folder on this device, `draft.defaults` refusing the last alike; `draft.open` and every other command reply `not_found` for an unknown session; `draft.register` before a successful compile replies `invalid_request`; `draft.source.write` with a stale version replies `conflict`;
+- a deleted session is announced to every client as `draft.removed`, so no client keeps a trace of it; an enabled one stays and reads enabled;
+- `draft.send` replies when the message is accepted, never when the turn ends; the protocol version bumps [[core-service-12](#core-service-12)].
+
+#### core-service-118
+
+When the core rescans a spex repository — after a sync's apply wrote to it, merged or not, or after it was joined or its working folder paired — the core shall announce each authoring session that repository holds to every client as `draft.history-replaced` naming the session's recorded instance, then its state, whether or not the history changed under the same instance, allowing a client showing one to read it again as its files now stand instead of combining histories [[core-service-96](#core-service-96)] ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)).
+
+#### core-service-119
+
+When the core follows a spex repository's clone to a new address, the core shall announce each authoring session that repository holds to every client by its state under the project now holding it, so a client showing one addresses it there [[core-service-96](#core-service-96)] ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)).
+
+### Intent Ledger
+
+#### core-service-42
+
+When a client sends `intent.queue` for a registered project ([DR-006](../decisions/006-projects-and-forge.md)), the core service shall store a new open intent as one file of its project's spex repository [[storage-4](storage.md#storage-4)] — the request's exact text and optional ordered attachment references [[media-5](media.md#media-5)], its optional source (kind, reference, URL, and labels), its optional author, and its capture time — reply with the stored intent, and announce the write [[core-service-51](#core-service-51)] ([DR-035](../decisions/035-intent-ledger.md), [DR-103](../decisions/103-the-home-and-its-groups.md)):
+
+- its author records the login as both `login` and `displayName` of the account the home is signed in as [[storage-2](storage.md#storage-2)] at the instance of its project's spex repository [[storage-31](storage.md#storage-31)], and none where that repository has no instance or the home is not signed in there ([DR-127](../decisions/127-a-home-signed-in-to-several-instances.md), [DR-171](../decisions/171-personal-names-are-space-logins.md));
+- its runtime is this one, written at capture [[storage-4](storage.md#storage-4)] with this runtime's label, so the intent runs here and nowhere else ([DR-134](../decisions/134-execution-ownership.md));
+- an intent holds no place of its own: the project's queue is its queued intents oldest first, and the next to run is the oldest;
+- where the source kind is issue, PR, or record and the project already holds an open intent with the same source kind and reference, the request is rejected with a `conflict` error naming that intent and stores nothing — at most one open intent per source artifact per project;
+- a chat-sourced or unsourced intent is never deduplicated.
+
+#### core-service-43
+
+While an intent is queued [[core-service-47](#core-service-47)], when a client sends `intent.edit` for it, the core service shall replace the intent's text and any supplied attachment list, preserving omitted attachments [[media-5](media.md#media-5)], and announce the write [[core-service-51](#core-service-51)]:
+
+- an edit of a dispatched or closed intent is rejected: from its dispatch binding on, the text is history ([DR-035](../decisions/035-intent-ledger.md));
+- an edit of an intent assigned to another runtime [[storage-4](storage.md#storage-4)] is rejected `conflict`, "Runs on <label>", so no sync choice can drop the stamp of work that ran there ([DR-134](../decisions/134-execution-ownership.md)).
+
+#### core-service-46
+
+When a client sends `intent.close` for an open intent with a verdict of `done` or `dropped`, the core service shall record the verdict and its time on the intent — the act appended, never rewritten [[core-service-52](#core-service-52)] — and announce the write [[core-service-51](#core-service-51)]:
+
+- `done` is accepted only while a turn the intent attributes [[core-service-47](#core-service-47)] ended finished with none later active, and is otherwise rejected — confirming work that never ran would falsify the ledger ([DR-035](../decisions/035-intent-ledger.md));
+- `dropped` is legal on any open intent; dropped before any turn the intent attributes [[core-service-47](#core-service-47)] ended finished, the intent is removed — the history read excludes it [[core-service-50](#core-service-50)] and no verdict shows anywhere ([DR-038](../decisions/038-history-is-done-work.md));
+- `dropped` while a run of the intent's session stands parked on the Boss within the turns it attributes [[core-service-47](#core-service-47)] — on a question, or in its recoverable failure state — first ends that run as the session's next turn, as an ending control does [[core-service-98](#core-service-98)], and records the verdict only once that turn has settled with no run of the session still parked, the two announced together; an ending refused, or one settling with the run still parked, refuses the close with that cause and leaves the intent open ([DR-073](../decisions/073-letting-go-ends-the-parked-run.md));
+- a close of an already-closed intent is rejected;
+- a close, `done` or `dropped`, of an intent assigned to another runtime [[storage-4](storage.md#storage-4)] is rejected `conflict`, "Runs on <label>", while a remove of a closed one stays allowed ([DR-134](../decisions/134-execution-ownership.md)).
+
+#### core-service-79
+
+While an intent is closed [[core-service-46](#core-service-46)], when a client sends `intent.remove` for it, the core service shall delete that intent's file and attachments, retiring it from every read — no queue row, no source binding, no attention entry [[core-service-49](#core-service-49)], and no history page [[core-service-50](#core-service-50)] — and announce the write [[core-service-51](#core-service-51)] ([DR-038](../decisions/038-history-is-done-work.md)):
+
+- a remove of an open intent is rejected with a `conflict` error: the ledger still owns work that is not ruled on;
+- a remove naming an intent no read knows — never stored, or already removed — is rejected `not_found`;
+- the removed intent's dispatch stamp no longer bounds its neighbours' turn ranges [[core-service-47](#core-service-47)], so the preceding dispatched intent owns the removed one's turns, and the session's viewed marker advances past the removed intent's last ended turn [[core-service-48](#core-service-48)], so no review prompt returns for work already ruled on; its file is recoverable from the spex repository's Git history alone.
+
+#### core-service-47
+
+While a session is live, when a Boss submission for it — from a client [[core-service-5](#core-service-5)] or automatic advancement [[core-service-94](#core-service-94)] — carries an intent id, the core service shall validate the intent at submission — open, of the session's project, and queued — and stamp the dispatch (session, turn, and time) onto the intent when and only when the submitted turn starts, announcing the write [[core-service-51](#core-service-51)] ([DR-035](../decisions/035-intent-ledger.md)):
+
+- a submission whose intent fails validation is rejected and starts no turn; one whose intent is assigned to another runtime [[storage-4](storage.md#storage-4)], or holds no runtime while this core runs as a seat ([DR-132](../decisions/132-team-servers.md)), is rejected `conflict`, "Runs on <label>", or "Runs nowhere yet" for the latter ([DR-134](../decisions/134-execution-ownership.md));
+- while a run of the session stands parked on a Boss question [[core-service-107](#core-service-107)], a submission carrying an intent id is rejected `conflict`, the intent staying queued: a dispatch is new work, never an answer ([DR-119](../decisions/119-an-answer-continues-its-intent.md));
+- a submission that never starts a turn stamps nothing, and the intent stays queued;
+- a later dispatch of the same intent re-writes the stamps;
+- the stamp attributes turns: an intent's turns run from its dispatch turn up to, not including, the next turn in the session that is another intent's dispatch turn, so the newest dispatched open intent owns follow-up turns;
+- an intent is queued while it is open and holds no standing dispatch — never dispatched, its dispatch turn ended aborted, or its dispatching session stopped before that turn finished — the release derived, never written: the stamps remain and the intent keeps its place by age;
+- a dispatch whose session is assigned to another runtime [[storage-43](storage.md#storage-43)] is never derived as released here: that runtime's stop or abort is its to read ([DR-134](../decisions/134-execution-ownership.md)).
+
+#### core-service-94
+
+When a locally owned intent-attributed turn completes full settlement [[core-service-91](#core-service-91)], the core service shall, after publishing the released conversation, automatically submit the project's oldest queued intent into that same conversation exactly once only while the just-settled turn ended finished — a restore's report [[core-service-82](#core-service-82)] never does — did not run an ending control [[core-service-98](#core-service-98)], and would leave its attributed owner Finished rather than Interrupted if that owner remained open, no run of the conversation remains parked on the Boss, and the turn, dispatch boundary, project lane, and conversation remain current ([DR-077](../decisions/077-up-next-is-a-committed-queue.md)):
+
+- an ordinary Captain reply qualifies with no `playbook.trace` record or typed terminal evidence, as does a reply that sounds like a question but parks no run;
+- a Boss answer qualifies after its own turn settles finished and the question park has left; a question or failure park still standing, a failed turn, or an aborted turn starts no successor;
+- an aborted follow-up starts no successor even where an older finished turn leaves the intent's derived state Finished; a later clean attributed follow-up — one recovering a failure among them — may qualify, while an ending control never does;
+- a permission record and absent, unsupported, child, failed, or non-terminal playbook trace evidence add no gate of their own;
+- a Done or Drop verdict accepted before or during the eligible settlement, and a later removal of that settled owner, neither authorizes nor cancels that settlement's successor; no verdict or removal initiates advancement;
+- the successor is chosen among the intents this runtime may run [[core-service-107](#core-service-107)]; an intent assigned to another runtime arriving through a sync neither becomes the successor nor cancels the handoff ([DR-134](../decisions/134-execution-ownership.md));
+- selection snapshots the successor's then-current identity before release can expose a manual Start and submits its latest text only while it remains the first eligible row; a later arrival of an older intent through a sync, or the closing of that successor, that changes the next row cancels the handoff rather than substituting another intent; normal admission [[core-service-5](#core-service-5)], and actual-start dispatch stamping and attribution [[core-service-47](#core-service-47)] stand, a competing manual submission wins normal admission, and a refused admission causes no automatic retry;
+- the settled intent remains finished and awaiting its human verdict unless that verdict already landed [[core-service-46](#core-service-46)] [[core-service-49](#core-service-49)];
+- no next eligible intent starts nothing, and queue capture or edits, ledger reads, verdicts after settlement, adoption and restart initiate no advancement or retained runner state.
+
+#### core-service-48
+
+When a client sends `session.viewed` naming a session and a turn, the core service shall persist that turn as the session's last-viewed marker in the state root's preferences file [[core-service-15](#core-service-15)], so review state derives from stored data alone [[core-service-49](#core-service-49)] and survives a restart:
+
+- a marker naming a turn that has not ended is refused, so no client suppresses the next summons by naming a turn in flight ([DR-066](../decisions/066-every-summons-has-a-door.md));
+- a marker no later than the stored one writes nothing, the act being monotonic and repeatable.
+
+#### core-service-49
+
+When a client sends `ledger.get`, the core service shall reply with the cross-project ledger read model, derived solely from the stored intents, turns, records, and viewed markers — the same stored data yielding an identical reply after a restart [[core-service-10](#core-service-10)] ([DR-035](../decisions/035-intent-ledger.md)):
+
+| Part | Content |
+| --- | --- |
+| Attention entries | two bands — intents standing interrupted on the Boss (a pending question or an unacknowledged failure among their turns), then intents finished and awaiting a verdict — each band ordered longest waiting first by condition onset, and no entry from a project whose stored state refuses the acts that would end it [[core-service-86](#core-service-86)] ([DR-066](../decisions/066-every-summons-has-a-door.md)) |
+| Run stats | each finished entry carries stats folded from its intent's attributed turns [[core-service-47](#core-service-47)]: turn count, elapsed time, and the review rounds when any |
+| Session stand-ins | a session bound to no intent enters the same bands for its own question, failure, or finished turn past the viewed marker [[core-service-48](#core-service-48)], titled with the Boss turn that opened that work: from the turn the entry points at — the latest where it points at none — back past every turn that started while a run of the session stood parked on a Boss question [[core-service-107](#core-service-107)], so an answer or a clarification folds under the turn it answers ([DR-119](../decisions/119-an-answer-continues-its-intent.md)) |
+| Project groups | per project: the current conversation's state [[core-service-93](#core-service-93)], the queue oldest first, its oldest queued intent as next with the scheduling standing, manual-start availability, and structured cause [[core-service-107](#core-service-107)], and the open intents' source-artifact references [[core-service-42](#core-service-42)] ([DR-077](../decisions/077-up-next-is-a-committed-queue.md)) |
+| Badge | the count of all attention entries |
+
+- an intent assigned to another runtime [[storage-4](storage.md#storage-4)], and a session assigned to one [[storage-43](storage.md#storage-43)], enter no band and no count: that runtime's ledger carries them ([DR-134](../decisions/134-execution-ownership.md));
+
+- a failure entry or queue standing carries the structured cause the runtime attached to that failure — the `{ code, evidence }` the stream reports beside the failure it decided — read defensively, so a shape that is not a code with an optional evidence object is dropped rather than half-read and the entry or standing states no reason the runtime did not state ([DR-075](../decisions/075-a-failure-says-what-and-what-now.md));
+- the core neither interprets nor completes that cause: the words are the client's to give it [[run-view-147](run-view.md#run-view-147)];
+- a failure among an intent's turns, or a session's own, is a `runtime_error` record — one naming no turn lying in the turn open when it was recorded, the latest started and not yet ended, and in no turn's range where none was open, as the core records a failure from before a turn of its own started [[core-service-135](#core-service-135)] — or a run of the session moving into its failure state within a turn that then ended finished, its onset that move, whichever conversation is current; a move within a turn a stop ended — the Boss's abort [[core-service-6](#core-service-6)], or a restore's report, the stop of the turn it reports [[core-service-82](#core-service-82)] — raises none ([DR-062](../decisions/062-ending-a-failed-workflow.md));
+- a failure entry's onset is the first failure recorded in the attempt its latest failure lies in — from that turn's latest start before that failure, a restore's report starting the turn again — or, for an entry naming no turn, the first such record since the preceding turn ended;
+- a `runtime_error` naming no turn recorded where no turn was open, once a turn of the session has started, raises no intent's entry: it stands in as the session's own failure naming no turn where no open intent owns the session's turns, no failure lying in a turn stands, and no turn has started since — while the summary counts it in the latest turn started before it [[core-service-32](#core-service-32)].
+
+#### core-service-107
+
+When the core service derives a project's queue reading, it shall choose the oldest queued intent this runtime may run — assigned to it, or to none where this core does not run as a seat ([DR-132](../decisions/132-team-servers.md)) [[storage-4](storage.md#storage-4)] — by capture time, then by id, as next and publish exactly one scheduling standing with its manual-start availability by the first matching row of this ordered table, attaching the standing failure's structured cause where one is known ([DR-077](../decisions/077-up-next-is-a-committed-queue.md)):
+
+| First matching lane condition | Standing | Manual start |
+| --- | --- | --- |
+| any turn in the current conversation is active, or its full settlement and release publication are still in progress | `after-current-work` | unavailable |
+| a run remains parked on a failure | `failure-park` | unavailable |
+| a run remains parked on a Boss question | `question-park` | unavailable |
+| no run remains parked on the Boss, and either the latest lane turn ended failed or an unparked failure condition still stands | `failed` | available |
+| the latest lane turn ended aborted, ran an ending control [[core-service-98](#core-service-98)], or reported a restore [[core-service-82](#core-service-82)] | `stopped` | available |
+| none of the preceding conditions holds | `manual-ready` | available |
+
+- a run is a playbook run: the Captain shell's own machine — which an abort taken during the Captain's call moves to its failure state — parks nothing;
+- a restore's report reuses the id of the turn it reports, so only a failure recorded after the report began is that turn ending failed;
+- an eligible automatic handoff [[core-service-94](#core-service-94)] is selected before publication can expose `manual-ready`, so clean settlement never flickers a Start; age still chooses next while admission is pending, and a non-verdict queue change that changes that next cancels the handoff;
+- the standing and availability are derived from the lane and intent records, never stored on an intent;
+- a queued intent assigned to another runtime keeps its place in the queue by age, carries `runsOn` with that runtime's label, is never next here and offers no manual start ([DR-134](../decisions/134-execution-ownership.md)).
+
+#### core-service-50
+
+When a client sends `ledger.history` for a project, the core service shall reply with one page of that project's worked closed intents — closed done, or closed dropped after a turn of theirs ended finished ([DR-038](../decisions/038-history-is-done-work.md)) — newest-closed first, the same stored data yielding identical pages after a restart [[core-service-10](#core-service-10)]:
+
+- a page holds at most twenty rows and carries a cursor naming its last row's close time and id;
+- a request carrying a prior page's cursor returns the page after it, overlapping nothing.
+
+#### core-service-51
+
+When the intents table is written [[core-service-52](#core-service-52)], or a session event lands that can change a derived intent state — a turn's start, finish, or abort, a runtime's release, or an interruption-condition record — the core service shall broadcast an `intents.changed` message naming the affected project to subscribed clients, so every consumer re-reads the one core-side fold [[core-service-49](#core-service-49)] instead of deriving its own ([DR-035](../decisions/035-intent-ledger.md)).
+
+### Intent Storage
+
+#### core-service-52
+
+The core package shall hold each intent as one file of its project's spex repository holding provenance and stamps only — no state or status field, every visible state derived at read time from the file, the session records and the viewed markers [[core-service-49](#core-service-49)] — kept as the storage package encodes it [[storage-4](storage.md#storage-4)] and written solely by the intent commands ([[core-service-42](#core-service-42)] [[core-service-43](#core-service-43)] [[core-service-46](#core-service-46)] [[core-service-79](#core-service-79)]) and the dispatch stamp [[core-service-47](#core-service-47)] ([DR-035](../decisions/035-intent-ledger.md), [DR-103](../decisions/103-the-home-and-its-groups.md)):
+
+| Field(s) | Content |
+| --- | --- |
+| `id` | the intent's identifier |
+| `projectId` | the owning project |
+| `text` | the exact staged Boss turn text; the display title uses its trimmed first line when nonblank, otherwise the trimmed text, falling back to attachment names when the text is blank [[media-5](media.md#media-5)] |
+| `attachments` | optional ordered project-owned immutable file references [[media-4](media.md#media-4)] |
+| `source` (`kind`, `ref`, `url`) | provenance — issue, PR, record, or chat, with reference and URL — absent when unsourced |
+| `author` | optional: the account that captured it at its project's instance [[core-service-42](#core-service-42)] |
+| `runtime` | the runtime that captured it and alone runs it [[core-service-42](#core-service-42)], absent in a file written before runtimes were recorded |
+| `createdAt` | the capture time, which orders the queue |
+| `dispatched` (`sessionId`, `turnId`, `at`) | the dispatch stamp, re-written by a later dispatch |
+| `closedAt`, `closedAs` | the close time and verdict — `done` or `dropped` |
+
+- An edit, dispatch or close rewrites the file whole; a remove, and a drop before any work, delete it with its attachments, so no read sees it ([DR-038](../decisions/038-history-is-done-work.md)).
+- Git selection replaces a complete intent file under the explicit whole-unit rule [[storage-11](storage.md#storage-11)]; an intent added on each device merges without a choice.
+
+### Record Streaming
+
+#### core-service-7
+
+While a session is live, when the embedded runtime emits a record not marked hidden, the core service shall deliver that record to every client subscribed to the session, preserving the runtime's emission order for each subscriber.
+
+#### core-service-8
+
+While a session is live, when the embedded runtime emits a record marked hidden (for example judge or router traffic), the core service shall deliver it only to clients subscribed to the debug channel and shall not deliver it on any session subscription, per [DR-003](../decisions/003-runtime-reuse.md).
+
+#### core-service-30
+
+While a session is live, when the embedded runtime emits a captain result record marked hidden whose result reports an error, the core service shall synthesize a visible failure record carrying the underlying error text into the session stream ([DR-028](../decisions/028-run-machine-view.md)) — the cause reaches every session subscriber [[core-service-7](#core-service-7)] while the hidden record itself stays off the session channel [[core-service-8](#core-service-8)].
+
+#### core-service-36
+
+While a session is live, when the embedded runtime emits a player record, the core service shall deliver and persist it carrying the role of the call it belongs to ([DR-032](../decisions/032-session-players.md)), so a player several roles share is read as a sequence of calls rather than one voice:
+
+- a `player.call.started` trace opens a call on the player it names, and that player's `player.call.finished` closes it;
+- a player record between them carries the opening trace's role, and the closing record carries it too;
+- a trace naming no resolved player opens nothing, and a player record outside any open call carries no role;
+- a replayed record carries the same role the live stream carried [[core-service-10](#core-service-10)].
+
+### Historical Context
+
+#### core-service-80
+
+When serving a stored session, the core service shall resolve its immutable participant/settings/binding/graph context through Playbook's replay references [[1]] and expose that context over the protocol without loading the historical executable module:
+
+- absent legacy context or an unknown graph/context version is reported unavailable, never replaced with current settings or a guessed graph;
+- graph activity is derived from the session's trace, and current configuration changes do not alter prior history.
+
+### Readiness
+
+#### core-service-9
+
+When a client requests adapter readiness, the core service shall report one deduplicated entry per adapter the active config references, each entry naming the positions using that adapter — `captain`, and each session player as `<player>` followed by the `<playbook>.<role>` bindings it answers ([DR-032](../decisions/032-session-players.md)) — and carrying a readiness status derived from the same adapter readiness rules as the playbook launcher — the runtime half and the credential half together ([DR-024](../decisions/024-app-supplied-agent-runtimes.md), [DR-004](../decisions/004-config-and-persistence.md)) — naming the unmet requirement for each adapter that is not ready and reporting null readiness with verify-yourself guidance for an adapter with no preflight rule:
+
+- The runtime half is cligent's availability probe, which confirms the native executable a bundled SDK spawns as well as the SDK itself; when the probe fails and no published runtime target is at fault, the unmet requirement for `claude` or `codex` comes from cligent's executable lookup — a missing platform package, named with its platform and architecture and the repair of running `npm ci` in the checkout or reinstalling the app, or a host the SDK publishes no executable for, named with no repair — and otherwise states that the runtime failed to load ([DR-090](../decisions/090-readiness-names-what-cligent-finds-missing.md)).
+- When the active config changes, refreshed readiness is broadcast to connected clients; a reload superseded by a newer one — before committing, or while its runtime probes are in flight — commits and broadcasts nothing, so the state and readiness clients hold always correspond to the newest configuration read.
+
+### Persistence
+
+#### core-service-10
+
+The core service shall persist and replay sessions through Playbook's hydrated manifest and replay API over its versioned physical session files [[1]] ([DR-144](../decisions/144-bounded-session-storage.md)), using the shared root and explicit overrides [[storage-1](storage.md#storage-1)] ([DR-045](../decisions/045-unified-session-storage.md)):
+
+- restart serves the same records and visibility filtering [[core-service-8](#core-service-8)], deriving turns, summaries, usage, and per-agent active time [[core-service-102](#core-service-102)]; liveness comes from runtime/leases rather than stored flags;
+- valid opaque v1 records, including unknown/headerless objects, remain in sequence/digest accounting; unsupported presentation is skipped without damage;
+- record-write failure preserves live presentation and durable recovery, marks the manifest's replay incomplete and refuses later continuation [[core-service-73](#core-service-73)]; a restart cannot clear the marker merely because the retained bytes parse;
+- a reader serves the valid complete prefix with the damaged boundary reported, without altering files during a read;
+- a monolithic schema-7 session remains readable without implicit conversion; continuation follows Playbook's explicit migration requirement ([DR-144](../decisions/144-bounded-session-storage.md));
+- token-free presentation includes synthesized visible failures [[core-service-30](#core-service-30)]; provider hints never enter the portable stream or manifest;
+- historical participants, settings, bindings and graphs come from stored context [[core-service-80](#core-service-80)], not today's installed modules.
+
+#### core-service-60
+
+The core service shall serve every session present in the `sessions/` directory of every spex repository's clone [[storage-1](storage.md#storage-1)], one shared session store per clone, whether found there at startup or written by another host while the service runs ([DR-103](../decisions/103-the-home-and-its-groups.md)):
+
+- a session's project is the clone holding it [[storage-6](storage.md#storage-6)]; it lists with shared continuation eligibility [[core-service-73](#core-service-73)], and a clone no folder pairs lists its sessions as history only;
+- a record beside no replay stream lists from its Boss journal: each Boss entry opens a turn with its prompt, each Captain reply follows it, and the record's own timestamps bound them ([DR-037](../decisions/037-playbook-12-adoption.md));
+- an arrival or change while the service runs is announced to subscribed clients as a session-state report, with `intents.changed` where a derived intent state can change [[core-service-51](#core-service-51)]; a record's disappearance is forgotten [[core-service-76](#core-service-76)];
+- a replay append, including one published through a replay descriptor while another host holds the writer lease, also reaches that session's subscribers through the record visibility filter [[core-service-8](#core-service-8)], once per appended record, without waiting for directory activity to stop; a replacement history is served on the next history request;
+- each session is read independently from its complete newline-terminated stream prefix, so an unfinished final line waits for its newline and an unreadable manifest preserves its previous served history without hiding healthy neighbors;
+- preserve opaque records [[core-service-10](#core-service-10)]; summary times use first/last finite record timestamps, otherwise manifest creation/update times or zero;
+- pairing a folder with a spex repository re-reads that clone's sessions [[storage-6](storage.md#storage-6)], without waiting for a new record.
+
+#### core-service-76
+
+While the core service serves a session another host wrote [[core-service-60](#core-service-60)], when that session's record leaves the shared session store's directory, the core service shall forget the session — its listing entry [[core-service-32](#core-service-32)] and its served history — and broadcast the removal to subscribed clients, announcing `intents.changed` for its project [[core-service-51](#core-service-51)] ([DR-042](../decisions/042-sessions-continue.md)).
+
+#### core-service-65
+
+The core service shall mutate a session from either interface only through Playbook's shared lease-bound lifecycle [[1]], retaining lease-free reads and never maintaining a host-specific manifest or recovery sidecar ([DR-045](../decisions/045-unified-session-storage.md)).
+
+#### core-service-61
+
+When the core service starts against a state root, the core service shall take this machine's identity from Playbook's facade [[5]] and the root lease by the shared rule [[storage-26](storage.md#storage-26)], refusing to serve — one core per state root at a time ([DR-036](../decisions/036-file-state-store.md), [DR-108](../decisions/108-the-root-lease-names-the-machine.md)) — with a message the host shows that names the lease path and the cause:
+
+| Cause | Message |
+| --- | --- |
+| a live process of this machine holds the root | the holder's `pid` and its recorded host name or machine identity |
+| another machine's owner holds the root | the owner's machine identity, or its legacy host name, named as such |
+| the owner cannot be verified: malformed — a tagged owner not private among them — tokenless, empty, a probe failing otherwise than `ESRCH`, an occupied retired target, or a staging or rename failure other than a target that appeared | the reason, a failed probe or file operation by its error code, with the instruction to stop every Spex writer before removing the lease by hand |
+| a `.lock/` of the former layout whose owner, read by the same rule, is live, another machine's or unverifiable | as above for that owner, naming `.lock/` in place of the lease path |
+| the machine identity is unavailable | the identity file and the reason, before the lease is inspected; no lease path |
+
+- A dead owner of this machine is reclaimed and the start proceeds; a dead former-layout owner of this machine is left for the migration [[storage-9](storage.md#storage-9)].
+
+#### core-service-64
+
+Where the host shell names a legacy SQLite store that neither the state root's own record nor a `<store>.imported` marker beside the file shows imported, when the core service starts, the core service shall import the store's rows into the file state once, before serving — the imported data served identically to data written natively [[core-service-10](#core-service-10)], the legacy file left in place, and the marker written beside it on success so that no state root created later imports it again ([DR-036](../decisions/036-file-state-store.md)):
+
+- The same import relocates a legacy library directory into the state root, rewriting the shared config's `from` paths that point into it with the comment-preserving targeted edit ([DR-005](../decisions/005-compilation-integration.md)).
+- A marker that cannot be written is reported and the root's own record alone stands; a root whose record lists a store the file does not yet mark writes the marker at its next start.
+
+### Shutdown
+
+#### core-service-39
+
+When a host shell stops the core service, the core service shall persist every live session's Captain snapshot [[core-service-72](#core-service-72)] and attempt disposal of its runtime, close its endpoint and its store, and report the disposal failures to the host once every session has been attempted:
+
+- One session's disposal failure neither skips another session's disposal nor leaves the endpoint or the store open.
+- Successful cleanup reports the session as no longer live; failed or unconfirmed cleanup retains its ownership evidence [[core-service-4](#core-service-4)].
+- Shutdown waits for settlement bookkeeping already in progress before closing the store.
+- Shutdown closes session and turn admission before waiting, drains session openings already admitted (including their pre-open waits), and attempts disposal of any runtime they create before closing the store; an opening or disposal failure does not skip the remaining cleanup.
+- Shutdown is bounded: every active turn is aborted with the core-stop reason as admission closes — one whose runtime has not begun it held and applied as it begins, as a client's abort is [[core-service-6](#core-service-6)]; when every turn active at the stop has settled, or ten seconds after the stop began, every agent process the core started that is still alive receives SIGTERM, and SIGKILL five seconds later; the stop then stops waiting for disposals not yet confirmed, reports them unconfirmed, releases its leases and closes the store, having written nothing into any working folder and reverted no file, so a turn cut before settlement stands `uncertain` for Restore on this runtime ([DR-134](../decisions/134-execution-ownership.md)).
+- An observed Captain cleanup-hook rejection or an ambiguous compound construction failure is reported as cleanup unconfirmed, including one whose opening settled before shutdown; a lease released during failed construction alone does not confirm runtime cleanup ([DR-048](../decisions/048-failed-session-cleanup.md)).
+
+### Interface Language
+
+#### core-service-108
+
+When a client sends `language.get`, the core service shall reply with the home's interface language — an offered language code [[localization-1](localization.md#localization-1)], or none for the reader's system — as stored in the state root's preferences file [[storage-5](storage.md#storage-5)], so every client of the home reads one choice ([DR-078](../decisions/078-the-interface-speaks-the-readers-language.md)).
+
+#### core-service-109
+
+When a client sends `language.set` naming an offered language code [[localization-1](localization.md#localization-1)] or none, the core service shall persist it as the home's interface language [[storage-5](storage.md#storage-5)], reply with the resulting choice, and broadcast `language.state` carrying it to every connected client:
+
+- a code that is not offered is rejected as a validation error, and the stored choice stands.
+
+#### core-service-111
+
+When the core service composes text for the reader — a refusal's message, a config error, a readiness requirement, a diagnostic's reason, the Space's messages and guidance, a unit's label and detail, a compile step's line and the toolchain's guidance, a draft's diagnostic, an authoring thread's status line, a specs notice — the core service shall phrase it in the home's interface language from its own catalog [[localization-6](localization.md#localization-6)], resolved from the stored choice or the system languages its host passes at start [[localization-2](localization.md#localization-2)], and on a change of the choice [[core-service-109](#core-service-109)] re-derive and broadcast the states it caches so they read in the new language ([DR-079](../decisions/079-the-core-speaks-the-homes-language.md)):
+
+- a message that names an internal failure for a developer, text relayed from a runtime, a tool, a file or a library, and a wire text the page matches to phrase itself stay as they are;
+- a record already written keeps the language it was written in;
+- what a finished operation composed — a storage diagnostic its store raised at load, a Space stop's message and guidance — keeps its language until that operation runs again, and a start speaks the stored choice, read from the preference file, before the store loads, so nothing it composes begins in another language than the home's ([DR-083](../decisions/083-a-finished-operations-words-keep-their-language.md));
+- a fact a page acts on travels beside the words, never in them: a refusal carries it as a detail of its reply, a state as a field of its own.
+
+#### core-service-145
+
+When the core service composes text for the reader [[core-service-111](#core-service-111)], it shall say each case as one whole phrase in the person's words, one name per thing as every surface names it ([DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)):
+
+- a Space is named by its display name wherever the phrase would say the host or the instance, this computer wherever it would say the device or the machine, and records wherever it would say the spex repository or the clone;
+- no phrase says seat, ticket, home, placement, origin or unit;
+- a step to take is named as its control is, as in "Add it to a group first" and "Open here again";
+- a failure says what happened and what to do, as in "spex.yaml cannot be read: <cause> — fix the file, then Retry" and "Another Spex is writing these files — wait, then Retry", what a tool or a file said travelling beside the phrase as its detail;
+- a Space's address the sign-in refuses by the origin rule [[git-host-2](git-host.md#git-host-2)] is answered "Enter just the Space's address, like https://spex.sublang.ai";
+- each case is one message of the catalog, never assembled from fragments, so its word order follows each language.
+
+### Seat Mode
+
+#### core-service-125
+
+Where the core runs as a seat — started with a server's id and name, the admitted person's permanent account id at the instance and, optionally, a shared credential file ([DR-132](../decisions/132-team-servers.md)) — the core service shall run for that person alone:
+
+- its sign-in is the device flow with the request naming the server and the person [[git-host-27](git-host.md#git-host-27)], and a sign-in whose account bears another permanent id than the person's ends `failed`, storing nothing;
+- your own group is placed at no instance [[space-102](space.md#space-102)];
+- every command naming a working folder path — `project.register`, `project.rebind`, `project.create`, and a join naming a folder — is refused `invalid_request`, "Projects on a server are opened from their group"; a join names no folder, the core allocating it [[space-103](space.md#space-103)];
+- intents without a runtime are run nowhere here [[core-service-107](#core-service-107)];
+- `server.open` is refused `invalid_request`, "Already on a server — open it from your computer": a seat holds no seats of its own [[core-service-128](#core-service-128)] ([DR-172](../decisions/172-surfaces-a-fresh-user-reads.md));
+- the seat account's own Git configuration names the app's credential helper in its member mode, so the pushes agents make from a work tree carry the member's token [[git-host-9](git-host.md#git-host-9)];
+- the runtime's label is the server's name [[core-service-4](#core-service-4)].
+
+#### core-service-126
+
+Where the core runs as a seat with a shared credential file [[core-service-125](#core-service-125)], when it starts — before it seeds or reseeds your own group's config [[core-service-3](#core-service-3)] [[core-service-137](#core-service-137)] ([DR-156](../decisions/156-an-untouched-seed-follows-the-credentials.md)) — and before each agent run, the core service shall read the file — `NAME=value` lines, the names of each agent's shared forms among them [[settings-49](settings.md#settings-49)] — into the environment its adapters inherit, so that a replaced value reaches the next run without a restart while a running agent process keeps the environment it started with ([DR-132](../decisions/132-team-servers.md)):
+
+- for an agent the member set a credential of their own for [[settings-48](settings.md#settings-48)], the file's names for that agent are left out of the run's environment and the member's own put in, so the member's own wins whatever the agent's precedence;
+- an unreadable file leaves the environment as it was and is reported through readiness [[settings-49](settings.md#settings-49)], blocking nothing else;
+- a stop, and a start that fails before the service stands, put every form name back as the process started with it;
+- no value of the file is written anywhere or logged.
+
+### Places
+
+#### core-service-128
+
+When a client sends `server.list`, `server.open` or `server.close`, the core service shall act on the seats the person holds on team servers ([DR-133](../decisions/133-one-desktop-over-several-cores.md)):
+
+| Command | Effect |
+| --- | --- |
+| `server.list` | reads each signed-in instance's servers listing [[git-host-29](git-host.md#git-host-29)] and replies `{servers, failures}` — every server by its `instance`, `id`, `name`, `group` (the group's full path) and `open`, whether a seat is open at it, and each instance whose read failed by its `instance` and `message`, so one instance's failure hides no other's servers [[git-host-11](git-host.md#git-host-11)] |
+| `server.open {instance, serverId, consented}` | with `consented` true — the client having shown the contract of the instance's record in its own words — reads the instance's servers listing for the server's name, group and address [[git-host-29](git-host.md#git-host-29)], a server the listing does not name being `not_found`, "No longer shared with you", with no ticket asked, then asks the instance for a ticket [[git-host-29](git-host.md#git-host-29)], presents it at the server's address for the admission, waiting ninety seconds for the answer — longer than the hub's own bound for an admission [[hub-2](hub.md#hub-2)], so that no admission the hub still runs is one this core gave up on — keeps the seat's endpoint, bearer and lease expiry under `local/` [[storage-45](storage.md#storage-45)], starts its relay [[core-service-129](#core-service-129)], keeps the ticket in memory for the seat's sign-in, which the relay's first hello starts with it [[core-service-142](#core-service-142)], and replies `{place, leaseExpiresAt}`, never the bearer, the endpoint or the ticket; `consented` absent or false is `invalid_request` and asks nothing; a place already holding a seat is admitted again, the new seat replacing the old |
+| `server.close {instance, serverId}` | ends the seat's relay and removes its entry, replying `{closed: true}`, `not_found` where no seat is open there; the seat's lease continues at the server while work runs there |
+| `server.signin {instance, serverId}` | starts the seat's sign-in again [[core-service-142](#core-service-142)], `not_found` where no seat is open there |
+
+- a refusal of the ticket or the admission is relayed with its cause [[git-host-11](git-host.md#git-host-11)], the instance's `host_refused` as refused and its `not_found` as no longer shared;
+- every change of the open seats is announced to every client as `server.state` — and the same message sent to a client as it connects — each seat by its `instance`, `serverId`, `name`, `group`, `place`, `leaseExpiresAt`, `relay` state — connecting until the watch's first hello, open after it, closed while the watch is down and reconnecting, or mismatched as an end state [[core-service-129](#core-service-129)] — and `signIn` state [[core-service-142](#core-service-142)]; the place is the seat's key, `<instance origin>#<server id>` [[storage-45](storage.md#storage-45)], shown by the server's name;
+- at start the core reopens every seat its file holds, a refusal removing the entry as a close does.
+
+#### core-service-142
+
+When a seat's relay first reads the seat's hello [[core-service-129](#core-service-129)], or a client sends `server.signin` for it, the core service shall read the seat's Groups state through a connection of its own to the seat, as any client reads it, and, where the seat is not signed in at the seat's instance, start its sign-in there over that connection — the device flow, the seat's request naming the server and the person and, where the relay's first hello starts the flow of an open this core made, carrying the ticket that open presented at the server, handed to the seat in the start and held no longer [[git-host-27](git-host.md#git-host-27)] — carrying the flow in the seat's `signIn` state of `server.state` [[core-service-128](#core-service-128)] ([DR-133](../decisions/133-one-desktop-over-several-cores.md), [DR-159](../decisions/159-projects-in-groups-opened-where-you-work.md), [DR-164](../decisions/164-the-seat-signs-in-on-its-ticket.md)):
+
+| `signIn` | While |
+| --- | --- |
+| `{state: "pending"}` | the seat's hello is not yet read, its Groups state not yet read, or a flow started with the ticket runs within the first poll interval the seat's reply names [[git-host-3](git-host.md#git-host-3)] plus two seconds, in which an instance granting on the ticket answers |
+| `{state: "running", verificationUri, expiresAt}` | the seat's flow runs with the instance asking for its page — from the seat's reply where the start carried no ticket, past that interval where it did: `verificationUri` the instance's page where the person approves "Spex on <server>" with the code carried in it [[git-host-3](git-host.md#git-host-3)] |
+| `{state: "signedIn"}` | the seat's Groups state lists its instance signed in |
+| `{state: "failed", cause}` | the flow ended denied, expired or refused, `cause` the seat's one-sentence cause [[git-host-27](git-host.md#git-host-27)] |
+
+- a flow the instance grants on the ticket passes from `pending` to `signedIn` with no `running` announced and no page opened; a sign-in started by `server.signin`, or by a relay reopened at start, carries no ticket — no grant can come — and reads `running` on the seat's reply;
+- the core starts the flow once per `server.open` and per `server.signin`, never again on its own while one runs, failed or stands signed in, and a seat reopened at start [[core-service-128](#core-service-128)] that is signed in already reads `signedIn` with no flow started;
+- the desktop shell opens `verificationUri` in the person's browser once per flow started, as it opens the local browser flow's page [[app-shell-37](app-shell.md#app-shell-37)], the served shell leaving it as a link;
+- the seat's sign-in is the seat's own: its app token stays on the server, and nothing of it reaches this core or a client beyond the states above.
+
+#### core-service-129
+
+While a seat is open [[core-service-128](#core-service-128)], the core service shall expose a relay path for it on its own endpoint, `/seats/<place>` with the place percent-encoded, admitted as the path `/` is [[core-service-24](#core-service-24)], and shall pipe each client connection there, frames unread both ways, through a connection of its own to the seat's endpoint over TLS presenting the bearer in the `Authorization` header and no `Origin` ([DR-133](../decisions/133-one-desktop-over-several-cores.md)):
+
+- one connection to the seat per client connection, so request ids and subscriptions stay the client's own; either side closing closes the other;
+- beside them one watch connection per seat, which relays nothing, reconnects every second as a client does, reads the seat's hello — a protocol version other than this core's marks the place mismatched and stops its reconnecting — and reads the seat's ledger badge on every `intents.changed` there; the watch stands as a connection at the hub, so the seat's lease renews while the desktop holds the seat open;
+- a close with the lease-end code `4401`, or the seat refusing the bearer at an upgrade, removes the seat as a close does and announces it, its relayed clients closed with `4401`; a relayed client is closed with `1000` at `server.close` or a re-admission, `1001` at the core's stop, and `1011` where the seat cannot be reached;
+- the shell reads one attention count from the core: this core's badge [[core-service-49](#core-service-49)] plus each seat's last read badge while its relay stands open or closed, none for a mismatched seat;
+- the bearer and the endpoint reach no client and no log.
+
+### core-service-143
+
+The core service shall expose independent registry commands `registry.get`, `registry.signin.start`, `registry.signin.cancel`, `registry.signout`, `registry.directory` and `registry.orgs`, plus `environment.registry.set`, using protocol version 31 and broadcasting `registry.state` for account changes ([DR-168](../decisions/168-independent-package-registry.md)):
+
+- `registry.get` names an origin or an environment, defaulting to the public registry, and reports its origin, display name, account without credentials, sign-in progress and read error;
+- sign-in uses the shell's existing browser or device flow with registry purpose, no seat ticket, and stores no Space entry or placement;
+- sign-out, refresh and a refused registry grant affect only its registry slot, even when a Space shares its origin; a start cancelled before its first reply stores no grant, and an old read or sign-in completion cannot restore an account after cancellation or sign-out;
+- `registry.orgs` reports every namespace the environment's registry account may publish to, with provider metadata, and directory discovery returns only public names, origins and sign-in kinds [[environments-39](environments.md#environments-39)];
+- explicit registry selection writes the environment's registry origin through a comment-preserving version-checked edit, retaining format, extension fields, Space, requests and existing lock provenance [[environments-38](environments.md#environments-38)].
+
+## Internal Behavior
+
+### Package Layout
+
+#### core-service-11
+
+The `packages/core` workspace package shall build as a headless Node package that imports no UI framework, no Electron module, and no DOM API, so the identical package serves the desktop shell and a cloud server deployment without change.
+
+### Protocol
+
+#### core-service-12
+
+The core package shall define the WebSocket protocol — message schemas, protocol version, and TypeScript message types — in one module and export it from a dedicated entry point free of Node-only runtime imports, so the UI package consumes the protocol from that one entry point and never redefines it:
+
+- When the protocol changes incompatibly, the protocol version carried by the hello message [[core-service-1](#core-service-1)] is bumped.
+- A closed vocabulary a client must hold against the runtime's own — the embedded runtime's failure-code list — is re-exported here unchanged rather than copied into a client ([DR-076](../decisions/076-playbook-14-1-adoption.md)).
+
+#### core-service-13
+
+When an inbound protocol message is received, the core package shall validate it against the message schema before acting on it:
+
+- When a message fails validation or carries an unknown type, the core package sends an error response identifying the failure, makes no state change, and leaves the connection open.
+
+### Record Routing
+
+#### core-service-14
+
+The core package shall filter records by visibility [[core-service-8](#core-service-8)] at the protocol boundary, before dispatch to any subscription, applying the same filter to live streaming and to stored-record replay [[core-service-10](#core-service-10)], so that no message on a session subscription ever carries a hidden record and clients need no client-side filtering.
+
+### Persistence Internals
+
+#### core-service-15
+
+The core package shall own Spex application files through the versioned encodings and root-lease writer contract [[storage-1](storage.md#storage-1)] [[storage-14](storage.md#storage-14)], using the staged migration before admitting clients [[storage-9](storage.md#storage-9)]:
+
+- session schemas and migrations remain Playbook-owned [[1]];
+- failed migration reports its cause and admits no writer to partially migrated data;
+- released migrations remain immutable; a format change adds a new migration.
+
+### Runtime Composition
+
+#### core-service-16
+
+The core package shall compose the session-player roster, the playbook registry, and runtime options from the shared config with the same fail-closed validation rules as the playbook launcher — as recorded in [DR-004](../decisions/004-config-and-persistence.md) and amended by [DR-019](../decisions/019-inline-agent-configuration.md) and [DR-032](../decisions/032-session-players.md) — so that any config the launcher accepts or rejects is accepted or rejected identically by the core package, a playbook's `from` and a `skills` list excepted ([DR-105](../decisions/105-playbook-17-5-0-adoption.md), [DR-123](../decisions/123-playbook-17-10-1-cligent-0-34-0-slc-0-18-0-adoption.md)):
+
+| Rule | Composition |
+| --- | --- |
+| Roster | a top-level `players` map of player id to inline agent block; a scalar adapter id normalizes to a bare-adapter block; an id outside `^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)*$`, or the reserved `captain`, is refused |
+| Bindings | `playbooks.<id>.roles` maps every id in the entry's `requiredRoleIds` to a roster player, as a bare player id or a block naming `player` with `model`/`subagentModel`/`effort`/`subagentEffort`/`fastMode`; a role left unbound, or bound to an absent player, is refused naming it |
+| Binding keys | `adapter`, `permissions`, `instruction` and `workspace` inside a binding are refused: they belong to the player's envelope |
+| Tuning | an omitted `model`/`subagentModel`/`effort`/`subagentEffort`/`fastMode` inherits the player's; for the first four, `false` selects the provider's current default and a string pins it, while a `fastMode` boolean is a literal request; the composed selection is complete on every call; a `subagentModel` string is accepted only where Cligent serves one for the player's adapter, refused in Cligent's own words otherwise ([DR-093](../decisions/093-a-players-subagent-model.md)) |
+| Delegation | an agent block's `subagentModel` is a model, the literal `inherit` — the agent's own model — or `false`, Off; where Cligent serves a subagent model for the adapter, an unset one composes as `inherit`, with or without a subagent effort beside it, at the Captain, at each player and at each binding inheriting it, as Playbook's launcher resolves it, while the configuration and its summary keep the omission; an Off is carried as itself through composition and the session's own tuning [[core-service-100](#core-service-100)], a binding omitting the field inheriting it as Off, and is sent as no subagent model only once the projection is built ([DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md)) |
+| Subagent effort | a `subagentEffort` in an agent block or a binding is accepted only from the adapter's effort values less its orchestration values and only where a subagent model composes beside it — never beside an Off, whichever of the player and the binding sets either — refused in Cligent's words naming the field otherwise ([DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md)) |
+| Writable paths | Captain and player `permissions.writablePaths` entries must be workspace-relative subpaths; empty/root-equivalent paths, absolute paths, `..`, empty segments, glob metacharacters, shell expansion or control characters are refused naming the field and entry; valid entries use `/` separators with leading `./`, trailing slashes and `.` components removed in the runtime projection, without rewriting the configuration bytes |
+| Concurrency | every group in the entry's `concurrentRoleSets` must bind to pairwise-distinct players, refused naming the group otherwise |
+| Roster scope | only players some binding references reach the composed session, so an unused roster entry gates no run |
+| Legacy | a surviving `playbooks.<id>.players` block is refused in the launcher's own words |
+| Module | a `playbooks.<id>.from` is refused [[core-service-2](#core-service-2)], while the launcher accepts one and takes ahead of it each playbook's module supplied at launch [[3]], so a configuration naming no `from` composes in both — in the launcher with each module supplied at launch, or on a record-backed reopen with the module the session records [[4]] |
+| Skills | a `skills` list at the top level, on the Captain or on a player is refused [[core-service-2](#core-service-2)], while the launcher accepts one; a session's agents carry no supplied skills, and skills reach agents from the environments that place them [[environments-8](environments.md#environments-8)] |
+| Custom options | composition for a paired project validates each entry's options with its actual working folder, naming the playbook and retaining the validator's reason on refusal, before reporting valid or accepting a project config write; global composition without a working folder defers this check, and authored option slices stay unchanged for the shell's validation and normalization at construction |
+
+- For an omitted `cwd`, the existing successful `cwd: "/"` capability probe requires validation with the actual project folder and its rejection cannot fall back to the raw slice; where that probe rejects, a successful actual-folder candidate establishes injection, otherwise the raw slice must validate and retains the existing non-injected behavior without inferring an opaque validator's reason for rejecting either candidate [[core-service-29](#core-service-29)].
+- An explicitly configured `cwd` validates and passes through unchanged [[core-service-29](#core-service-29)]; a capability probe establishes no actual-folder validation.
+
+#### core-service-17
+
+When a session is created, the core package shall instantiate the engagement host through the playbook captain shell factory with a core-provided module loader, the session's host construction capabilities [[core-service-67](#core-service-67)], and its unresolved-effect settlement hooks injected via the shell's dependency options, keeping playbook module resolution under core control and the shell's coupling to the core type-only.
+
+#### core-service-67
+
+When creating or continuing a session, the core package shall obtain the shared Playbook host lifecycle and repository capabilities [[1]], backed by that session's lease and durable effect ledger rather than an in-memory replacement ([DR-045](../decisions/045-unified-session-storage.md)):
+
+- a project that is not a Git worktree refuses before execution;
+- repository/effect reconciliation precedes each turn, and a failure starts no turn;
+- settlement and abandonment preserve the shared durable authority; no core-side snapshot can replace it.
+
+#### core-service-74
+
+When a session continues, the core package shall restore through Playbook's shared lifecycle [[1]], preserving logical session, turn, trace, operation and journal identities while appending to the existing stream:
+
+- a fresh runtime restores the saved state rather than reinitializing completed work;
+- the checkpoint's ledger must agree with the authoritative durable ledger before effects;
+- intent dispatch uses the continued logical turn ID [[core-service-47](#core-service-47)], without an independent host-owned counter offset.
+
+#### core-service-29
+
+Where a configured playbook's registry entry accepts a `cwd` option and the config block leaves it unset, when a session is created, the core package shall pass the session project's directory as that playbook's `cwd` option in the captain options ([DR-014](../decisions/014-released-toolchain.md)):
+
+- A `cwd` set in the config block passes through unchanged.
+
+### Contract Testing
+
+#### core-service-18
+
+The core contract test suite shall exercise the service end to end through the WebSocket protocol against a scripted fake adapter that replays a predetermined record script, using no network access and no real agent credentials, so protocol behavior is verified deterministically in CI.
+
+### Compile Lifecycle
+
+#### core-service-25
+
+The core package shall run each `compile.run` as its own toolchain process with its own cancel handle, admitted as one job over its artifact folder [[playbook-library-99](playbook-library.md#playbook-library-99)], and accept a `compile.abort` command naming no instance that cancels the one-shot compiles in flight for a playbook id, an authoring session's compile being canceled only by a `compile.abort` naming its instance [[core-service-96](#core-service-96)] ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)):
+
+- `compile.abort` cancels each in-flight `compile.run` of the id by terminating its toolchain child process, emits a final canceled progress line, and makes each pending `compile.run` reply with an `aborted` error; no further progress output follows the canceled line;
+- where no `compile.run` of the id is in flight, an authoring session's compile of that id running or not, the core package rejects it with a `not_found` error.
+
+### Readiness Reporting
+
+#### core-service-26
+
+The readiness report of [[core-service-9](#core-service-9)] shall be keyed by adapter: the core package shall resolve every configured position — the captain and each referenced session player, whether an inline agent block or a scalar adapter id, under the same resolution rule as the launcher [[core-service-16](#core-service-16)] — to its adapter and emit exactly one entry per distinct adapter listing those positions, so that no referenced adapter's unmet requirement is hidden by deduplication and a hand-written scalar still surfaces its adapter's requirements before the first turn fails.
+
+## Verification
+
+### core-service-144
+
+When a real-core integration suite drives registry and Space accounts at one origin, it shall verify separate sign-in, refresh and sign-out, a registry sign-in creating no Space entry, registry status discovering a CLI-created credential, public package reads before registry sign-in and private refusal until registry sign-in, cancellation during the initial device request, directory and namespace replies without backend metadata, and explicit registry selection retaining comments, extension fields, format, Space and exact lock bytes [[core-service-143](#core-service-143)].
+
+
+### Session Coverage
+
+#### core-service-19
+
+Where the core service runs with a valid config and the scripted fake adapter [[core-service-18](#core-service-18)], the test suite shall connect a WebSocket client, create a session for a temporary project directory, submit a Boss turn, and assert that:
+
+- the session's runtime working directory is the project directory [[core-service-4](#core-service-4)];
+- every non-hidden scripted record arrives on the session subscription in script order [[core-service-7](#core-service-7)];
+- the turn ends with a finished record;
+- a second Boss submission during the turn is rejected with a busy error and starts no turn [[core-service-5](#core-service-5)];
+- no network connection is opened during the run [[core-service-18](#core-service-18)].
+
+#### core-service-31
+
+Where a session's captain finishes a turn with a hidden result reporting an error, the test suite shall assert the synthesized surfacing of [[core-service-30](#core-service-30)]: a session subscriber receives a visible failure record carrying the underlying error text with the turn's id, and no hidden record reaches the session channel [[core-service-8](#core-service-8)].
+
+#### core-service-37
+
+Where a scripted captain calls one player twice within a turn, bracketing each call with the trace that names a different role, the test suite shall assert that the prompt and result records of the first call carry the first role and those of the second carry the second, that the trace records themselves carry none, and that reading the session back from the store yields the same roles [[core-service-36](#core-service-36)].
+
+#### core-service-33
+
+Where stored sessions hold, respectively, a failed first turn followed by two turns settled clean; a latest settled turn whose failure named no turn, followed by a turn not yet settled; only a stop's own error; a run parked on a failure through a later clean turn; a released turn whose manifest was updated an hour after its last record; and no turn, the test suite shall assert the listing contract of [[core-service-32](#core-service-32)]:
+
+- the first entry carries its first turn's text as its title, a turn count of three, and no failure marker;
+- the second carries the marker, loses it once its unsettled turn settles clean, and carries it again once a later turn fails;
+- the stopped entry carries no marker;
+- the parked entry carries the marker until its run leaves the failure state;
+- the released entry's last activity is its latest record's time, not its manifest's later update;
+- the last entry carries no title, a zero count, and no marker.
+
+#### core-service-35
+
+Where a client subscribes to a session that then runs a fake-adapter turn, the test suite shall assert the broadcast contract of [[core-service-34](#core-service-34)]: the state reported at the turn's start already carries the session's title, and the states reported at the turn's end and at the runtime's release [[core-service-91](#core-service-91)] each carry the title and turn count, not the zeros the session was created with.
+
+#### core-service-103
+
+Where fixture sessions' stored record streams hold overlapping prompt-to-finish calls by two players, two roles served by one of those players, successful, failed and aborted finishes, a hidden Captain call, a zero-length call and a backward-clock call followed by a second same-agent, same-turn finish with no new prompt for otherwise unmeasured players, terminal and tool durations deliberately different from their enclosing spans, a live open prompt, an unmatched finish after an earlier measured call, invalid-timestamp records around a valid pair, a dangling prompt followed by a matched same-agent call in a later turn, an otherwise measured stream marked incomplete, and a stream with no matched pair, the core integration suite shall assert the active-time fold through the WebSocket protocol:
+
+- each player's matched spans sum under that player across both roles and the hidden Captain span sums under `captain`, with successful, failed and aborted calls retained and no terminal or tool duration added [[core-service-102](#core-service-102)];
+- the concurrent spans remain whole when their sum exceeds the turn's elapsed time [[core-service-102](#core-service-102)];
+- the zero-length and backward-clock calls each produce a zero-valued entry, and the second finish after the backward call leaves that entry at zero, proving the backward finish consumed its prompt; the live open prompt, unmatched finish and invalid-timestamp records change no completed-call figure, consume no valid counterpart and do not remove an earlier entry; the later same-agent call contributes only its within-turn span rather than closing the earlier turn's dangling prompt [[core-service-102](#core-service-102)];
+- the session whose stream is marked incomplete carries no `agentActiveMs` [[core-service-102](#core-service-102)];
+- the session with no matched pair carries no `agentActiveMs` [[core-service-102](#core-service-102)];
+- a newly matched finish and an incompleteness change each cause a state report carrying the revised or absent fold, without asserting that report's position among record messages [[core-service-34](#core-service-34)] [[core-service-102](#core-service-102)].
+
+#### core-service-116
+
+Where fixture sessions' stored record streams hold execution contexts and `init` events — a hidden Captain call reporting its model, a player's later call naming an earlier context, another player's call naming none after a newer context, a player a role binding runs on another model, a call reporting no model after one that did, a stream marked incomplete, and a stream reporting no model — and a live session's runtime reports the model of the Captain's and a player's calls, the core integration suite shall assert the reported-model fold through the WebSocket protocol:
+
+- each reporting agent carries the model its latest reporting call named, as sent, with the settings that call began under read from the context its record names, else the latest one before it — the hidden Captain's included [[core-service-115](#core-service-115)];
+- a call reporting no model leaves the earlier report standing, and the player a binding runs on another model has no entry [[core-service-115](#core-service-115)];
+- the incomplete stream and the stream reporting no model carry no `agentReportedModels` [[core-service-115](#core-service-115)];
+- a newly stored report causes a state report carrying the revised fold, without asserting that report's position among record messages [[core-service-34](#core-service-34)] [[core-service-115](#core-service-115)];
+- in the live session the served records carry each `reportedModel` as the runtime sent it, and once this conversation's own model for the player changes, the next turn's report carries the new settings [[core-service-115](#core-service-115)].
+
+#### core-service-40
+
+Where a live session's runtime fails its disposal, the test suite shall request that session's disposal over the protocol during its turn and assert the failing-disposal case of [[core-service-4](#core-service-4)]: the request reports the failure and a fresh session request for the same project remains blocked.
+
+#### core-service-101
+
+Where two sessions of one project share a player and the config pins that player's model, effort and fast mode, and a second player leaves its subagent model unset, when the test suite tunes those players and the Captain in the first session over the protocol and opens both sessions in turn, the test suite shall assert that a session's tuning reaches its own runtime and nothing else ([DR-067](../decisions/067-tuning-for-one-conversation.md)):
+
+- the first session's projection carries the tuned values at the Captain, at the player's block, and at every role binding naming that player [[core-service-100](#core-service-100)] [[core-service-92](#core-service-92)];
+- the second session's projection carries the config's values at all three [[core-service-92](#core-service-92)], the role binding setting no fast mode carrying its player's [[core-service-16](#core-service-16)];
+- the second session's projection carries `inherit` and no subagent effort at the Captain, at the second player's block and at the binding naming it, where the config sets no subagent model [[core-service-16](#core-service-16)];
+- the shared config file's bytes are identical before and after [[core-service-100](#core-service-100)];
+- clearing the tuning returns the first session's projection to the config's values, and deleting the session leaves no tuning behind [[core-service-100](#core-service-100)];
+- a value the player's adapter cannot enforce is refused with the session's tuning unchanged [[core-service-100](#core-service-100)];
+- the player's subagent model, tuned alike, reaches the same three sites and is refused on a player whose adapter Cligent serves none for [[core-service-100](#core-service-100)] [[core-service-92](#core-service-92)];
+- the player's subagent effort, tuned alike, reaches the same three sites, and is refused with the session's tuning unchanged where the session also turns the subagent model off or names an orchestration effort [[core-service-100](#core-service-100)] [[core-service-92](#core-service-92)];
+- a subagent effort tuned on the second player reaches its block and the binding naming it beside `inherit`, and one tuned on the Captain reaches the Captain's block beside `inherit` [[core-service-16](#core-service-16)] [[core-service-100](#core-service-100)];
+- once the config moves that player to such an adapter, continuing the first session tuned with a subagent model is refused naming the adapter's change and offering a new session, not naming the tuning [[core-service-92](#core-service-92)];
+- once the config sets the Captain's subagent model and the second player's binding's to `false`, a subagent effort tuned on the Captain, or on that player, is refused in Cligent's words naming the Captain or the binding, with the session's tuning unchanged [[core-service-16](#core-service-16)] [[core-service-100](#core-service-100)].
+
+### Shutdown Coverage
+
+#### core-service-41
+
+Where two sessions are live and the first one's runtime fails its disposal, the test suite shall stop the core service and assert the stop contract of [[core-service-39](#core-service-39)]:
+
+- the second session's runtime is disposed even though the first one's disposal failed;
+- the stop reports the first session's failure to the host after both sessions have been attempted;
+- the endpoint accepts no further connection once the stop has returned.
+
+Where session creation or continuation is held after acquiring its shared lease but before publishing its runtime, the integration suite shall stop the core, release that initialization, and assert that shutdown waits for the admitted opening and disposes its runtime before closing the store, later session or turn admission creates no work, and the shared session lease is idle after successful cleanup [[core-service-39](#core-service-39)].
+
+Where admitted initialization fails, the integration suite shall distinguish an ordinary initialization error with successful cleanup from a cleanup-hook rejection or ambiguous compound construction error: the ordinary error does not fail shutdown; the latter outcomes report cleanup unconfirmed and retain ownership even when no controller was returned or the opening settled before shutdown; every outcome still permits shutdown to attempt the other runtimes [[core-service-39](#core-service-39)].
+
+Where a fixture agent ignores SIGTERM and holds a child of its own, and the stop's bounds are shortened through the seams, the integration suite shall stop the core mid-turn and assert that the agent receives SIGTERM once turns settle or the first bound passes and SIGKILL at the second, that the stop returns reporting the disposal unconfirmed, that nothing was written into the working folder, and that the session reads `uncertain` on this runtime afterwards [[core-service-39](#core-service-39)].
+
+### Record Visibility Coverage
+
+#### core-service-20
+
+Where the fake adapter script contains records marked hidden, the test suite shall subscribe one client to the session and a second client to the debug channel, and assert that the session subscriber receives no hidden record [[core-service-8](#core-service-8)] while the debug subscriber receives every hidden record [[core-service-14](#core-service-14)].
+
+### Configuration Coverage
+
+#### core-service-21
+
+Where the config file carries a defect from each launcher fail-closed defect class recorded in [DR-004](../decisions/004-config-and-persistence.md) as amended by [DR-019](../decisions/019-inline-agent-configuration.md) — a subagent effort beside an Off, from the player or the binding, among them ([DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md)) — [[core-service-16](#core-service-16)], or a `from` or `skills` the core refuses where the launcher accepts it [[core-service-16](#core-service-16)], when the core loads each fixture, the integration suite shall assert a named configuration refusal before session execution [[core-service-2](#core-service-2)]:
+
+- Each defect names its offending entry and blocks session creation [[core-service-2](#core-service-2)].
+- Captain and player writable paths exercise every refusal class and valid canonical form, agreeing with the installed Cligent configuration loader [[core-service-16](#core-service-16)].
+- Accepted paths reach the runtime projection canonically while their on-disk spelling stays unchanged [[core-service-16](#core-service-16)].
+
+#### core-service-122
+
+Where your own group's file is valid, when the core creates a session, the integration suite shall assert that the session records its Captain and players with no `skills` [[core-service-16](#core-service-16)].
+
+#### core-service-117
+
+Where the core watches no config file and a playbook module's import or a readiness probe can be held, when each case changes the files beneath it with no reload asked, the integration suite shall assert the case's outcome [[core-service-2](#core-service-2)]:
+
+| Case | Outcome |
+| --- | --- |
+| your own file edited, then `config.get` and `readiness.get` | both read the edit |
+| a valid file made invalid while its import is held | the invalid state answers; the valid one is never broadcast |
+| an invalid file repaired while its import is held | the repair answers; the invalid one is never broadcast |
+| edited again while the re-read's import is held | refused `conflict`, nothing broadcast; the retry reads what stands |
+| edited while a reload's readiness probe is held | no readiness broadcast for the earlier file; the re-read's follows its state |
+| the module entry the lock names removed, then restored | the missing module, then the valid state |
+| the matching install record, or a selected non-entry file, removed then restored without changing the lock or config | unavailable, then valid, with no restart or session |
+| edited while a reload's broadcast composes a project, its import held | only the re-read's state is broadcast |
+| a project's file edited while its composition's import is held | the project's state names the edit |
+| edited before an authoring turn, before a queued one, and before a compile | each runs on the edited agent; the running turn keeps its own |
+| a player added to the roster, then `draft.player.set` choosing it | accepted, the next turn running on that player |
+| a compile asked while the config cannot be read as standing | the compile's failure recorded at the toolchain phase, no compiler run |
+| `config.edit` whose reload's composition is held while the file is edited twice more | the reply is the state standing after the edits or `conflict`, never the state before the edit |
+
+#### core-service-136
+
+Where the shared config path holds no file, the test suite shall start the core service once for each credential row of [[core-service-3](#core-service-3)] — Claude only, Codex only, both and neither, each with an explicit environment and a scratch home — and fail unless the seeded file's Captain and each player carry the `adapter`, `model`, `effort` and `writablePaths` that Playbook's seed — the one the `playbook` CLI writes — returns for that same environment and home, the both-credentials row placing `dev.reviewer` alone on `codex`, no `playbooks.<id>.from` remains, and a second start over the seeded file leaves its bytes unchanged [[core-service-3](#core-service-3)].
+
+
+#### core-service-138
+
+Where the core seeded the shared config path under Claude credentials alone, the test suite shall restart it on the same home and fail unless:
+
+- with Codex credentials added, the file becomes the both-credentials seed — `dev.reviewer` alone on `codex` — with its permission bits kept, the recorded version following it, and connected clients told it was reseeded [[core-service-137](#core-service-137)];
+- a restart with unchanged credentials leaves its bytes as they are [[core-service-137](#core-service-137)];
+- after one config edit, a restart under Codex credentials alone leaves the edited bytes as they are and the record gone, and so does a further restart under Claude alone [[core-service-137](#core-service-137)];
+- a config standing with no record is left as it is under every credential row [[core-service-137](#core-service-137)].
+
+#### core-service-139
+
+Where the core runs as a seat whose shared credential file holds `CODEX_ACCESS_TOKEN` alone, with no credential in the process environment or the home, the test suite shall start it on a fresh home and fail unless the seeded config, as the clone's first commit records it, carries every agent on `codex` [[core-service-126](#core-service-126)] [[core-service-3](#core-service-3)], and unless, after the member sets their own Claude credential, the untouched config becomes the both-credentials seed [[core-service-137](#core-service-137)].
+
+#### core-service-140
+
+Where the core runs as a seat whose shared credential file holds `CODEX_ACCESS_TOKEN`, with no credential in the process environment, the test suite shall fail unless a start on a home another core already serves is refused, a stop whose media staging cannot be removed fails, and a stop whose root lease cannot be released fails, each leaving no form name of any agent in the process environment [[core-service-126](#core-service-126)].
+### Persistence Coverage
+
+#### core-service-22
+
+Where a session has completed a Boss turn, the test suite shall stop the core service, start it again on the same state root and sessions directory [[core-service-15](#core-service-15)], and assert that the session, its turns, its records (content and order), its usage totals, and its per-agent active time are served identically after restart [[core-service-10](#core-service-10)] [[core-service-102](#core-service-102)], and that a session live at shutdown is reported as no longer live:
+
+- Where the root carries an earlier release's file versions, the suite shall assert startup migrates forward, keeps every row, and serves the migrated data identically [[core-service-15](#core-service-15)].
+- Where records carry provider resume tokens — in a result and in a `playbook.trace` payload — the suite shall assert the persisted and replayed stream carries none of them [[core-service-10](#core-service-10)].
+- Where the stream file becomes unappendable mid-session, the suite shall assert the fail-soft contract of [[core-service-10](#core-service-10)]: the record is still served from memory, the listing marks the stream incomplete after the last durable sequence and carries no `agentActiveMs`, and both facts survive a restart [[core-service-102](#core-service-102)].
+- Where a native stream is damaged before restart, the suite shall assert its valid history remains readable, its persisted incomplete marker keeps any earlier boundary [[core-service-10](#core-service-10)], and a Boss submission refuses continuation without appending to the damaged stream [[core-service-73](#core-service-73)].
+- With opaque v1 objects interspersed, restart preserves records, sequences, later turn, usage, and active-time folds and stream bytes without marking incompleteness [[core-service-10](#core-service-10)] [[core-service-102](#core-service-102)].
+- Where the shell names a legacy SQLite store holding sessions and intents, beside a legacy library directory the shared config's `from` paths point into, the suite shall assert the one-time import of [[core-service-64](#core-service-64)]: the rows serve identically from the file state, the library relocates with its `from` paths rewritten and comments kept, the legacy store file is untouched but marked `<store>.imported` beside itself, a second startup imports nothing twice, a state root created later against the marked store imports nothing, an unreadable store stays unmarked for a later retry, and a store whose directory refuses the mark imports once per root all the same.
+
+#### core-service-62
+
+Where a fixture session — manifest naming a registered project's directory as its working directory, record-stream file, and no Spex sidecar — sits in the sessions directory before the core service starts, and the test suite writes a second such fixture session while the service runs, the test suite shall assert the foreign-session contract of [[core-service-60](#core-service-60)]:
+
+- both sessions appear in the listing bound to that project, non-live, with titles and turn counts folded from their streams [[core-service-32](#core-service-32)];
+- their records are served with hidden records filtered from the session subscription [[core-service-10](#core-service-10)];
+- a session-state report announcing the second session reaches a subscribed client [[core-service-60](#core-service-60)];
+- after the terminal appends to an already listed session's stream without replacing its manifest, the listing and history reflect the new title and turns, and the session subscriber receives each appended visible record once even during continuous directory activity, with the complete but unterminated final record withheld until its newline arrives [[core-service-60](#core-service-60)];
+- an external host appending through a bounded replay descriptor, with the session root unchanged, streams each new visible record once and updates the title and turn count [[core-service-60](#core-service-60)]; a missing recovery chunk retains the session's association and readable history with execution refused, a blocking diagnostic and lease-bound deletion still available [[core-service-10](#core-service-10)] [[core-service-65](#core-service-65)];
+- rescanning the same streams leaves their turn, usage, and active-time folds unchanged, replacing a stream refreshes its title, history, and active-time fold, and a malformed neighboring manifest hides no healthy session [[core-service-60](#core-service-60)] [[core-service-102](#core-service-102)];
+- leading, interspersed and trailing opaque v1 objects preserve history without inventing players, turns or failures; summary times stay finite even for wholly opaque streams [[core-service-60](#core-service-60)];
+- a fixture session whose working directory matches no registered project is absent from the listing [[core-service-60](#core-service-60)];
+- a fixture record with a Boss journal and no stream lists with the first Boss entry as its title, its Boss turns counted, and a history of turn starts, Captain replies, and turn finishes [[core-service-60](#core-service-60)];
+- every fixture file is byte-identical once the service stops, and no sidecar joins them while only reads are requested [[core-service-65](#core-service-65)].
+
+#### core-service-71
+
+Where a stored session is idle and a second session holds a turn in flight, the test suite shall assert the deletion contract of [[core-service-70](#core-service-70)]: `session.delete` on the idle session removes its files, drops it from the listing [[core-service-32](#core-service-32)] and its history from `history.get`, and a subscribed client receives the removal; the same command on the live session is refused `busy`; and on a fixture session another host wrote [[core-service-60](#core-service-60)] whose lease names this live process it is refused `busy` naming the holder [[core-service-75](#core-service-75)], with the files byte-identical afterwards.
+
+#### core-service-78
+
+Where fixture sessions another host wrote [[core-service-60](#core-service-60)] sit in the sessions directory — one leased to a dead process on this host beside a retired lease, one leased to another host, and one unleased — the test suite shall assert the cross-host deletion contract: `session.delete` on the dead-leased session removes its record and stream through the shared lease, preserves retired guards, drops it from the listing, and reaches a subscribed client as a removal [[core-service-70](#core-service-70)] [[core-service-75](#core-service-75)]; on the session leased to another host it is refused `busy` naming that host, its files intact [[core-service-75](#core-service-75)]; and removing the unleased session's files while the service runs makes it leave the listing with a removal broadcast [[core-service-76](#core-service-76)].
+
+#### core-service-88
+
+When an integration suite changes stored history and folder pairs through a running core, it shall verify removal and restoration of a recorded-path alias [[core-service-85](#core-service-85)], diagnostics preserving unresolved files [[core-service-86](#core-service-86)], and history-replacement notification before the updated summary [[core-service-87](#core-service-87)].
+
+#### core-service-77
+
+When the integration suite settles and restarts a shared-store session, it shall verify that either a desktop- or CLI-created supported checkpoint lists continuable [[core-service-32](#core-service-32)], that its runtime was released at settlement with the provider hints kept [[core-service-91](#core-service-91)], continues with the same identities and stream [[core-service-74](#core-service-74)], and persists recovery without provider tokens [[core-service-72](#core-service-72)]; that a message opens it on the current tuning while an added playbook changes nothing and a structural change is refused naming the field [[core-service-92](#core-service-92)]; and that active leases and turns in flight, history-only recovery, damaged digests, uncertain work, missing bindings and path/config drift shall refuse before a turn or intent stamp [[core-service-73](#core-service-73)]:
+
+- listing and state reports after configuration or binding changes name deterministic continuation refusals before submission, restore normal continuability when those causes are removed, and preserve exact checkpoint/replay/hint bytes and session lease state without opening a runtime or calling an agent [[core-service-32](#core-service-32)] [[core-service-34](#core-service-34)]; concurrent input edits produce no stale positive reading, lose no settlement notification, and never republish a removed session;
+- a session parked on a question keeps its summons across the release and answers where it waited [[core-service-93](#core-service-93)];
+- a session Spex created continues through the real CLI from a configuration naming no `from`, with no module supplied, on the module the session records [[core-service-16](#core-service-16)];
+- after a custom playbook finishes, the next Boss submission reopens the released runtime [[core-service-91](#core-service-91)] [[core-service-73](#core-service-73)] and starts and completes its current turn with the supplied text [[core-service-5](#core-service-5)], preserving the logical session and existing stream [[core-service-74](#core-service-74)];
+- a rejected attachment handoff starts no turn or provider call, releases the runtime opened for the submission before its reply, and permits session deletion and another session for the project [[core-service-73](#core-service-73)]; the same refusal preserves a runtime that was already live [[core-service-5](#core-service-5)];
+- with release-time summary refresh held after runtime disposal, a next-message or new-session request waits for publication before admission [[core-service-91](#core-service-91)], and shutdown keeps the store open until refresh completes [[core-service-39](#core-service-39)]; a finished turn and an aborted turn the shared lifecycle settled at its saved progress both permit continuation [[core-service-6](#core-service-6)], and no waiting message stamps an intent [[core-service-47](#core-service-47)].
+
+#### core-service-63
+
+While a core service is serving a state root, the test suite shall start a second core service against the same root and assert the admission contract of [[core-service-61](#core-service-61)]: the second start refuses to serve reporting the holder's `pid`; after the first service stops [[core-service-39](#core-service-39)], a fresh start on that root succeeds and the stopped service's lease stands retired under `.lease.retired/`; a root whose lease a killed process of this machine left is reclaimed by the next start; a lease tagged with another machine's identity refuses naming it as a machine identity; and a start whose identity file is malformed refuses naming that file, leaving no lease [[core-service-61](#core-service-61)].
+
+#### core-service-68
+
+Where a config file with a comment and a non-default mode sits at a former location and the shared config path is absent, the test suite shall start the core service with a default config path and assert the relocation contract of [[core-service-66](#core-service-66)] from each former location: the shared path holds the same bytes and mode, the active config is reported valid and not seeded, and an edit to the shared file survives a second start; from the home's `playbook/` location, a relative `sessions` locator reaching outside the directory keeps its target, the former file and its emptied directory are gone, and an XDG file beside it is untouched; a home file whose relative locator points into its own directory is left where it is and reported, the XDG file beside it stays unpublished, and the shared path holds the seeded starter; from the XDG location, the previous file is untouched.
+
+#### core-service-69
+
+Where the core service runs with the installed playbook's real captain shell and registries over a git-initialized project, the test suite shall create a session and assert the capability contract of [[core-service-67](#core-service-67)]: the session starts with a capability covering every enabled playbook [[core-service-17](#core-service-17)], and a Boss turn round-trips the Captain's reply after reconciliation.
+
+### Interface Language Coverage
+
+#### core-service-110
+
+Where a core service runs on a scratch state root with two clients connected, when one client sets the interface language to `zh`, the test suite shall assert that both clients receive `language.state` carrying `zh`, that `language.get` answers `zh` on either client and the preferences file holds it [[core-service-108](#core-service-108)] [[core-service-109](#core-service-109)], that setting none clears the stored choice, and that a code that is not offered is rejected with the stored choice unchanged [[core-service-109](#core-service-109)].
+
+#### core-service-112
+
+Where a core service runs with a config carrying an error and an adapter that is not ready, when a client sets the interface language to `zh`, the test suite shall assert that the config error and the readiness requirement the client then reads are the catalog's Chinese phrases, broadcast without a further request, that a refusal's message reads Chinese, that setting none returns each to English, and that a start on a home storing `zh` with a damaged forge cache reports that cache's diagnostic in Chinese before any client speaks [[core-service-111](#core-service-111)] [[core-service-109](#core-service-109)].
+
+#### core-service-146
+
+When the core's test suite runs, the test suite shall assert that no message of the core's English catalog says seat, ticket, home, placement, origin, unit, device or spex repository as a word, and that `space.signin.start` naming `https://spex.sublang.ai/path` is refused with "Enter just the Space's address, like https://spex.sublang.ai", writing nothing [[core-service-145](#core-service-145)].
+
+### Intent Ledger Coverage
+
+#### core-service-53
+
+Where the core service runs with a valid config and the scripted fake adapter [[core-service-18](#core-service-18)], the test suite shall drive intents through their lives over the protocol — queue, edit, dispatch on a session's turn, finish, and close — and assert that:
+
+- a queued intent comes back from `ledger.get` in its project's queue at its place by age, written as one file of the project's spex repository [[core-service-42](#core-service-42)] [[core-service-49](#core-service-49)] [[core-service-52](#core-service-52)];
+- an edit lands while the intent is queued, and the same edit after dispatch is rejected [[core-service-43](#core-service-43)];
+- closing the dispatched intent as `done` before its turn finishes is rejected, succeeds after the finish, and `dropped` is accepted on a second, still-queued intent, which then appears in no `ledger.history` page while the done one does [[core-service-46](#core-service-46)] [[core-service-50](#core-service-50)];
+- removing the closed done intent takes it out of every `ledger.history` page and leaves the rest of the ledger as it was, while the same request against a still-open intent is refused `conflict` and against an unknown or already-removed one `not_found` [[core-service-79](#core-service-79)];
+- an `intents.changed` broadcast naming the project arrives for each write and for the turn's start and finish [[core-service-51](#core-service-51)].
+
+#### core-service-54
+
+Where a store holds queued, dispatched, finished, and closed intents from a completed run, the test suite shall stop the core service, start it again on the same state root [[core-service-15](#core-service-15)], and assert that `ledger.get` replies identically to its pre-restart reply [[core-service-49](#core-service-49)] and that the intent act log carries no state or status field [[core-service-52](#core-service-52)].
+
+#### core-service-106
+
+Where a stored session's stream parks a run in its failure state, the test suite shall fold that stream and assert the cause contract of [[core-service-49](#core-service-49)]:
+
+- a stream whose failed-state status record carries the runtime's error with a well-formed cause yields a parked failure entry carrying exactly that cause, code and evidence alike;
+- a stream carrying a shape that is not a cause yields the same parked entry with none, the fold stating no reason the runtime did not state.
+
+#### core-service-132
+
+Where stored session streams raise a failure through a run moving into its failure state or a `runtime_error` naming no turn, alone or beside one naming its turn, the test suite shall fold each stream below and assert the onset contract of [[core-service-49](#core-service-49)]:
+
+| Stream | Bound to | Asserted |
+| --- | --- | --- |
+| the run's own move within a turn that then ends finished | no intent | one interrupted-band failure entry marked parked, naming no intent, its onset the move's time and turn and its title that turn's [[core-service-49](#core-service-49)] |
+| the same, then a later Boss turn, then a restore of a cut-off turn re-stating the run | no intent | that entry unchanged, onset, turn and title alike [[core-service-49](#core-service-49)] [[core-service-82](#core-service-82)] |
+| the same, then the run leaving its failure state | no intent | no failure entry [[core-service-49](#core-service-49)] |
+| the run's own move within a turn the Boss's abort ends, then a later finished turn, then a restore re-stating the run | no intent | no entry, before the restore and after it, while the session's summary reads its failure standing [[core-service-32](#core-service-32)] and the queue `failure-park` [[core-service-107](#core-service-107)] |
+| the run's own move within a dispatch turn the Boss's abort ends | an intent | the intent queued again and no entry [[core-service-49](#core-service-49)] |
+| the run's own move within a dispatch turn that then ends finished | an intent | the intent interrupted on a failure, never finished, its entry marked parked at the move's onset, and still interrupted with another conversation current [[core-service-49](#core-service-49)] |
+| the run's own move within a turn cut off, then that turn's restore re-stating the run, its report named by its marker or by its recorded position alone | no intent | no failure entry [[core-service-49](#core-service-49)] [[core-service-82](#core-service-82)] |
+| one run's move within an aborted turn, then another run's within a later turn that ends finished | no intent | one failure entry, at the second run's move [[core-service-49](#core-service-49)] |
+| the aggregate state report alone reaching the failure state within a turn that then ends finished | no intent | one failure entry marked parked, at that report [[core-service-49](#core-service-49)] |
+| a `runtime_error` naming no turn within a turn that then ends finished | no intent | one interrupted-band failure entry, not marked parked, its onset the record's time and its turn and title the turn's [[core-service-49](#core-service-49)] |
+| the same, then a later Boss turn | no intent | no failure entry [[core-service-49](#core-service-49)] |
+| a `runtime_error` naming its turn after a dispatch turn ended finished, as the core records its settlement failing, no later turn started | an intent | the intent interrupted on a failure, never finished, its entry naming that turn [[core-service-49](#core-service-49)] |
+| a `runtime_error` naming no turn after a dispatch turn ended finished, as the core records a failure from before the next turn started | an intent | the intent finished awaiting its verdict and no failure entry [[core-service-49](#core-service-49)] |
+| the same after a turn ended finished, then a second failure naming no turn | no intent | one failure entry naming no turn, not marked parked, at the first record, titled with that turn [[core-service-49](#core-service-49)] |
+| the same, then a later Boss turn | no intent | no failure entry [[core-service-49](#core-service-49)] |
+| a turn-scoped `runtime_error`, the turn's abort, then one naming no turn for the same failure | no intent | one failure entry, at the turn-scoped record [[core-service-49](#core-service-49)] |
+| a run's move into its failure state, then a `runtime_error` naming no turn, within a turn that then ends finished | no intent | one failure entry marked parked, at the move [[core-service-49](#core-service-49)] |
+| the same, then a later Boss turn | no intent | that entry unchanged, onset, turn and title alike [[core-service-49](#core-service-49)] |
+| the same within a dispatch turn | an intent | the intent interrupted on a failure, its entry marked parked at the move [[core-service-49](#core-service-49)] |
+| a run's move and a `runtime_error` naming no turn within a turn cut off, then that turn's restore re-stating the run | no intent | one failure entry marked parked, at the lost attempt's record [[core-service-49](#core-service-49)] [[core-service-82](#core-service-82)] |
+| a `runtime_error` naming no turn before any turn started | no intent | no failure entry [[core-service-49](#core-service-49)], while the session's summary reads its failure standing [[core-service-32](#core-service-32)] |
+| a `runtime_error` naming no turn in a turn cut off, then that turn's restore, whose report records one naming that turn | no intent | one failure entry, at the report's record [[core-service-49](#core-service-49)] [[core-service-82](#core-service-82)] |
+
+#### core-service-134
+
+When an integration suite drives a session's own failures over the protocol — a turn whose scripted Captain throws, then, in a later session, an intent's turn that finishes followed by a whitespace-only message dispatching a second intent, which fails before its turn starts — it shall verify the records the core writes and the ledger it folds:
+
+- the throw's runtime and core records both name its turn [[core-service-135](#core-service-135)], and the session's own failure entry names that turn at the runtime's record [[core-service-49](#core-service-49)];
+- the pre-start failure's record names no turn [[core-service-135](#core-service-135)], the first intent still reads finished awaiting its verdict with no failure entry for its session [[core-service-49](#core-service-49)], the second stays queued with the queue reading `failed` [[core-service-107](#core-service-107)], and the session's summary reads its failure standing [[core-service-32](#core-service-32)].
+
+#### core-service-133
+
+When an integration suite parks a real session's run on its coder's failure — the real `/code` coder's call failing before it touches the repository — once in a session bound to no intent and once in a turn dispatching an intent, it shall assert through `ledger.get` the entry the settled park raises [[core-service-49](#core-service-49)]:
+
+- the session's own entry is an interrupted-band failure marked parked, carrying the cause the runtime attached and naming no intent, its onset the run's move ahead of the stream's one `runtime_error`, the core's record of the Captain's failed call, which names its turn [[core-service-135](#core-service-135)];
+- the intent reads interrupted on a failure, its entry marked parked at its run's move, and never finished awaiting a verdict, while its session's summary reads the failure standing [[core-service-32](#core-service-32)].
+
+#### core-service-55
+
+Where a project holds an open issue-sourced intent, the test suite shall send a second `intent.queue` with the same source kind and reference and assert the dedup contract of [[core-service-42](#core-service-42)]: the reply is a `conflict` error naming the existing intent, no intent is stored, and once the existing intent closes [[core-service-46](#core-service-46)] the same request is accepted; and that an intent holding the same source, whether written by a sync or stored by a second `intent.queue`, while a first queue is held adopting its attachments leaves exactly one intent file for that source and refuses the held queue with `conflict` [[core-service-42](#core-service-42)].
+
+#### core-service-56
+
+Where two intents are captured a moment apart and a third arrives through a sync with an older capture time, the test suite shall assert the order of [[core-service-42](#core-service-42)]: the queue reads the synced one first, then the two by capture time, and `ledger.get` names the oldest as next [[core-service-49](#core-service-49)] [[core-service-107](#core-service-107)].
+
+#### core-service-123
+
+Where a real core on a scratch home is signed in to two stand-in instances as two accounts and pairs a project at each and a local-only project, the test suite shall queue an intent in each project over the protocol and assert that each stored intent file carries as its author [[core-service-52](#core-service-52)] the login in both author fields of the account signed in at its project's instance despite a stored personal display name, the local-only project's carrying none, and that once one instance signs out a further intent of its project carries none while the other's still carries its login in both author fields [[core-service-42](#core-service-42)].
+
+#### core-service-57
+
+Where a session is live on the fake adapter, the test suite shall submit Boss text carrying an intent id and assert the stamping contract of [[core-service-47](#core-service-47)]:
+
+- when the submitted turn starts, the intent carries that session, that turn, and a dispatch time;
+- a submission carrying the id of another project's intent, or of a closed one, is rejected and starts no turn;
+- a submission rejected busy while a turn is active [[core-service-5](#core-service-5)] stamps nothing and leaves the intent queued;
+- while a run of the session stands parked on a Boss question, a submission carrying a queued intent's id is rejected `conflict`, starts no turn, and stamps nothing, while the Boss's answer carrying no intent is accepted [[core-service-47](#core-service-47)];
+- a dispatch turn that is aborted [[core-service-6](#core-service-6)] keeps its stamps while the next `ledger.get` re-derives the intent as queued at its place by age [[core-service-49](#core-service-49)].
+
+#### core-service-95
+
+Where the integration suite starts project turns through real core commands with substitute agents, it shall verify automatic advancement [[core-service-94](#core-service-94)] and queue-standing derivation [[core-service-107](#core-service-107)] across the following settlement cases:
+
+- an ordinary Captain reply carrying no typed terminal evidence starts the oldest queued intent exactly once after release and publication, using its latest queued text, while the first remains finished and unconfirmed;
+- a prose question that parks no run and permission telemetry add no hold, while an answered parked question starts the successor only after the answer turn settles and the park leaves;
+- an unattributed turn in the project lane publishes `after-current-work` with manual start unavailable, starts no successor when it settles, and then publishes `manual-ready` with manual start available [[core-service-107](#core-service-107)];
+- a failed turn, a finished turn retaining an unparked failure condition, an aborted dispatch, an aborted follow-up after an older finish, and a reply or control settling with a question or failure park still standing start no successor; either abort leaves its conversation continuable with no recovery owed and keeps it as the current lane [[core-service-6](#core-service-6)] [[core-service-93](#core-service-93)], while a later clean attributed follow-up — one recovering a failure among them — may start one and an ending control may not;
+- a restore of an interrupted follow-up settles its report, leaves the conversation continuable and the next row `stopped`, and starts no successor, and a restore of an interrupted dispatch whose lost attempt failed turns the next row from `failed` to `stopped` and leaves its intent Queued as the stopped dispatch left it, its stamps kept, raising no finish and starting no successor [[core-service-82](#core-service-82)] [[core-service-94](#core-service-94)] [[core-service-107](#core-service-107)];
+- `ledger.get` publishes the ordered standings of [[core-service-107](#core-service-107)]: active or settling work wins over every settled condition, a surviving failure park wins over a simultaneous question park and carries its structured cause, either park wins over the turn that left it, a failed turn or finished turn retaining an unparked failure reports `failed` with its cause, an abort, a successful ending or a restore reports `stopped`, and the fallback alone reports `manual-ready`;
+- a Done or Drop verdict accepted before or during an otherwise eligible settlement neither selects a row that only the verdict releases nor cancels the verdict-independent successor, while either verdict after settlement and a later removal initiate nothing; an ending turn required by Drop remains ineligible;
+- a competing manual submission or admission refusal creates no duplicate turn, dispatch stamp, or automatic retry;
+- adding or editing queued work during the active turn affects the next selection, while an older intent arriving through a sync, or a close, that changes next after authorization cancels rather than substitutes work; later queue edits, ledger reads, adoption and restart initiate no handoff;
+- subsequent dispatch bounds the first intent's attribution, and confirming that first intent changes neither the second intent nor its active turn.
+
+#### core-service-104
+
+Where a session's scripted Captain leaves a run parked on a Boss question inside an open intent's turn range while the Captain shell holds the root its decision engaged [[core-service-18](#core-service-18)] and the project holds a queued successor, the test suite shall close that intent `dropped` over the protocol and assert the whole ruling [[core-service-46](#core-service-46)] ([DR-073](../decisions/073-letting-go-ends-the-parked-run.md)):
+
+- the close runs one further turn carrying the ending control's own label rather than any Boss text, adding no dispatch stamp [[core-service-47](#core-service-47)] [[core-service-98](#core-service-98)];
+- that turn disposes the ended run, after which the intent reads closed dropped, `ledger.get` carries no entry for its session, and `ledger.history` lists it dropped [[core-service-49](#core-service-49)] [[core-service-50](#core-service-50)];
+- the ending turn dispatches no successor, and `ledger.get` leaves the queued successor next with standing `stopped` and manual start available after the ending and after a service restart [[core-service-49](#core-service-49)] [[core-service-94](#core-service-94)] [[core-service-107](#core-service-107)];
+- closing an intent no run stands parked for records the verdict alone and runs no further turn;
+- where the opened session advertises no ending, the close is refused with that cause, the intent stays open and its entry stands [[core-service-98](#core-service-98)];
+- the same rule's failure park is not driven here: the harness keeps the engaged root parked on its coder's question, so no run of the session stands parked in its failure state.
+
+#### core-service-58
+
+Where a project's store holds twenty-five closed intents, the test suite shall page through `ledger.history` and assert the paging contract of [[core-service-50](#core-service-50)]: the first page holds the twenty newest-closed intents newest-first, the second page — requested with the first page's cursor — holds the remaining five with no overlap, and both pages reply identically after a restart on the same store [[core-service-15](#core-service-15)].
+
+#### core-service-59
+
+Where a session finishes a turn bound to no intent, the test suite shall assert the review-state contract of [[core-service-48](#core-service-48)]: `ledger.get` lists a finished-band stand-in entry for the unviewed turn [[core-service-49](#core-service-49)], a `session.viewed` naming that turn clears the entry from the next reply, a `session.viewed` naming a turn still in flight is refused and leaves the entry standing, a marker no later than the stored one writing nothing, a player's permission request raises no entry at all [[core-service-49](#core-service-49)], the entry stays cleared after a restart on the same store, and, where the session's first turn left a run parked on a Boss question and a second turn answered it, the entry for that answer's finished turn is titled with the first turn's text [[core-service-49](#core-service-49)] and the session's summary names that text as its work title while the answer's turn runs and after it settles, a third turn sent once no question stands naming its own [[core-service-32](#core-service-32)].
+
+### Readiness Coverage
+
+#### core-service-23
+
+Where the config's agent blocks reference both an adapter whose readiness requirements are satisfied and one whose requirements are not (via controlled environment variables and home-directory fixtures), the test suite shall assert that readiness reporting marks each adapter's entry accordingly and names the unmet requirement for the not-ready adapter [[core-service-9](#core-service-9)].
+
+#### core-service-113
+
+Where readiness is evaluated for the `claude` and `codex` adapters with credentials satisfied, over this checkout's supplied SDKs and with cligent's availability probe and executable lookup substituted, the test suite shall assert each outcome's readiness:
+
+| Probe | Lookup | Readiness |
+| --- | --- | --- |
+| unavailable | a missing platform package | not ready, naming the package, its platform and architecture, and the `npm ci` or reinstall repair [[core-service-9](#core-service-9)] |
+| unavailable | an unsupported host | not ready, naming the host with no repair [[core-service-9](#core-service-9)] |
+| unavailable | no SDK, or the executable present | not ready, stating that the runtime failed to load [[core-service-9](#core-service-9)] |
+| available | any | ready [[core-service-9](#core-service-9)] |
+
+### Compile Lifecycle Coverage
+
+#### core-service-27
+
+Where the core service runs with an injected compile spawner whose toolchain run blocks until canceled, the test suite shall start a compile over the protocol and assert that:
+
+- a second `compile.run` for the same playbook id and project while the first is in flight is refused `busy` naming the artifact folder, the first running on [[core-service-25](#core-service-25)];
+- `compile.abort` for that id makes the pending `compile.run` reply with an `aborted` error, and the final progress line broadcast for the playbook is the canceled marker [[core-service-25](#core-service-25)];
+- `compile.abort` for a playbook id with no compile in flight is rejected with a `not_found` error [[core-service-25](#core-service-25)];
+- after cancellation, a new `compile.run` for the same id is accepted [[core-service-25](#core-service-25)].
+
+### Playbook Draft Coverage
+
+#### core-service-97
+
+Where the core service runs with the scripted fake adapter and a compile spawner that blocks until canceled, the test suite shall drive the authoring command family over the protocol and assert each reply of the activity table, the `not_found`, `invalid_request` and `conflict` refusals, a `draft.create` naming the org `Acme` or an empty license and a `draft.defaults` for a project with no working folder on this device among the `invalid_request` ones with nothing made, a command naming a replaced session's former instance among the conflicts, a `compile.abort` naming a former instance refused while its successor's compile runs and the progress lines naming the compile's instance, a second compile of an instance refused `busy` while its first runs and one `compile.abort` naming it canceling the first, a turn and a compile running at once each reported in the session's state, that `draft.record` messages arrive in sequence on the draft channel only, that `draft.state` follows every transition, that the session's files land in the project's clone, and that a malformed command is rejected with no state change [[core-service-96](#core-service-96)]; that a `compile.abort` naming no instance is refused `not_found` while the session's compile runs [[core-service-25](#core-service-25)]; that a moved clone's session is announced under its new project with its instance [[core-service-119](#core-service-119)]; that a sync receiving a session's transcript announces it as `draft.history-replaced` with its instance [[core-service-118](#core-service-118)]; and that `draft.compile`, and `draft.register` after a successful compile, are refused `busy` naming the folder while a one-shot compile of the session's id runs, once with the session idle and once with its `activity` read as `turn` before the refusals [[core-service-96](#core-service-96)].
+
+### Endpoint Coverage
+
+#### core-service-90
+
+Where CI runs on Windows, the integration suite shall exercise real Windows private storage and assert unsafe existing permissions refuse without creating config or migrating data [[core-service-89](#core-service-89)].
+
+#### core-service-38
+
+Where the core service attaches to a test-supplied HTTP server [[core-service-1](#core-service-1)], the test suite shall connect real WebSocket clients to that server's port and assert the admissions and rejections of [[core-service-24](#core-service-24)]:
+
+- a token-bearing handshake whose Origin is the server's own host succeeds and receives the hello with the protocol version, with the endpoint address reported to the host [[core-service-1](#core-service-1)];
+- a handshake with a wrong or missing token is rejected;
+- a token-bearing handshake from a foreign web origin is rejected;
+- a token-bearing handshake with no Origin, and one from a `file://` origin, each succeed.
+
+### Readiness Dedup Coverage
+
+#### core-service-28
+
+Where the config references one adapter from several positions — as the captain and as a session player, including a hand-written scalar adapter id — the test suite shall assert that readiness reporting includes exactly one entry for that adapter [[core-service-26](#core-service-26)], naming each referencing position, marked per the adapter readiness rules with the unmet requirement named when the adapter is not ready [[core-service-9](#core-service-9)].
+
+#### core-service-81
+
+When the integration suite opens recorded Captain/player work after removing its playbook modules and changing current configuration, it shall verify historical context and graphs are still served, activity derives from recorded traces, and absent/unknown context is reported without substitution [[core-service-80](#core-service-80)].
+
+### Recovery Coverage
+
+#### core-service-84
+
+When an integration suite interrupts CLI-created and desktop-created sessions and recovers them through core commands, it shall verify explicit recovery [[core-service-82](#core-service-82)] [[core-service-83](#core-service-83)]:
+
+- listing and broadcasts expose the saved input with a reason naming Restore, and disable ordinary continuation [[core-service-32](#core-service-32)] [[core-service-34](#core-service-34)];
+- an active external writer withholds recovery, and releasing its lease reveals uncertainty without another replay write [[core-service-32](#core-service-32)];
+- an idle shared lease clears a cached external holder at admission without consuming unread foreign records, while active and unprovable ownership each refuse without agent calls or checkpoint writes [[core-service-73](#core-service-73)];
+- an attempt with nothing recorded lists as discardable, and one with a recorded step lists as not discardable and refuses Discard with Playbook's cause, without evidence loss [[core-service-32](#core-service-32)] [[core-service-83](#core-service-83)];
+- a refused Discard releases and republishes ownership before Restore is admitted, preserves its original refusal when ownership refresh fails, and leaves foreign replay records for their normal publication [[core-service-83](#core-service-83)];
+- concurrent admission and recovery keep distinct sessions of one project exclusive through ownership publication, and a same-session live refusal preserves the runtime's local reservation through a scanner refresh [[core-service-4](#core-service-4)];
+- Restore reuses the saved configuration, reports the unprocessed message or the lost position through the Captain without calling an agent or re-running the input, settles, and preserves logical identities [[core-service-82](#core-service-82)];
+- a CLI writer killed mid-step, its phase committed, lists that step as recorded work, and Restore brings its run back in its failure state: the restored position with the checkpoint's cause stands in the stream, the summary carries the parked run's controls and the shell's ending, and the failure summons with that cause [[core-service-82](#core-service-82)] [[core-service-91](#core-service-91)] [[core-service-49](#core-service-49)];
+- a run the Boss stopped mid-step, whose next message a CLI writer lost in the Captain's call, comes back from Restore still parked with the stop's cause and its controls, and raises no failure summons [[core-service-82](#core-service-82)] [[core-service-49](#core-service-49)];
+- a restore whose marker and settled report stand with no recorded position is completed once by the next core to read the session, which then reads the report as a stop and the failure it brought back as a summons, and a later start appends nothing [[core-service-82](#core-service-82)];
+- Restore refuses a session with nothing interrupted before opening it, writing no record, and a relocated checkpoint with Playbook's cause, starting no turn and leaving the uncertainty standing [[core-service-82](#core-service-82)];
+- Discard restores the prior checkpoint or removes a fresh attempt without loading agents [[core-service-83](#core-service-83)];
+- competing leases and repeated requests start no duplicate turn [[core-service-82](#core-service-82)] [[core-service-83](#core-service-83)].
+
+#### core-service-99
+
+When an integration suite parks a real session's run in its recoverable failure state — a scripted player committing its phase and leaving behind the repository evidence Playbook cannot classify — and drives that park through core commands across a restart, it shall verify the named recovery [[core-service-98](#core-service-98)]:
+
+- settlement releases the runtime with the unresolved effect standing, and the session lists continuable with no reason [[core-service-91](#core-service-91)] [[core-service-73](#core-service-73)];
+- its summary carries the park's reason, every action the fenced run advertised in the order it advertised them, and the shell's own ending [[core-service-32](#core-service-32)];
+- a second session of the same project is created while that one stands parked and idle [[core-service-4](#core-service-4)];
+- a fresh core over the same state root lists the same continuability and the same advertised controls, no shell being held to read them from [[core-service-32](#core-service-32)] [[core-service-91](#core-service-91)];
+- a named action the opened run does not advertise is refused with its cause, starting no turn and leaving the session idle;
+- the action named rather than the first advertised — the run's abandonment beside the reconciliation it offers first — opens the settled session and runs as one turn whose text is that action's own label, after which the session carries no parked controls and continues [[core-service-32](#core-service-32)] [[core-service-73](#core-service-73)];
+- the abandoned run then stands interrupted on nobody, the session's only attention entry being its finished turn's [[core-service-49](#core-service-49)];
+- a repeated request starts no duplicate turn [[core-service-5](#core-service-5)].
+
+#### core-service-105
+
+When an integration suite parks a real session's run in its recoverable failure state and drives it through an unnamed control, it shall verify the fallback, the continuation it leaves, and the deletion that follows [[core-service-98](#core-service-98)]:
+
+- an ending sent with no action named opens the settled session and runs the first control that shell advertises, as one turn after which the session carries no parked controls and continues [[core-service-32](#core-service-32)] [[core-service-91](#core-service-91)];
+- an ordinary Boss message then continues the session and its new run publishes its own park [[core-service-73](#core-service-73)] [[core-service-32](#core-service-32)];
+- deleting that session — idle, though its run stands parked — forgets what that run advertised [[core-service-70](#core-service-70)].
+
+#### core-service-114
+
+When an integration suite aborts a real session's turn while a scripted call is in flight — its player's, with the phase committed, or the Captain's own decision call — it shall verify the saved stop [[core-service-6](#core-service-6)]:
+
+- in either case the turn-aborted record streams, and the settled session lists continuable with no recovery owed [[core-service-6](#core-service-6)] [[core-service-32](#core-service-32)];
+- the player's stop leaves its summary carrying the park's reason, the actions the stopped run advertised in order, and the shell's own ending, kept with the preferences as at any settlement [[core-service-91](#core-service-91)] [[core-service-32](#core-service-32)];
+- the Captain's stop, which moves the shell's own machine to its failure state, keeps no park and leaves its dispatched intent Queued with the next row `stopped`, manual start available, and no summons [[core-service-107](#core-service-107)] [[core-service-49](#core-service-49)].
+
+#### core-service-131
+
+Where the publication of a real session's state is held through the seam at the checkpoint that marks its turn begun — before the runtime has begun the turn and before any agent call, the Captain's first call scripted far past the settlement bound — when an integration suite aborts that turn and then releases the hold, it shall verify the held stop [[core-service-6](#core-service-6)]:
+
+- the abort is reported taken while the turn is held, no agent call having started;
+- released, the turn-aborted record streams and the session settles inside the bound, continuable with no recovery owed and no park, the held call never reaching the agent [[core-service-6](#core-service-6)] [[core-service-32](#core-service-32)].
+
+#### core-service-120
+
+When an integration suite parks a real session's run on a Boss question — the real `/code` coder asking, the substitute judgment returning the question as awaiting the Boss — and answers it, it shall verify the summary across the answer's turn:
+
+- the settlement that parked the run leaves its summary carrying the question's park and no recovery [[core-service-32](#core-service-32)];
+- while the answer's turn runs, its checkpoint reading uncertain, the listing and every state reported since the answer was accepted carry `turnActive` with no `recovery`, no continuation reason and no park, and the park has left the preferences [[core-service-32](#core-service-32)] [[core-service-34](#core-service-34)];
+- once the answer's turn settles with the run finished, the session carries no recovery and no park and lists continuable [[core-service-32](#core-service-32)].
+
+#### core-service-121
+
+When a real-core integration suite composes a paired project's custom options, it shall verify missing or invalid options are reported before a session lease, runtime or provider call, project config writes refuse invalid options without changing bytes, and valid options retain the authored slice [[core-service-16](#core-service-16)]:
+
+- exact real-folder injection and an explicit override pass unchanged to the shared host [[core-service-29](#core-service-29)];
+- an optional cwd accepted by the capability probe but rejected for the actual folder is refused, with no raw-default fallback [[core-service-16](#core-service-16)];
+- an entry rejecting cwd validates its raw options, while global composition without a working folder defers context-dependent validation [[core-service-16](#core-service-16)];
+- a pairing changed while a module imports is re-read before publishing a config state, and a config write or new-session request holding the previous pairing is refused without changing config bytes or opening a session [[core-service-2](#core-service-2)].
+
+### Ownership Coverage
+
+#### core-service-124
+
+Where two homes pair one project at the same working-folder path and sync its records, the integration suite shall assert execution ownership across them:
+
+- a session created on the first home carries its runtime record before its first turn [[core-service-4](#core-service-4)], and on the second reads `runsOn` with the first's label, not continuable, with no `recovery` [[core-service-32](#core-service-32)], refuses continuation, `session.control`, Restore and Discard with `invalid_request` and the phrase [[core-service-73](#core-service-73)] [[core-service-82](#core-service-82)] [[core-service-83](#core-service-83)], is never the second's lane [[core-service-93](#core-service-93)], and raises no attention there [[core-service-49](#core-service-49)];
+- an intent captured on the first home carries the first's runtime [[core-service-42](#core-service-42)], and on the second is listed in its queue with `runsOn`, never next [[core-service-107](#core-service-107)], never advanced into [[core-service-94](#core-service-94)], and refused `conflict` on a turn, an edit and a close [[core-service-47](#core-service-47)] [[core-service-43](#core-service-43)] [[core-service-46](#core-service-46)], while a remove of it once closed on the first succeeds;
+- an open dispatch of the first's session is not derived as released on the second [[core-service-47](#core-service-47)];
+- a session and an intent carrying no runtime keep today's readings on both homes, and an intent without a runtime is next on either [[core-service-107](#core-service-107)];
+- deleting the first's session from the second succeeds as any deletion does.
+
+#### core-service-127
+
+Where the core runs as a seat against a stand-in instance with a fixture adapter recording its environment, the integration suite shall assert seat mode [[core-service-125](#core-service-125)]: the device request names the server and the person and a sign-in as another account stores nothing; your own group gains no placement; the path-naming commands are refused with the phrase; `server.open` is refused before anything is asked; a join names no folder; an intent holding no runtime is listed queued, never next while a newer intent the seat captured is, and refused `conflict`, "Runs nowhere yet", on a turn while its edit and close succeed; a `git push` run outside the app in a project's work tree reaches an `http` or `https` host the member placed a token for with that token and a host without one with none [[core-service-125](#core-service-125)]; and the shared credential file [[core-service-126](#core-service-126)]: its values reach a run's environment, a value replaced between runs reaches the next run while the running one keeps its own, a member's own credential displaces the shared names of its agent, and an unreadable file is reported without blocking.
+
+#### core-service-130
+
+Where a stand-in instance answers the servers routes and a stand-in hub admits a ticket and relays to a second core as a seat, the integration suite shall assert the places [[core-service-128](#core-service-128)] [[core-service-129](#core-service-129)]: `server.list` names the server; `server.open` without consent asks nothing; with it, the seat's entry is written owner-only and the reply carries no bearer; the relay path admits the local token and refuses a wrong one and a foreign origin; the relayed hello is the seat's and a `project.list` round-trips; a seat whose hello carries another version reads mismatched alone; the attention count includes the seat's badge; a lease-end close and `server.close` each remove the path and the entry and announce `server.state`; no frame to the client carries the bearer; a restarted core reopens the seat; the admission's wait outlasts a stand-in hub answering after seventy seconds and ends `unreachable` at ninety [[core-service-128](#core-service-128)]; and the seat's sign-in [[core-service-142](#core-service-142)]: the seat's hello read, `server.state` carries `signIn` `pending`, the seat's own `space.signin.start` having been sent once with the ticket the open presented, then `signedIn` with no `running` between where the stand-in grants on the ticket; where the stand-in is scripted to keep its page, `pending` through the first poll interval, then `running` with the stand-in's verification URL, then `signedIn` once the stand-in approves and `failed` with the seat's cause where it denies, `server.signin` starting a second flow with no ticket after a failure, read `running` within the interval, and none while one runs, a seat signed in before the open reading `signedIn` with no flow started, a core restarted over its seat starting its sign-in with no ticket, read `running` within the interval, and no app token of the seat's and no ticket in any frame to the client.
+
+#### core-service-141
+
+When a protocol integration client connects to the real core, the suite shall assert the hello names the current protocol version and no client before any other message [[core-service-1](#core-service-1)].
+
+## References
+
+[1]: https://github.com/sublang-ai/playbook/blob/main/specs/packages/session-storage.md "Shared session format and host lifecycle"
+[2]: https://github.com/sublang-ai/playbook/blob/main/specs/packages/recovery.md "Prepare and resume interrupted work"
+[3]: https://github.com/sublang-ai/playbook/blob/main/specs/packages/playbook-cli.md#playbook-cli-94 "Playbook playbook-cli-94: modules supplied at launch"
+[4]: https://github.com/sublang-ai/playbook/blob/main/specs/packages/playbook-cli.md#playbook-cli-22 "Playbook playbook-cli-22: a reopen takes the module the session records"
+[5]: https://github.com/sublang-ai/playbook/blob/main/specs/packages/playbook-cli.md#playbook-cli-98 "Playbook playbook-cli-98: the machine identity facade"

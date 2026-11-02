@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// The one queued-intent presentation (dashboard-59, DR-077): every
+// consumer gets the same standing phrases. Start
+// availability travels beside a published QueueSchedule; callers place
+// the control where their surface owns it.
+
+import type { QueueSchedule } from "@sublang/spex-core/protocol";
+
+import { causePhrase } from "../lib/failure-catalogue.js";
+import { i18n } from "../i18n.js";
+
+const QUEUED_CLASS =
+  "shrink-0 rounded-full bg-neutral-100 px-1.5 py-0.5 text-xs text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400";
+
+/** The exact phrase for a published scheduling standing. */
+export function queueStandingPhrase(
+  schedule: QueueSchedule,
+): string | undefined {
+  const failure = causePhrase(schedule.cause);
+  switch (schedule.standing) {
+    case "after-current-work":
+      return i18n._({
+        id: "after current work",
+        comment: "queued row standing: it runs once the current work ends",
+      });
+    case "question-park":
+      return i18n._({
+        id: "waiting — your reply",
+        comment: "queued row standing: the work ahead parked on a question",
+      });
+    case "failure-park":
+      // One whole phrase per case, never a translated stem with a
+      // cause glued on (localization-4).
+      return failure
+        ? i18n._("waiting — current work failed — {failure}", { failure })
+        : i18n._("waiting — current work failed");
+    case "failed":
+      return failure
+        ? i18n._("waiting — previous work failed — {failure}", { failure })
+        : i18n._("waiting — previous work failed");
+    case "stopped":
+      return i18n._("waiting — previous work stopped");
+    case "manual-ready":
+      return undefined;
+  }
+}
+
+/** Where a row assigned to another runtime runs (dashboard-29,
+ * DR-134): the phrase stands in place of any standing, naming that
+ * runtime by the label the core serves. */
+export function runsOnPhrase(label: string): string {
+  return i18n._({
+    id: "Runs on {label}",
+    values: { label },
+    comment:
+      "queued row: the intent is assigned to another runtime, named by its label — the server's name on a seat, else the host name — and runs there alone",
+  });
+}
+
+/** The neutral lifecycle mark every committed queue row carries. */
+export function QueuedMark({ testId }: { testId?: string }) {
+  return (
+    <span data-testid={testId} className={QUEUED_CLASS}>
+      {i18n._({
+        id: "Queued",
+        comment: "lifecycle mark on every committed queue row (DR-077)",
+      })}
+    </span>
+  );
+}
+
+/** The shared visible phrase. A manual-ready standing renders nothing. */
+export function QueueStandingPhrase({
+  schedule,
+  testId,
+  className = "",
+}: {
+  schedule: QueueSchedule;
+  testId?: string;
+  className?: string;
+}) {
+  const phrase = queueStandingPhrase(schedule);
+  return phrase ? (
+    <span data-testid={testId} title={phrase} className={className}>
+      {phrase}
+    </span>
+  ) : null;
+}

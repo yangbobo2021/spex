@@ -1,0 +1,959 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// The spec-view data plane (SPECV; DR-011, DR-015): parse a project's
+// specs/ tree — the packages collection of meta-1 — into the
+// protocol's SpecTreeState in one pass, confine specs.read fetches
+// to the specs/ directory, and replace one file atomically under a
+// digest token (specs.write, DR-043). Sync fs is deliberate — spec
+// trees are small and reads happen on request (no watcher).
+
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import type { Dirent } from "node:fs";
+import { basename, dirname, isAbsolute, join, posix, sep } from "node:path";
+
+import { defaultRunCommand, type RunCommand } from "./forge.js";
+import { i18n } from "./i18n.js";
+import type {
+  SpecFileInfo,
+  SpecGroup,
+  SpecRecordInfo,
+  SpecTreeState,
+} from "./protocol.js";
+
+/** Directories marking a legacy tree, per the scaffold package's
+ * legacy-generation classification: the pre-DR-012 user/dev/test/items
+ * groups and the interactions/compositions collections retired by
+ * DR-000. `iterations` is absent by design — intent records there
+ * still list (spec-view-14). */
+const LEGACY_DIRS = [
+  "user",
+  "dev",
+  "test",
+  "items",
+  "interactions",
+  "compositions",
+] as const;
+
+const KNOWN_TOP_LEVEL = new Set([
+  "packages",
+  "decisions",
+  "intents",
+  // Tolerated while a tree migrates to intent records (DR-017).
+  "iterations",
+  "map.md",
+  "meta.md",
+]);
+
+/** `### <pack>-<N>` / `#### <pack>-<N>` item heading (meta-11) —
+ * lowercase kebab-case, with the pre-DR-000 ALLCAPS form kept so
+ * old-generation trees still parse, degraded to notices. */
+const ITEM_HEADING =
+  /^(#{3,4})\s+((?:[a-z0-9]+(?:-[a-z0-9]+)*|[A-Z][A-Z0-9]*)-\d+)\s*$/;
+/** A bare item ID, as used in citation link text (meta-16, meta-20). */
+const ITEM_ID = /^(?:[a-z0-9]+(?:-[a-z0-9]+)*|[A-Z][A-Z0-9]*)-\d+$/;
+/** A link fragment that targets an item heading's anchor. */
+const ITEM_ANCHOR = /^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\d+$/;
+/** `# <pack>: <Title>` H1 (meta-10); the ALLCAPS short form kept so
+ * old-generation trees still parse, degraded to notices. */
+const H1_IDENTIFIER = /^((?:[a-z0-9]+(?:-[a-z0-9]+)*|[A-Z][A-Z0-9]*)):\s*(.+)$/;
+const FENCE = /^\s*(?:```|~~~)/;
+/** Innermost inline link, so the enclosed citation form
+ * `[[<id>](<path>#<id>)]` (meta-16) captures the bare id. */
+const INLINE_LINK = /\[([^[\]]+)\]\(([^()\s]+)\)/g;
+
+/** Known `##` sections -> filter group (DR-015; meta-30).
+ * Localized scaffolds translate the section headings; the zh names
+ * mirror the scaffold/linter vocabulary. */
+const SECTION_GROUPS: ReadonlyMap<string, SpecGroup> = new Map([
+  ["External Behavior", "external"],
+  ["外部行为", "external"],
+  ["Internal Behavior", "internal"],
+  ["内部行为", "internal"],
+  ["Verification", "test"],
+  ["验证", "test"],
+]);
+
+// ---------------------------------------------------------------------------
+// Per-file parsing (pure text -> SpecFileInfo)
+// ---------------------------------------------------------------------------
+
+interface OpenItem {
+  id: string;
+  /** Heading level: 3 or 4. */
+  level: number;
+  section: string | undefined;
+  topic: string | undefined;
+  body: string[];
+}
+
+function stripAnchor(heading: string): string {
+  return heading.replace(/\s*\{#[^}]*\}\s*$/, "").trim();
+}
+
+/** Empty file shell carrying identity fields derived from the key;
+ * the basename is the package identifier (meta-10). */
+function fileShell(key: string): SpecFileInfo {
+  const slash = key.lastIndexOf("/");
+  return {
+    path: `specs/packages/${key}.md`,
+    key,
+    dir: slash === -1 ? "" : key.slice(0, slash),
+    basename: slash === -1 ? key : key.slice(slash + 1),
+    items: [],
+    notices: [],
+  };
+}
+
+/** Ordered unique item IDs cited by inline links whose anchor targets
+ * an item (META-16/META-20); fenced lines never cite. */
+function extractCites(body: string[]): string[] {
+  const cites: string[] = [];
+  const seen = new Set<string>();
+  let inFence = false;
+  for (const line of body) {
+    if (FENCE.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    for (const match of line.matchAll(INLINE_LINK)) {
+      const text = match[1];
+      if (!ITEM_ID.test(text)) continue;
+      const hash = match[2].indexOf("#");
+      if (hash === -1) continue;
+      if (!ITEM_ANCHOR.test(match[2].slice(hash + 1))) continue;
+      if (!seen.has(text)) {
+        seen.add(text);
+        cites.push(text);
+      }
+    }
+  }
+  return cites;
+}
+
+/** First sentence of the body, or the whole first non-empty line when
+ * no sentence end is found before the line break. Raw markdown kept. */
+/** Enclosed citation `[[id](target)]` (meta-16), dropped whole from
+ * digests — the citation is navigation, not prose, and a truncated
+ * `[[…` leaks markup into the one-line row. */
+const DIGEST_CITE = /\[\[[^[\]]+\]\([^()\s]+\)\]/g;
+/** Plain inline link, kept as its text in digests. */
+const DIGEST_LINK = /\[([^[\]]+)\]\([^()\s]+\)/g;
+/** Inline code span, kept as its content in digests — the backreference
+ * pairs equal-length fences, so a literal backtick inside a
+ * double-backtick span survives; the bare-backtick alternative drops
+ * only unmatched markers ("$2" is empty when it fires). */
+const DIGEST_CODE = /(`+)(.+?)\1|`+/g;
+
+function firstSentence(body: string[]): string {
+  const firstText = (body.find((line) => line.trim() !== "") ?? "")
+    .replace(DIGEST_CITE, "")
+    .replace(DIGEST_LINK, "$1")
+    .replace(DIGEST_CODE, "$2")
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  const sentence = /^(.*?[.!?])(?=\s|$)/.exec(firstText);
+  return sentence ? sentence[1] : firstText;
+}
+
+/** Parse one spec file's markdown text (exported for tests). */
+export function parseSpecFileText(text: string, key: string): SpecFileInfo {
+  const file = fileShell(key);
+  const unexpectedSections = new Set<string>();
+
+  let h1: string | undefined;
+  let section: string | undefined;
+  let topic: string | undefined;
+  let intent: string | undefined;
+  let inFence = false;
+  let open: OpenItem | undefined;
+  let collectingIntent = false;
+  let intentPara: string[] = [];
+
+  const closeItem = (): void => {
+    if (!open) return;
+    const body = [...open.body];
+    while (body.length > 0 && body[0].trim() === "") body.shift();
+    while (body.length > 0 && body[body.length - 1].trim() === "") body.pop();
+    let group = open.section === undefined ? undefined : SECTION_GROUPS.get(open.section);
+    if (group === undefined) {
+      // Best-guess group for items outside the known behavior and
+      // verification sections; the file notice flags the surprise.
+      group = "external";
+      if (open.section === undefined) {
+        file.notices.push(
+          i18n._({
+            id: "item {item} appears before any ## section",
+            values: { item: open.id },
+            comment: "Spec notice; `##` is the markdown heading level and stays as it is",
+          }),
+        );
+      } else if (!unexpectedSections.has(open.section)) {
+        unexpectedSections.add(open.section);
+        file.notices.push(
+          i18n._({
+            id: 'items under unexpected section "{section}"',
+            values: { section: open.section },
+            comment: "Spec notice: the section heading is the file's own words",
+          }),
+        );
+      }
+    }
+    file.items.push({
+      id: open.id,
+      group,
+      section: open.section ?? "",
+      ...(open.topic !== undefined ? { topic: open.topic } : {}),
+      firstLine: firstSentence(body),
+      text: body.join("\n"),
+      cites: extractCites(body),
+    });
+    open = undefined;
+  };
+  const endIntent = (): void => {
+    if (collectingIntent && intentPara.length > 0 && intent === undefined) {
+      intent = intentPara.join(" ");
+    }
+    collectingIntent = false;
+    intentPara = [];
+  };
+
+  for (const line of text.split(/\r?\n/)) {
+    if (FENCE.test(line)) {
+      inFence = !inFence;
+      if (open) open.body.push(line);
+      continue;
+    }
+    if (inFence) {
+      if (open) open.body.push(line);
+      continue;
+    }
+    const heading = /^(#{1,6})(?!#)\s+(.*)$/.exec(line);
+    if (!heading) {
+      if (open) {
+        open.body.push(line);
+      } else if (collectingIntent) {
+        if (line.trim() === "") {
+          if (intentPara.length > 0) endIntent();
+        } else {
+          intentPara.push(line.trim());
+        }
+      }
+      continue;
+    }
+    const level = heading[1].length;
+    const item = ITEM_HEADING.exec(line);
+    if (item) {
+      // Any item heading starts a new item, closing the open one.
+      closeItem();
+      endIntent();
+      if (level === 3) topic = undefined;
+      open = {
+        id: item[2],
+        level,
+        section,
+        // A ### heading between the section start and a #### item is
+        // its topic; a ### item in between clears it (nearest wins).
+        topic: level === 4 ? topic : undefined,
+        body: [],
+      };
+      continue;
+    }
+    // A non-item heading at the open item's level or above closes it;
+    // deeper headings stay inside the item body.
+    if (open && level <= open.level) closeItem();
+    if (open) {
+      open.body.push(line);
+      continue;
+    }
+    endIntent();
+    const title = stripAnchor(heading[2]);
+    if (level === 1) {
+      if (h1 === undefined) h1 = title;
+      section = undefined;
+      topic = undefined;
+    } else if (level === 2) {
+      section = title;
+      topic = undefined;
+      if (title === "Intent" || title === "意图") {
+        collectingIntent = intent === undefined;
+      }
+    } else if (level === 3) {
+      topic = title;
+    }
+  }
+  closeItem();
+  endIntent();
+
+  if (intent !== undefined) file.intent = intent;
+
+  // The basename is the package identifier (meta-10); an H1
+  // identifier or item-ID prefix disagreeing with it is noticed —
+  // once per distinct prefix — never adopted (spec-view-11). An H1
+  // without the `<pack>: <Title>` pattern is a plain title.
+  const headed = h1 === undefined ? null : H1_IDENTIFIER.exec(h1);
+  if (headed) {
+    file.title = headed[2].trim();
+    if (headed[1] !== file.basename) {
+      file.notices.push(
+        i18n._({
+          id: 'H1 identifier "{identifier}" disagrees with basename "{basename}"',
+          values: { identifier: headed[1], basename: file.basename },
+          comment: "Spec notice; `H1` is the markdown top heading and both names are the file's own",
+        }),
+      );
+    }
+  } else if (h1 !== undefined) {
+    file.title = h1;
+  }
+  const noticedPrefixes = new Set<string>();
+  for (const item of file.items) {
+    const prefix = item.id.replace(/-\d+$/, "");
+    if (prefix === file.basename || noticedPrefixes.has(prefix)) continue;
+    noticedPrefixes.add(prefix);
+    file.notices.push(
+      i18n._({
+        id: 'item-ID prefix "{prefix}" disagrees with basename "{basename}"',
+        values: { prefix, basename: file.basename },
+        comment: "Spec notice: the prefix an item's ID carries and the file's basename are both the file's own",
+      }),
+    );
+  }
+
+  return file;
+}
+
+/** Read + parse one spec file; never throws (SPECV degradation). */
+export function parseSpecFile(absPath: string, key: string): SpecFileInfo {
+  let text: string;
+  try {
+    text = readFileSync(absPath, "utf8");
+  } catch (error) {
+    // The core's own words; what the filesystem or the parse said is
+    // relayed as it came.
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ...fileShell(key),
+      error: i18n._({
+        id: "cannot read file: {message}",
+        values: { message },
+        comment: "Spec file error: the filesystem's own reason follows",
+      }),
+    };
+  }
+  try {
+    return parseSpecFileText(text, key);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ...fileShell(key),
+      error: i18n._({
+        id: "parse failed: {message}",
+        values: { message },
+        comment: "Spec file error: the parser's own reason follows",
+      }),
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tree walking
+// ---------------------------------------------------------------------------
+
+/** Realpath of `path` when it stays inside the project, else undefined. */
+function realInside(path: string, baseReal: string): string | undefined {
+  try {
+    const real = realpathSync(path);
+    return real === baseReal || real.startsWith(baseReal + sep)
+      ? real
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sortedEntries(dir: string): Dirent[] {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+interface WalkedFile {
+  /** Relative path from the collection root, `/`-separated, minus `.md`. */
+  keyRel: string;
+  abs: string;
+}
+
+/** One notice for every skipped symlink, wherever it stood: the path
+ * is a value, so the sentence is written once. */
+function skippedSymlinkNotice(path: string): string {
+  return i18n._({
+    id: "skipped symlink escaping the project: {path}",
+    values: { path },
+    comment: "Spec notice: a link under specs/ pointed outside the project and was not read",
+  });
+}
+
+function walkCollection(
+  collectionDir: string,
+  baseReal: string,
+  notices: string[],
+): WalkedFile[] {
+  const out: WalkedFile[] = [];
+  const visit = (dir: string, rel: string): void => {
+    for (const entry of sortedEntries(dir)) {
+      const abs = join(dir, entry.name);
+      const relPath = rel === "" ? entry.name : `${rel}/${entry.name}`;
+      if (entry.isSymbolicLink() && realInside(abs, baseReal) === undefined) {
+        notices.push(skippedSymlinkNotice(`specs/packages/${relPath}`));
+        continue;
+      }
+      let stats;
+      try {
+        stats = statSync(abs);
+      } catch {
+        continue;
+      }
+      if (stats.isDirectory()) visit(abs, relPath);
+      else if (entry.name.endsWith(".md")) {
+        out.push({ keyRel: relPath.slice(0, -".md".length), abs });
+      }
+    }
+  };
+  if (realInside(collectionDir, baseReal) !== undefined) visit(collectionDir, "");
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Records (decisions/, intents/)
+// ---------------------------------------------------------------------------
+
+// Record ids form from the filename's leading number, so two
+// differently named files can carry the same id. Keep both so
+// nothing is hidden — the view keys records by path and lint
+// reports the collision — but notice each duplicate.
+function noticeDuplicateRecordIds(
+  records: SpecRecordInfo[],
+  notices: string[],
+): SpecRecordInfo[] {
+  const firstById = new Map<string, string>();
+  for (const record of records) {
+    const first = firstById.get(record.id);
+    if (first === undefined) {
+      firstById.set(record.id, record.path);
+    } else {
+      notices.push(
+        i18n._({
+          id: "duplicate record id {id}: {first} and {second}",
+          values: { id: record.id, first, second: record.path },
+          comment: "Spec notice: two record files carry one id; the values are that id and both paths",
+        }),
+      );
+    }
+  }
+  return records;
+}
+
+// Intent records live in intents/; a tree not yet migrated keeps
+// them in the legacy iterations/ directory, and a partially
+// migrated tree — a scaffold --update conflict, or an agent run
+// under an older toolchain — can hold both (DR-017). Read the two
+// together so no record is hidden: a legacy file whose basename
+// reappears under intents/ is shadowed with a notice, and the
+// coexistence itself is noticed for reconciliation.
+function parseIntentRecords(
+  specsDir: string,
+  baseReal: string,
+  notices: string[],
+  committedAt: ReadonlyMap<string, number>,
+): SpecRecordInfo[] {
+  const current = parseRecords(specsDir, "intents", baseReal, notices, committedAt);
+  const legacy = parseRecords(specsDir, "iterations", baseReal, notices, committedAt);
+  if (legacy.length === 0) return noticeDuplicateRecordIds(current, notices);
+  if (current.length === 0) return noticeDuplicateRecordIds(legacy, notices);
+  notices.push(
+    i18n._({
+      id: "legacy specs/iterations/ records coexist with specs/intents/; run `spex scaffold --update` for the migration prompt an agent applies",
+      comment: "Spec notice; the two directory paths and the `spex scaffold --update` command stay as they are",
+    }),
+  );
+  const currentNames = new Set(
+    current.map((record) => posix.basename(record.path)),
+  );
+  const kept = legacy.filter((record) => {
+    if (!currentNames.has(posix.basename(record.path))) return true;
+    notices.push(
+      i18n._({
+        id: "{path} is shadowed by the same-named file under intents/",
+        values: { path: record.path },
+        comment: "Spec notice; `intents/` is a directory name and stays as it is",
+      }),
+    );
+    return false;
+  });
+  const merged = [...current, ...kept].sort((a, b) => {
+    const nameA = posix.basename(a.path);
+    const nameB = posix.basename(b.path);
+    return nameA < nameB ? -1 : nameA > nameB ? 1 : 0;
+  });
+  return noticeDuplicateRecordIds(merged, notices);
+}
+
+/** The first non-empty line of a record's `## Status` section,
+ * verbatim (DR-035); the core classifies it, the clients never match
+ * it themselves (spec-view-14). */
+function recordStatusLine(content: string): string | undefined {
+  const lines = content.split(/\r?\n/);
+  const start = lines.findIndex((line) => /^##\s+Status\s*$/.test(line));
+  if (start < 0) return undefined;
+  for (const line of lines.slice(start + 1)) {
+    if (/^#{1,6}\s/.test(line)) return undefined;
+    const trimmed = line.trim();
+    if (trimmed.length > 0) return trimmed;
+  }
+  return undefined;
+}
+
+/** Status words that finish a record (spec-view-14, DR-038): the
+ * leading word decides, case-insensitively; anything else is open. */
+const FINISHED_DONE = new Set([
+  "done",
+  "complete",
+  "completed",
+  "closed",
+  "shipped",
+  "released",
+  "finished",
+]);
+const FINISHED_SUPERSEDED = new Set([
+  "superseded",
+  "cancelled",
+  "canceled",
+  "dropped",
+  "abandoned",
+  "withdrawn",
+]);
+
+/** The classification of a status line: its leading word — the first
+ * run of letters, so trailing punctuation such as "." or " —" never
+ * counts — against the finished vocabularies; open otherwise. */
+function classifyStatus(
+  status: string | undefined,
+): SpecRecordInfo["finished"] {
+  const word = /[A-Za-z]+/.exec(status ?? "")?.[0].toLowerCase();
+  if (word === undefined) return undefined;
+  if (FINISHED_DONE.has(word)) return "done";
+  if (FINISHED_SUPERSEDED.has(word)) return "superseded";
+  return undefined;
+}
+
+function parseRecords(
+  specsDir: string,
+  sub: "decisions" | "intents" | "iterations",
+  baseReal: string,
+  notices: string[],
+  committedAt: ReadonlyMap<string, number>,
+): SpecRecordInfo[] {
+  const dir = join(specsDir, sub);
+  if (realInside(dir, baseReal) === undefined) return [];
+  const idPrefix = sub === "decisions" ? "DR" : "IR";
+  const out: SpecRecordInfo[] = [];
+  for (const entry of sortedEntries(dir)) {
+    if (!entry.name.endsWith(".md")) continue;
+    const numbered = /^(\d+)/.exec(entry.name);
+    if (!numbered) continue;
+    const abs = join(dir, entry.name);
+    if (entry.isSymbolicLink() && realInside(abs, baseReal) === undefined) {
+      notices.push(skippedSymlinkNotice(`specs/${sub}/${entry.name}`));
+      continue;
+    }
+    let stats;
+    try {
+      stats = statSync(abs);
+    } catch {
+      continue;
+    }
+    if (!stats.isFile()) continue;
+    let title = entry.name.replace(/\.md$/, "");
+    let status: string | undefined;
+    try {
+      const content = readFileSync(abs, "utf8");
+      const heading = /^#\s+(.+?)\s*$/m.exec(content);
+      if (heading) title = heading[1].replace(/^(?:DR|IR)-\d+\s*:\s*/, "");
+      status = recordStatusLine(content);
+    } catch {
+      // Keep the filename fallback; the reader will surface the error.
+    }
+    const finished = classifyStatus(status);
+    out.push({
+      id: `${idPrefix}-${numbered[1]}`,
+      title,
+      path: `${sub}/${entry.name}`,
+      ...(status !== undefined ? { status } : {}),
+      ...(finished !== undefined ? { finished } : {}),
+      // The record's last change orders finished records in History
+      // (DR-038): its last commit where Git tracks the file, else the
+      // file's mtime — which a fresh clone sets alike on every file.
+      updatedAt:
+        committedAt.get(`${sub}/${entry.name}`) ?? Math.round(stats.mtimeMs),
+    });
+  }
+  return out;
+}
+
+/** The `specs/` subdirectories holding records (spec-view-14). */
+const RECORD_DIRS = ["decisions", "intents", "iterations"] as const;
+
+/** When Git last touched each record file: one `git log` over the
+ * record directories, newest commit first, so a file's first listing
+ * is the last commit touching it (DR-038). Keys are `specs/`-relative
+ * paths as the records carry them; an untracked file has no entry,
+ * and the map is empty where the project is no work tree or git
+ * fails, so the parse falls back to the file's mtime. */
+export async function readRecordCommitTimes(
+  projectPath: string,
+  run: RunCommand = defaultRunCommand,
+): Promise<ReadonlyMap<string, number>> {
+  const times = new Map<string, number>();
+  let result: Awaited<ReturnType<RunCommand>>;
+  try {
+    result = await run(
+      "git",
+      [
+        // Paths as the tree spells them: no octal quoting of
+        // non-ASCII names, and relative to the project rather than
+        // the repository root.
+        "-c",
+        "core.quotepath=off",
+        "log",
+        "--relative",
+        "--format=@%ct",
+        "--name-only",
+        "--",
+        ...RECORD_DIRS.map((sub) => `specs/${sub}`),
+      ],
+      projectPath,
+    );
+  } catch {
+    return times;
+  }
+  if (result.code !== 0) return times;
+  let at: number | undefined;
+  for (const line of result.stdout.split(/\r?\n/)) {
+    const stamp = /^@(\d+)$/.exec(line);
+    if (stamp) {
+      at = Number(stamp[1]) * 1000;
+      continue;
+    }
+    if (at === undefined || !line.startsWith("specs/")) continue;
+    const key = line.slice("specs/".length);
+    if (!times.has(key)) times.set(key, at);
+  }
+  return times;
+}
+
+// ---------------------------------------------------------------------------
+// The tree parse (specs.get)
+// ---------------------------------------------------------------------------
+
+export function parseSpecTree(
+  projectPath: string,
+  options: {
+    /** Each record's last commit time by `specs/`-relative path, as
+     * readRecordCommitTimes reads it; a record absent here dates by
+     * its file's mtime. */
+    committedAt?: ReadonlyMap<string, number>;
+  } = {},
+): SpecTreeState {
+  const committedAt = options.committedAt ?? new Map<string, number>();
+  const readAt = Date.now();
+  const absent: SpecTreeState = {
+    present: false,
+    legacy: false,
+    files: [],
+    decisions: [],
+    intents: [],
+    notices: [],
+    readAt,
+  };
+  let baseReal: string;
+  try {
+    baseReal = realpathSync(projectPath);
+  } catch {
+    return absent;
+  }
+  const specsDir = join(projectPath, "specs");
+  try {
+    if (!statSync(specsDir).isDirectory()) return absent;
+  } catch {
+    return absent;
+  }
+  if (realInside(specsDir, baseReal) === undefined) return absent;
+
+  // Legacy layout — the pre-DR-012 user/dev/test groups or the
+  // compositions collection retired by DR-000: report the flag so the
+  // UI can render migration guidance with nothing parsed from any
+  // collection; records still parse.
+  const legacy = LEGACY_DIRS.some((name) => {
+    try {
+      return statSync(join(specsDir, name)).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+  if (legacy) {
+    const discarded: string[] = [];
+    return {
+      present: true,
+      legacy: true,
+      files: [],
+      decisions: noticeDuplicateRecordIds(
+        parseRecords(specsDir, "decisions", baseReal, discarded, committedAt),
+        discarded,
+      ),
+      intents: parseIntentRecords(specsDir, baseReal, discarded, committedAt),
+      notices: [],
+      readAt,
+    };
+  }
+
+  const notices: string[] = [];
+
+  // Unknown entries directly under specs/ (dotfiles like .DS_Store are
+  // ignored silently — they are OS noise, not spec content).
+  const unknown = sortedEntries(specsDir)
+    .map((entry) => entry.name)
+    .filter((name) => !KNOWN_TOP_LEVEL.has(name) && !name.startsWith("."));
+  if (unknown.length > 0) {
+    notices.push(
+      i18n._({
+        id: "unknown entries under specs/: {entries}",
+        values: { entries: unknown.join(", ") },
+        comment: "Spec notice: the entry names follow, as the tree spells them",
+      }),
+    );
+  }
+
+  // Walk the packages collection; subdirectories are navigation only
+  // (meta-31), so files stay flat, keyed by collection-relative path.
+  const files = walkCollection(join(specsDir, "packages"), baseReal, notices)
+    .sort((a, b) => (a.keyRel < b.keyRel ? -1 : a.keyRel > b.keyRel ? 1 : 0))
+    .map((entry) => parseSpecFile(entry.abs, entry.keyRel));
+
+  return {
+    present: true,
+    legacy: false,
+    files,
+    decisions: noticeDuplicateRecordIds(
+      parseRecords(specsDir, "decisions", baseReal, notices, committedAt),
+      notices,
+    ),
+    intents: parseIntentRecords(specsDir, baseReal, notices, committedAt),
+    notices,
+    readAt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// specs.read confinement
+// ---------------------------------------------------------------------------
+
+export type ResolvedSpecPath =
+  | { ok: true; path: string }
+  | { ok: false; code: "invalid_request" | "not_found"; message: string };
+
+/**
+ * Resolve `<project>/specs/<relPath>` with confinement: relative
+ * `.md` paths only, no `..`, and no symlink escape from the project.
+ */
+export function resolveSpecPath(
+  projectPath: string,
+  relPath: string,
+): ResolvedSpecPath {
+  if (isAbsolute(relPath) || /^[\\/]/.test(relPath) || /^[A-Za-z]:/.test(relPath)) {
+    return {
+      ok: false,
+      code: "invalid_request",
+      message: i18n._({
+        id: "path must be relative to specs/",
+        comment: "Refusal; `specs/` is the directory's name and stays as it is",
+      }),
+    };
+  }
+  const segments = relPath.split(/[\\/]+/).filter((segment) => segment !== "");
+  if (segments.length === 0 || segments.some((segment) => segment === "..")) {
+    return {
+      ok: false,
+      code: "invalid_request",
+      message: i18n._({
+        id: "path may not escape specs/",
+        comment: "Refusal: the path asked for leads out of the specs/ directory",
+      }),
+    };
+  }
+  if (!relPath.endsWith(".md")) {
+    return {
+      ok: false,
+      code: "invalid_request",
+      message: i18n._({
+        id: "only .md files under specs/ can be read",
+        comment: "Refusal; `.md` is the markdown file extension and stays as it is",
+      }),
+    };
+  }
+  let baseReal: string;
+  try {
+    baseReal = realpathSync(projectPath);
+  } catch {
+    return {
+      ok: false,
+      code: "not_found",
+      message: i18n._({
+        id: "project directory is missing",
+        comment: "Refusal: the project's own folder is not on this device",
+      }),
+    };
+  }
+  const missing = (): string =>
+    i18n._({
+      id: "no spec file at specs/{path}",
+      values: { path: relPath },
+      comment: "Refusal: nothing readable stands at the path under specs/",
+    });
+  const abs = join(projectPath, "specs", ...segments);
+  let stats;
+  try {
+    stats = statSync(abs);
+  } catch {
+    return { ok: false, code: "not_found", message: missing() };
+  }
+  if (!stats.isFile()) {
+    return { ok: false, code: "not_found", message: missing() };
+  }
+  if (realInside(abs, baseReal) === undefined) {
+    return {
+      ok: false,
+      code: "invalid_request",
+      message: i18n._({
+        id: "path resolves outside the project",
+        comment: "Refusal: a link made the path leave the project",
+      }),
+    };
+  }
+  return { ok: true, path: abs };
+}
+
+// ---------------------------------------------------------------------------
+// specs.read / specs.write: the version token and the atomic replace
+// ---------------------------------------------------------------------------
+
+/** The version token (spec-view-47): a digest of the file's bytes, so
+ * a checkout that touches a file without changing it keeps the token
+ * where an mtime would not. 16 hex characters are ample for the
+ * "did it change under me" question. */
+export function specVersion(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex").slice(0, 16);
+}
+
+export interface SpecFileRead {
+  markdown: string;
+  version: string;
+  /** Last change, ms epoch. */
+  mtime: number;
+}
+
+/** One resolved file's text with its token (spec-view-16). */
+export function readSpecFile(absPath: string): SpecFileRead {
+  const bytes = readFileSync(absPath);
+  return {
+    markdown: bytes.toString("utf8"),
+    version: specVersion(bytes),
+    mtime: Math.round(statSync(absPath).mtimeMs),
+  };
+}
+
+export type SpecWriteResult =
+  | { ok: true; version: string; mtime: number }
+  | {
+      ok: false;
+      code: "invalid_request" | "not_found" | "conflict";
+      message: string;
+    };
+
+/**
+ * Replace one existing spec file's bytes atomically under the digest
+ * token (spec-view-47): a `baseVersion` that no longer matches is a
+ * conflict; none means unconditional. Content lands exactly as sent
+ * through a staged sibling dotfile — neither a `.md` file nor a
+ * top-level entry the tree parse would list — renamed over the
+ * original with its mode kept. Confinement is resolveSpecPath's, so a
+ * missing target is not_found and nothing is ever created.
+ */
+export function writeSpecFile(
+  projectPath: string,
+  relPath: string,
+  content: string,
+  baseVersion?: string,
+): SpecWriteResult {
+  const resolved = resolveSpecPath(projectPath, relPath);
+  if (!resolved.ok) return resolved;
+  const current = readFileSync(resolved.path);
+  const currentVersion = specVersion(current);
+  if (baseVersion !== undefined && baseVersion !== currentVersion) {
+    return {
+      ok: false,
+      code: "conflict",
+      // The draft store words its own conflict the same way: one
+      // message, the file named as a value.
+      message: i18n._({
+        id: "{file} changed on disk since it was read",
+        values: { file: `specs/${relPath}` },
+        comment: "Refusal: the file moved under the write the reader asked for",
+      }),
+    };
+  }
+  const next = Buffer.from(content, "utf8");
+  if (next.equals(current)) {
+    return {
+      ok: true,
+      version: currentVersion,
+      mtime: Math.round(statSync(resolved.path).mtimeMs),
+    };
+  }
+  const mode = statSync(resolved.path).mode & 0o7777;
+  const stage = join(
+    dirname(resolved.path),
+    `.${basename(resolved.path)}.spex-stage`,
+  );
+  try {
+    writeFileSync(stage, next, { mode });
+    // The mode option only applies to a file being created; a stage
+    // left by an interrupted write would otherwise keep its own.
+    chmodSync(stage, mode);
+    renameSync(stage, resolved.path);
+  } catch (cause) {
+    rmSync(stage, { force: true });
+    throw cause;
+  }
+  return {
+    ok: true,
+    version: specVersion(next),
+    mtime: Math.round(statSync(resolved.path).mtimeMs),
+  };
+}

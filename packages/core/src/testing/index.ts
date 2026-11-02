@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+export * from "./fake-adapter.js";
+export * from "./scripted-captain.js";
+export * from "./demo.js";
+export * from "./authoring.js";
+export * from "./stub-slc.js";
+export * from "./compiled-run.js";
+export * from "./develop-run.js";
+// The stand-in Git host for host-client coverage and journeys (git-host-12).
+export * from "./standin-host.js";
+// The managed Git rules writer, for fixtures that stand in for a peer
+// home (space-36): the same rules the core writes, so a joining home
+// meets no rules conflict of the fixture's making.
+export { prepareStorageGitFiles } from "../storage-git.js";
+// The stand-in registry ships with the package-manager library (DR-165).
+export * from "@sublang/spex/testing";
+// A release holding an applet, published to the stand-in (DR-161).
+export * from "./applet-release.js";
+export * from "./git-http-host.js";
+// Each enabled playbook's module, supplied to Playbook's launcher at
+// launch beside a Spex config naming no `from` (DR-105).
+export * from "./launch-modules.js";

@@ -1,0 +1,6495 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// Acceptance coverage for the CORE test package (CORE-19..23):
+// end-to-end over the WebSocket protocol against the scripted fake
+// adapter — no network, no agent credentials (CORE-18). It hosts the
+// installed-template acceptance too: the config the core seeds on a
+// first run, hosted by the real Playbook Captain shell over the real
+// registries, starts a session on the template's whole roster.
+
+import { test } from "node:test";
+import { createHash, randomUUID } from "node:crypto";
+import assert from "node:assert/strict";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { hostname } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { Store } from "./store.js";
+import { WebSocket } from "ws";
+import { loadTmuxPlayConfig } from "@sublang/cligent/tmux-play";
+import { openSessionStore, createSessionStore, validateSessionManifest } from "@sublang/playbook/session-store";
+import { openSessionHost, loadLaunchPlan, executionConfigFromPlan } from "@sublang/playbook/session-host";
+
+import { CoreService } from "./service.js";
+import { defaultRunCommand, type RunCommand } from "./forge.js";
+import { speak } from "./i18n.js";
+import { starterText, templatePath, resolveModulePath, REGISTRY_CONTRACT } from "./config.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { readFileSync } from "node:fs";
+import { fakeAdapterImports, type FakeAdapterStats, type FakeScript } from "./testing/fake-adapter.js";
+import { createScriptedCaptain } from "./testing/scripted-captain.js";
+import { ASKING, askingScript, failingScript, parkingScript } from "./testing/demo.js";
+import type { LineSpawner } from "./compile.js";
+import { defaultSpawner } from "./compile.js";
+import { stubSlcSource } from "./testing/stub-slc.js";
+import { restoringRecord } from "./control-record.js";
+import type {
+  Command,
+  CommandResults,
+  CompileProgressMessage,
+  Language,
+  ReadinessEntry,
+  RecordMessage,
+  ServerMessage,
+  SessionInfo,
+  StoredRecord,
+  TmuxPlayRecord,
+} from "./protocol.js";
+import { scratchDir } from "./testing/scratch.js";
+import { readSessionManifest, writeSessionManifest, readSessionReplay, writeSessionReplay } from "./testing/session-storage.js";
+import { builtinLaunchModules } from "./testing/launch-modules.js";
+
+const machineIdentity = "machine-id:v1:00000000-0000-4000-8000-0000000000aa";
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+const VALID_CONFIG = `
+captain:
+  adapter: claude
+  model: claude-test
+players:
+  dev.coder:
+    adapter: claude
+    model: claude-test
+playbooks:
+  code:
+    roles:
+      coder: dev.coder
+  review:
+    roles:
+      coder: dev.coder
+      reviewer: dev.coder
+`;
+
+class Client {
+  private readonly socket: WebSocket;
+  readonly messages: ServerMessage[] = [];
+  private nextId = 0;
+
+  constructor(port: number) {
+    this.socket = new WebSocket(`ws://127.0.0.1:${port}/?token=test`);
+    this.socket.on("message", (data) => {
+      this.messages.push(JSON.parse(String(data)) as ServerMessage);
+    });
+  }
+
+  async open(): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      // The socket may open during an unrelated await between the
+      // constructor and this call; 'open' is edge-triggered.
+      if (this.socket.readyState === WebSocket.OPEN) {
+        resolve();
+        return;
+      }
+      this.socket.once("open", resolve);
+      this.socket.once("error", reject);
+    });
+    await this.waitFor((m) => m.type === "hello");
+  }
+
+  close(): void {
+    this.socket.close();
+  }
+
+  sendRaw(text: string): void {
+    this.socket.send(text);
+  }
+
+  async command<T extends Command["type"]>(
+    type: T,
+    fields: Omit<Extract<Command, { type: T }>, "type" | "id">,
+  ): Promise<
+    | { ok: true; result: CommandResults[T] }
+    | { ok: false; error: { code: string; message: string; details?: Record<string, unknown> } }
+  > {
+    const id = `c${(this.nextId += 1)}`;
+    this.socket.send(JSON.stringify({ type, id, ...fields }));
+    const reply = await this.waitFor(
+      (m) => m.type === "reply" && m.id === id,
+    );
+    if (reply.type !== "reply") throw new Error("unreachable");
+    return reply.ok
+      ? { ok: true, result: reply.result as CommandResults[T] }
+      : { ok: false, error: reply.error };
+  }
+
+  async expectOk<T extends Command["type"]>(
+    type: T,
+    fields: Omit<Extract<Command, { type: T }>, "type" | "id">,
+  ): Promise<CommandResults[T]> {
+    const reply = await this.command(type, fields);
+    if (!reply.ok) {
+      throw new Error(`${type} failed: ${reply.error.code} ${reply.error.message}`);
+    }
+    return reply.result;
+  }
+
+  records(channel: "session" | "debug"): RecordMessage[] {
+    return this.messages.filter(
+      (m): m is RecordMessage => m.type === "record" && m.channel === channel,
+    );
+  }
+
+  /** The first message satisfying the check. The bound only ends a hung
+   * wait: the message is what the step waits for. */
+  async waitFor(
+    check: (message: ServerMessage) => boolean,
+    timeoutMs = 60_000,
+  ): Promise<ServerMessage> {
+    const start = Date.now();
+    for (;;) {
+      const found = this.messages.find(check);
+      if (found) return found;
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(
+          `timeout waiting; got ${JSON.stringify(this.messages.map((m) => m.type))}`,
+        );
+      }
+      await sleep(10);
+    }
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A repository a scripted player can really commit in: an identity,
+ * no signing — the host's global git config must not decide it — and a
+ * baseline commit for a later one to descend from. */
+function configureRepositoryIdentity(projectDir: string): void {
+  for (const [key, value] of [
+    ["user.name", "Spex Test"],
+    ["user.email", "spex@example.test"],
+    ["commit.gpgsign", "false"],
+  ]) execFileSync("git", ["-C", projectDir, "config", key, value]);
+}
+
+const creationTestRun: RunCommand = async (command, args, cwd, env) => {
+  const result = await defaultRunCommand(command, args, cwd, env);
+  if (command === "git" && args[0] === "init" && result.code === 0) {
+    configureRepositoryIdentity(args[1]);
+  }
+  return result;
+};
+
+function seedRepository(projectDir: string): void {
+  configureRepositoryIdentity(projectDir);
+  writeFileSync(join(projectDir, "work.txt"), "baseline\n");
+  execFileSync("git", ["-C", projectDir, "add", "-A"]);
+  execFileSync("git", ["-C", projectDir, "commit", "-q", "-m", "baseline"]);
+}
+
+/** Every scratch home's own group (storage-2). */
+
+
+const OWN = "tester";
+
+/** A spex repository's clone under a home (storage-1). */
+function clonePath(dataDir: string, key: string): string {
+  return join(dataDir, "workspace", ...key.split("/"));
+}
+
+/** The session store of the spex repository that holds a project's
+ * sessions (storage-6): the harness's `project` folder pairs with
+ * `tester/project-spex`. */
+function projectSessions(dataDir: string, key = `${OWN}/project-spex`): string {
+  return join(clonePath(dataDir, key), "sessions");
+}
+
+/** A home with one working folder paired before any core starts, so
+ * another host's sessions can be written into its spex repository's
+ * session store (storage-6): the project's key and that store. */
+function pairedHome(dataDir: string, projectDir: string): { projectId: string; sessionsDir: string } {
+  const store = new Store({ machineIdentity, dir: dataDir, own: OWN });
+  try {
+    const project = store.registerProject(projectDir, basename(projectDir));
+    return { projectId: project.id, sessionsDir: store.repository(project.id)!.sessionsDir };
+  } finally {
+    store.close();
+  }
+}
+
+/** The shared config path of a scratch home: your own group's clone
+ * holds it (storage-1). */
+function ownConfig(dataDir: string): string {
+  return join(clonePath(dataDir, `${OWN}/${OWN}-spex`), "config", "playbook.config.yaml");
+}
+
+interface Harness {
+  service: CoreService;
+  stats: FakeAdapterStats;
+  /** The same substitute agents a restarted core is given. */
+  imports: import("@sublang/cligent/tmux-play").PlayerAdapterImports;
+  dir: string;
+  dataDir: string;
+  projectDir: string;
+}
+
+async function startHarness(
+  configText: string = VALID_CONFIG,
+  options: {
+    dataDir?: string;
+    realShell?: boolean;
+    /** Replaces the default adapter script, so a test can drive the
+     * real shell's decisions and its players' repository work. */
+    script?: FakeScript;
+    /** Seed the project with an identity, no signing and a baseline
+     * commit, so a scripted player can really commit in it. */
+    seedCommit?: boolean;
+    env?: NodeJS.ProcessEnv;
+    systemLanguages?: readonly string[];
+    runCommand?: import("./forge.js").RunCommand;
+    /** The scaffold generator project.create runs (the built CLI). */
+    scaffoldCommand?: string[];
+    scaffoldEnv?: Record<string, string>;
+    compileSpawner?: import("./compile.js").LineSpawner;
+    adapterRuntime?: import("./service.js").CoreServiceOptions["adapterRuntime"];
+    discoverAgentModels?: import("./service.js").CoreServiceOptions["discoverAgentModels"];
+    /** Watch the config files and the clones as a running app does. */
+    watchConfig?: boolean;
+    loadModule?: import("./service.js").CoreServiceOptions["loadModule"];
+    /** Replaces the default scripted Captain's turn. */
+    captainScript?: Parameters<typeof createScriptedCaptain>[0];
+    /** Awaited as a session's lifecycle publishes its state. */
+    sessionStatePublished?: import("./service.js").CoreServiceOptions["sessionStatePublished"];
+  } = {},
+): Promise<Harness> {
+  const dir = scratchDir("spex-core-it-");
+  const configPath = join(dir, "playbook.config.yaml");
+  writeFileSync(configPath, configText);
+  const projectDir = join(dir, "project");
+  mkdirSync(projectDir);
+  execFileSync("git", ["init", "-q", projectDir]);
+  if (options.seedCommit) seedRepository(projectDir);
+  const dataDir = options.dataDir ?? join(dir, "state");
+
+  const { imports, stats } = fakeAdapterImports(options.script ?? {
+    rules: [
+      { match: "route:", response: { result: '{"decision":"dispatch"}' } },
+      {
+        match: "slow:",
+        response: { deltas: ["working"], result: "slow done", delayMs: 250 },
+      },
+    ],
+    fallback: {
+      deltas: ["hello ", "world"],
+      result: "hello world",
+      usage: { totalCostUsd: 0.02 },
+    },
+  });
+
+  const captain = createScriptedCaptain(options.captainScript ?? (async (turn, context, session) => {
+    await session.emitStatus(`◇ turn ${turn.id}`);
+    await context.callCaptain(`route: ${turn.prompt}`, { visibility: "hidden" });
+    await context.callPlayer("dev.coder", `${turn.prompt}`);
+    await context.emitReply("Finished the scripted turn.");
+  }));
+
+  const service = await CoreService.start({
+    token: "test",
+    configPath,
+    dataDir,
+    adapterImports: imports,
+    // DR-024: the fake-adapter harness fakes the readiness runtime half
+    // too, so verdicts never depend on the host's installed runtimes.
+    adapterRuntime: options.adapterRuntime ?? (() => ({ usable: true })),
+    discoverAgentModels: options.discoverAgentModels,
+    ...(options.realShell ? {} : {captainFactory: async () => captain}),
+    env: options.env ?? {},
+    ...(options.systemLanguages ? { systemLanguages: options.systemLanguages } : {}),
+    home: join(dir, "home"),
+    own: OWN,
+    watchConfig: options.watchConfig ?? false,
+    ...(options.loadModule ? { loadModule: options.loadModule } : {}),
+    ...(options.scaffoldCommand
+      ? { scaffoldCommand: options.scaffoldCommand }
+      : {}),
+    runCommand: options.runCommand ?? creationTestRun,
+    ...(options.scaffoldEnv ? { scaffoldEnv: options.scaffoldEnv } : {}),
+    ...(options.compileSpawner
+      ? { compileSpawner: options.compileSpawner }
+      : {}),
+    ...(options.sessionStatePublished
+      ? { sessionStatePublished: options.sessionStatePublished }
+      : {}),
+  });
+  return { service, stats, imports, dir, dataDir, projectDir };
+}
+
+// ---------------------------------------------------------------------------
+// CORE-19: end-to-end session over the protocol
+// ---------------------------------------------------------------------------
+
+test("core-service-121: paired project options validate before reads, writes and session creation with the actual cwd", async (t) => {
+  let mode: "exact" | "optional" | "none" = "exact";
+  let expectedCwd = "";
+  let explicitCwd = "";
+  let factories = 0;
+  const validations: Record<string, unknown>[] = [];
+  let heldImport: { reached: boolean; open: () => void; gate: Promise<void> } | undefined;
+  const allImports: NonNullable<typeof heldImport>[] = [];
+  const holdImport = () => {
+    let open!: () => void;
+    const held = { reached: false, open: () => open(), gate: new Promise<void>(resolve => { open = resolve; }) };
+    allImports.push(held);
+    heldImport = held;
+    return held;
+  };
+  const harness = await startHarness(VALID_CONFIG, {
+    loadModule: async (specifier) => {
+      const module = await import(isAbsoluteModule(specifier));
+      if (module.default?.id !== "code") return module;
+      const held = heldImport;
+      heldImport = undefined;
+      if (held) { held.reached = true; await held.gate; }
+      return { ...module, default: {
+        ...module.default,
+        validateOptions(value: unknown) {
+          const options = (value ?? {}) as Record<string, unknown>;
+          validations.push({ ...options });
+          if (options.marker !== "ready") throw new Error("custom marker must be ready");
+          if (mode === "exact" && options.cwd !== expectedCwd) throw new Error("custom cwd must be the paired folder");
+          if (mode === "optional" && options.cwd !== undefined && options.cwd !== "/" && options.cwd !== explicitCwd) throw new Error("custom selected folder is refused");
+          if (mode === "none" && options.cwd !== undefined) throw new Error("custom cwd is not an option");
+          return { ...options, normalizedDefault: "provided by the shared shell" };
+        },
+        createRuntime(...args: unknown[]) { factories += 1; return module.default.createRuntime(...args); },
+      } };
+    },
+  });
+  expectedCwd = harness.projectDir;
+  explicitCwd = join(harness.projectDir, "explicit");
+  const client = new Client(harness.service.port());
+  await client.open();
+  t.after(async () => { for (const held of allImports) held.open(); client.close(); await harness.service.stop(); });
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  const config = join(clonePath(harness.dataDir, project.id), "config/playbook.config.yaml");
+  const ownBefore = readFileSync(join(harness.dir, "playbook.config.yaml"), "utf8");
+
+  await t.test("global composition defers context-dependent options; a selected project refuses before ownership or agents", async () => {
+    assert.equal((await client.expectOk("config.get", {})).status, "valid");
+    const state = await client.expectOk("config.get", { projectId: project.id });
+    assert.equal(state.status, "invalid");
+    if (state.status === "invalid") assert.match(state.errors.join("\n"), /playbooks\.code: custom marker must be ready/);
+    const refused = await client.command("session.create", { projectId: project.id });
+    assert.equal(refused.ok, false);
+    if (!refused.ok) { assert.equal(refused.error.code, "invalid_config"); assert.match(refused.error.message, /playbooks\.code: custom marker must be ready/); }
+    assert.deepEqual(await client.expectOk("session.list", {}), []);
+    const sessions = projectSessions(harness.dataDir, project.id);
+    assert.ok(!existsSync(sessions) || readdirSync(sessions).length === 0, "invalid configuration acquires no session lease or writes");
+    assert.equal(factories, 0);
+    assert.equal(harness.stats.runs.length, 0);
+  });
+
+  const set = (key: string, value: unknown) => client.command("config.edit", { repository: project.id, op: { kind: "playbook.option.set", playbookId: "code", key, value } });
+  await t.test("required exact real cwd accepts a repaired project declaration without writing defaults or cwd", async () => {
+    const accepted = await client.command("config.edit", { repository: project.id, op: { kind: "playbook.add", playbookId: "code", roles: { coder: "dev.coder" }, options: { marker: "ready" } } });
+    assert.equal(accepted.ok, true);
+    assert.equal((await client.expectOk("config.get", { projectId: project.id })).status, "valid");
+    assert.deepEqual(parseYaml(readFileSync(config, "utf8")).playbooks.code, { roles: { coder: "dev.coder" }, marker: "ready" });
+    const session = await client.expectOk("session.create", { projectId: project.id });
+    const manifest = (await readSessionManifest(join(projectSessions(harness.dataDir, project.id), session.id + ".json")));
+    assert.equal(manifest.lastAppliedExecutionProjection.catalog.code.options.cwd, expectedCwd);
+    assert.equal(manifest.lastAppliedExecutionProjection.catalog.code.options.normalizedDefault, undefined, "the authored slice is retained; shell normalization is not persisted as configuration");
+    await client.expectOk("session.dispose", { sessionId: session.id });
+  });
+
+  await t.test("invalid option writes retain exact bytes and current valid state", async () => {
+    const before = readFileSync(config, "utf8");
+    const refused = await set("marker", "invalid");
+    assert.equal(refused.ok, false);
+    if (!refused.ok) assert.match(refused.error.message, /playbooks\.code: custom marker must be ready/);
+    assert.equal(readFileSync(config, "utf8"), before);
+    assert.equal((await client.expectOk("config.get", { projectId: project.id })).status, "valid");
+  });
+
+  await t.test("an external invalid non-cwd option is read as invalid before session admission", async () => {
+    const before = readFileSync(config, "utf8");
+    const beforeFactories = factories;
+    writeFileSync(config, before.replace("marker: ready", "marker: invalid"));
+    const state = await client.expectOk("config.get", { projectId: project.id });
+    assert.equal(state.status, "invalid");
+    if (state.status === "invalid") assert.match(state.errors.join("\n"), /playbooks\.code: custom marker must be ready/);
+    const refused = await client.command("session.create", { projectId: project.id });
+    assert.equal(refused.ok, false);
+    if (!refused.ok) assert.equal(refused.error.code, "invalid_config");
+    assert.equal(factories, beforeFactories);
+    writeFileSync(config, before);
+  });
+
+  await t.test("explicit cwd passes unchanged", async () => {
+    mode = "optional";
+    assert.equal((await set("cwd", explicitCwd)).ok, true);
+    const session = await client.expectOk("session.create", { projectId: project.id });
+    const manifest = (await readSessionManifest(join(projectSessions(harness.dataDir, project.id), session.id + ".json")));
+    assert.equal(manifest.lastAppliedExecutionProjection.catalog.code.options.cwd, explicitCwd);
+    await client.expectOk("session.dispose", { sessionId: session.id });
+  });
+
+  await t.test("a known optional cwd capability cannot hide a rejected project path by falling back to defaults", async () => {
+    const before = readFileSync(config, "utf8");
+    const refused = await set("cwd", null);
+    assert.equal(refused.ok, false);
+    if (!refused.ok) assert.match(refused.error.message, /playbooks\.code: custom selected folder is refused/);
+    assert.equal(readFileSync(config, "utf8"), before);
+    assert.ok(validations.some(v => v.cwd === "/" && v.marker === "ready"));
+    assert.ok(validations.some(v => v.cwd === expectedCwd && v.marker === "ready"));
+  });
+
+  await t.test("an entry without cwd accepts its raw options and leaves normalizer defaults to the shell", async () => {
+    mode = "none";
+    assert.equal((await set("cwd", null)).ok, true);
+    assert.equal((await client.expectOk("config.get", { projectId: project.id })).status, "valid");
+    assert.deepEqual(parseYaml(readFileSync(config, "utf8")).playbooks.code, { roles: { coder: "dev.coder" }, marker: "ready" });
+    assert.equal(readFileSync(join(harness.dir, "playbook.config.yaml"), "utf8"), ownBefore);
+    assert.equal(harness.stats.runs.length, 0, "validation and idle initialization use no provider calls");
+  });
+
+  await t.test("a pairing changed during import is re-read, and refuses stale config writes and new sessions", async () => {
+    mode = "exact";
+    const other = join(harness.dir, "other");
+    mkdirSync(other);
+    execFileSync("git", ["init", "-q", other]);
+    const waitForImport = async (held: NonNullable<typeof heldImport>) => {
+      const deadline = Date.now() + 30_000;
+      while (!held.reached && Date.now() < deadline) await sleep(10);
+      assert.equal(held.reached, true, "selected project import reached its gate");
+    };
+    const rebind = (path: string) => client.expectOk("project.rebind", { projectId: project.id, path });
+    let held = holdImport();
+    const reading = client.expectOk("config.get", { projectId: project.id });
+    await waitForImport(held);
+    await rebind(other);
+    held.open();
+    const state = await reading;
+    assert.equal(state.status, "invalid", "the old folder's valid composition cannot publish after rebind");
+    if (state.status === "invalid") assert.match(state.errors.join("\n"), /custom cwd must be the paired folder/);
+
+    await rebind(harness.projectDir);
+    const before = readFileSync(config, "utf8");
+    held = holdImport();
+    const editing = set("extra", "must not publish");
+    await waitForImport(held);
+    await rebind(other);
+    held.open();
+    const edit = await editing;
+    assert.equal(edit.ok, false);
+    if (!edit.ok) { assert.equal(edit.error.code, "conflict"); assert.match(edit.error.message, /home\.yaml changed meanwhile/); }
+    assert.equal(readFileSync(config, "utf8"), before);
+
+    await rebind(harness.projectDir);
+    const beforeFactories = factories;
+    const beforeSessions = (await client.expectOk("session.list", {})).map(session => session.id);
+    held = holdImport();
+    const creating = client.command("session.create", { projectId: project.id });
+    await waitForImport(held);
+    // This folder is accepted by the validator after the retry, but the
+    // request's original ProjectInfo still names the previous folder.
+    expectedCwd = other;
+    await rebind(other);
+    held.open();
+    const created = await creating;
+    assert.equal(created.ok, false);
+    if (!created.ok) assert.equal(created.error.code, "conflict");
+    assert.equal(factories, beforeFactories);
+    assert.deepEqual((await client.expectOk("session.list", {})).map(session => session.id), beforeSessions);
+    assert.equal(harness.stats.runs.length, 0);
+  });
+});
+
+function isAbsoluteModule(specifier: string): string {
+  return specifier.startsWith("/") || /^[A-Za-z]:[\\/]/.test(specifier) ? pathToFileURL(specifier).href : specifier;
+}
+
+test("CORE-19: fake-adapter session end to end over the WebSocket", async () => {
+  const harness = await startHarness();
+  const client = new Client(harness.service.port());
+  await client.open();
+
+  const hello = client.messages[0];
+  assert.equal(hello.type, "hello");
+
+  const project = await client.expectOk("project.register", {
+    path: harness.projectDir,
+  });
+  const session = await client.expectOk("session.create", {
+    projectId: project.id,
+  });
+  assert.deepEqual(
+    session.players.map((p) => p.id),
+    ["dev.coder"],
+  );
+
+  await client.expectOk("subscribe", {
+    channel: { kind: "session", sessionId: session.id },
+  });
+
+  await client.expectOk("turn.submit", {
+    sessionId: session.id,
+    text: "slow: build the feature",
+  });
+
+  // A second submission during the active turn is rejected busy.
+  const busy = await client.command("turn.submit", {
+    sessionId: session.id,
+    text: "another",
+  });
+  assert.ok(!busy.ok && busy.error.code === "busy");
+
+  await client.waitFor(
+    (m) => m.type === "record" && m.record.type === "turn_finished",
+  );
+
+  const sessionRecords = client.records("session");
+  // The runtime cwd is the project directory, observed by the adapter.
+  assert.ok(
+    harness.stats.runs.every((run) => run.cwd === harness.projectDir),
+    `adapter cwds: ${JSON.stringify(harness.stats.runs.map((r) => r.cwd))}`,
+  );
+  // Script-ordered, seq-ascending, no hidden records on the session channel.
+  const seqs = sessionRecords.map((m) => m.seq);
+  assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b));
+  const types = sessionRecords.map((m) => m.record.type);
+  assert.equal(types[0], "turn_started");
+  assert.ok(types.includes("captain_status"));
+  assert.ok(types.includes("player_prompt"));
+  assert.ok(types.includes("player_event"));
+  assert.ok(types.includes("player_finished"));
+  assert.equal(types[types.length - 1], "turn_finished");
+  assert.ok(!types.includes("captain_prompt"), "hidden records leaked");
+
+  // No network: every event came from the substitute, which stands in
+  // for the Claude runtime under its own name and served every call.
+  const playerEvents = sessionRecords.filter(
+    (m) => m.record.type === "player_event",
+  );
+  assert.ok(playerEvents.length > 0);
+  for (const message of playerEvents) {
+    const event = (message.record as { event: { agent: string } }).event;
+    assert.equal(event.agent, "claude-code");
+  }
+  assert.ok(
+    harness.stats.runs.some((run) => run.agent === "claude-code" && run.prompt.includes("slow: build the feature")),
+    "the substitute served the player's call",
+  );
+
+  client.close();
+  await harness.service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// CORE-20: hidden records only on the debug channel
+// ---------------------------------------------------------------------------
+
+test("CORE-20: hidden records reach only debug subscribers", async () => {
+  const harness = await startHarness();
+  const sessionClient = new Client(harness.service.port());
+  const debugClient = new Client(harness.service.port());
+  await sessionClient.open();
+  await debugClient.open();
+
+  const project = await sessionClient.expectOk("project.register", {
+    path: harness.projectDir,
+  });
+  const session = await sessionClient.expectOk("session.create", {
+    projectId: project.id,
+  });
+  await sessionClient.expectOk("subscribe", {
+    channel: { kind: "session", sessionId: session.id },
+  });
+  await debugClient.expectOk("subscribe", {
+    channel: { kind: "debug", sessionId: session.id },
+  });
+
+  await sessionClient.expectOk("turn.submit", {
+    sessionId: session.id,
+    text: "do something",
+  });
+  await sessionClient.waitFor(
+    (m) => m.type === "record" && m.record.type === "turn_finished",
+  );
+  await debugClient.waitFor(
+    (m) => m.type === "record" && m.record.type === "captain_finished",
+  );
+
+  const visibleTypes = sessionClient
+    .records("session")
+    .map((m) => m.record.type);
+  assert.ok(!visibleTypes.includes("captain_prompt"));
+  assert.ok(!visibleTypes.includes("captain_event"));
+
+  const debugRecords = debugClient.records("debug");
+  const debugTypes = [...new Set(debugRecords.map((m) => m.record.type))].sort();
+  assert.deepEqual(debugTypes, [
+    "captain_event",
+    "captain_finished",
+    "captain_prompt",
+  ]);
+  for (const message of debugRecords) {
+    assert.equal(
+      (message.record as { visibility?: string }).visibility,
+      "hidden",
+    );
+  }
+
+  sessionClient.close();
+  debugClient.close();
+  await harness.service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// CORE-21: launcher fail-closed defect classes rejected identically
+// ---------------------------------------------------------------------------
+
+const DEFECT_CONFIGS: { name: string; pattern: RegExp; config: string }[] = [
+  // A playbook's module comes from an environment, never from a path in
+  // a shared file (core-service-2, environments-9).
+  {
+    name: "a from in your own file",
+    pattern: /playbooks\.code\.from is not allowed: a playbook's module comes from the environment/,
+    config: VALID_CONFIG.replace("  code:\n", '  code:\n    from: "@sublang/playbook/code/registry"\n'),
+  },
+  // Skills reach agents from the packages spex.yaml adds, never from a
+  // path in a shared file (core-service-2, DR-123).
+  {
+    name: "a skills list at the top of your own file",
+    pattern: /(?:^|; )skills is not allowed: skills reach agents from the packages spex\.yaml adds/,
+    config: `skills: [./team-guide]\n${VALID_CONFIG}`,
+  },
+  {
+    name: "a skills list on the Captain",
+    pattern: /captain\.skills is not allowed: skills reach agents from the packages spex\.yaml adds/,
+    config: VALID_CONFIG.replace("  model: claude-test\nplayers:", "  model: claude-test\n  skills: [./team-guide]\nplayers:"),
+  },
+  {
+    name: "a skills list on a player",
+    pattern: /players\.dev\.coder\.skills is not allowed: skills reach agents from the packages spex\.yaml adds/,
+    config: VALID_CONFIG.replace("    model: claude-test\nplaybooks:", "    model: claude-test\n    skills: [./team-guide]\nplaybooks:"),
+  },
+  {
+    name: "a playbook no environment of the session exports",
+    pattern: /playbooks\.triage is enabled, but the environment of tester\/tester-spex exports no playbook triage/,
+    config: VALID_CONFIG.replace('  code:\n', "  triage:\n"),
+  },
+  {
+    name: "reserved captain role",
+    pattern: /roles\.captain binds local role "captain"/,
+    config: VALID_CONFIG.replace(
+      "      coder: dev.coder\n",
+      "      coder: dev.coder\n      captain: dev.coder\n",
+    ),
+  },
+  {
+    name: "unresolved required role",
+    pattern: /roles must exactly cover requiredRoleIds; missing reviewer/,
+    config: VALID_CONFIG.replace("      reviewer: dev.coder\n", ""),
+  },
+  {
+    name: "bindings miss a required role",
+    pattern: /roles must exactly cover requiredRoleIds/,
+    config: VALID_CONFIG.replace("    roles:\n      coder: dev.coder\n", "    roles: {}\n"),
+  },
+  {
+    name: "a binding names an absent player",
+    pattern: /names absent session player/,
+    config: VALID_CONFIG.replace("coder: dev.coder", "coder: dev.missing"),
+  },
+  {
+    name: "the removed per-playbook players block",
+    pattern: /was removed in the explicit-session-player major release/,
+    config: VALID_CONFIG.replace(
+      "    roles:\n      coder: dev.coder\n",
+      "    players:\n      coder:\n        adapter: claude\n",
+    ),
+  },
+  {
+    name: "unknown adapter",
+    pattern: /Unknown adapter "mystery" for players\.dev\.coder/,
+    config: VALID_CONFIG.replace(
+      "players:\n  dev.coder:\n    adapter: claude\n    model: claude-test",
+      "players:\n  dev.coder:\n    adapter: mystery",
+    ),
+  },
+  {
+    name: "adapter-scoped invalid effort",
+    pattern: /effort "extreme" is not supported by the "claude" adapter/,
+    config: VALID_CONFIG.replace(
+      "    model: claude-test\n",
+      "    model: claude-test\n    effort: extreme\n",
+    ),
+  },
+  // An Off carried through composition: an effort beside it, from either
+  // tier, is refused rather than switching delegation back on (DR-095).
+  {
+    name: "a binding's subagent effort over its player's Off",
+    pattern: /playbooks\.code\.roles\.coder\.subagentEffort for adapter "claude" requires subagentModel/,
+    config: VALID_CONFIG.replace(
+      "    model: claude-test\nplaybooks:",
+      "    model: claude-test\n    subagentModel: false\nplaybooks:",
+    ).replace(
+      "      coder: dev.coder\n",
+      "      coder:\n        player: dev.coder\n        subagentEffort: low\n",
+    ),
+  },
+  {
+    name: "a binding's Off beside its player's subagent effort",
+    pattern: /playbooks\.code\.roles\.coder\.subagentEffort for adapter "claude" requires subagentModel/,
+    config: VALID_CONFIG.replace(
+      "    model: claude-test\nplaybooks:",
+      "    model: claude-test\n    subagentEffort: low\nplaybooks:",
+    ).replace(
+      "      coder: dev.coder\n",
+      "      coder:\n        player: dev.coder\n        subagentModel: false\n",
+    ),
+  },
+];
+
+test("CORE-21: each launcher defect class yields a named config error and blocks sessions", async () => {
+  for (const defect of DEFECT_CONFIGS) {
+    const harness = await startHarness(defect.config);
+    const client = new Client(harness.service.port());
+    await client.open();
+
+    const state = await client.expectOk("config.get", {});
+    assert.equal(state.status, "invalid", defect.name);
+    if (state.status === "invalid") {
+      assert.match(state.errors.join("; "), defect.pattern, defect.name);
+    }
+
+    const project = await client.expectOk("project.register", {
+      path: harness.projectDir,
+    });
+    const rejected = await client.command("session.create", {
+      projectId: project.id,
+    });
+    assert.ok(
+      !rejected.ok && rejected.error.code === "invalid_config",
+      defect.name,
+    );
+
+    client.close();
+    await harness.service.stop();
+  }
+});
+
+test("core-service-122: a session from a valid file records its agents with no supplied skills", async () => {
+  // Skills reach agents from environments, so the core composes none and
+  // no session record carries a key an earlier Playbook refuses
+  // (core-service-16, DR-123).
+  const harness = await startHarness(VALID_CONFIG);
+  const client = new Client(harness.service.port());
+  await client.open();
+  try {
+    const project = await client.expectOk("project.register", { path: harness.projectDir });
+    const session = await client.expectOk("session.create", { projectId: project.id });
+    const manifest = (await readSessionManifest(join(projectSessions(harness.dataDir, project.id), session.id + ".json"))) as {
+      lastAppliedExecutionProjection: { captain: Record<string, unknown>; players: Record<string, unknown>[] };
+    };
+    const { captain, players } = manifest.lastAppliedExecutionProjection;
+    assert.ok(players.length > 0, "the session records its players");
+    for (const agent of [captain, ...players]) assert.equal(Object.hasOwn(agent, "skills"), false, JSON.stringify(agent));
+  } finally {
+    client.close();
+    await harness.service.stop();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// CORE-22: restart persistence
+// ---------------------------------------------------------------------------
+
+test("CORE-22: records, order, usage, and active time survive a service restart", async () => {
+  const harness = await startHarness();
+  const client = new Client(harness.service.port());
+  await client.open();
+
+  const project = await client.expectOk("project.register", {
+    path: harness.projectDir,
+  });
+  const session = await client.expectOk("session.create", {
+    projectId: project.id,
+  });
+  await client.expectOk("subscribe", {
+    channel: { kind: "session", sessionId: session.id },
+  });
+  await client.expectOk("turn.submit", { sessionId: session.id, text: "go" });
+  await client.waitFor(
+    (m) => m.type === "record" && m.record.type === "turn_finished",
+  );
+  // The runtime is held only for a turn (core-service-91): settlement
+  // releases it, the Captain's disposal trace reaching the session
+  // channel outside any turn, and the session lists as no longer live.
+  await client.waitFor(
+    (m) => m.type === "session.state" && m.session.id === session.id &&
+      m.session.turns === 1 && m.session.live === false,
+  );
+  assert.ok(client.records("session").some(({ record }) =>
+    record.type === "captain_telemetry" && record.topic === "playbook.trace" &&
+    (record.payload as { type?: string }).type === "session.disposed" &&
+    (record as { turnId?: number | null }).turnId === null,
+  ), "release delivers the Captain's disposal trace to the session channel");
+
+  const before = await client.expectOk("history.get", {
+    sessionId: session.id,
+  });
+  const usageBefore = await client.expectOk("usage.get", {
+    sessionId: session.id,
+  });
+  const activeBefore = (await client.expectOk("session.list", {}))
+    .find((entry) => entry.id === session.id)?.agentActiveMs;
+  assert.ok(Object.hasOwn(activeBefore ?? {}, "captain"));
+  assert.ok(Object.hasOwn(activeBefore ?? {}, "dev.coder"));
+  client.close();
+  await harness.service.stop();
+
+  const restarted = await CoreService.start({
+    token: "test",
+    configPath: join(harness.dir, "playbook.config.yaml"),
+    dataDir: harness.dataDir,
+    env: {},
+    home: join(harness.dir, "home"),
+    watchConfig: false,
+  });
+  const client2 = new Client(restarted.port());
+  await client2.open();
+
+  const sessions = await client2.expectOk("session.list", {});
+  const recovered = sessions.find((s: SessionInfo) => s.id === session.id);
+  assert.ok(recovered, "session survives restart");
+  assert.equal(recovered.live, false, "a released session stays not live across restart");
+  assert.deepEqual(recovered.agentActiveMs, activeBefore);
+
+  const after = await client2.expectOk("history.get", {
+    sessionId: session.id,
+  });
+  // Content and order, whole (core-service-22): payloads, roles, and
+  // timestamps replay byte-identical, not just seq and type.
+  assert.deepEqual(after.records, before.records);
+  assert.deepEqual(
+    await client2.expectOk("usage.get", { sessionId: session.id }),
+    usageBefore,
+  );
+
+  client2.close();
+  await restarted.stop();
+});
+
+// ---------------------------------------------------------------------------
+// CORE-23: readiness reporting
+// ---------------------------------------------------------------------------
+
+const READINESS_CONFIG = `
+captain:
+  adapter: gemini
+players:
+  dev.coder:
+    adapter: claude
+    model: claude-test
+  dev.reviewer:
+    adapter: codex
+  dev.unused:
+    adapter: kimi
+playbooks:
+  code:
+    roles:
+      coder: dev.coder
+  review:
+    roles:
+      coder: dev.coder
+      reviewer: dev.reviewer
+`;
+
+test("core-service-32: a session's failure stands only until a later turn settles clean", async (t) => {
+  // The Captain's hidden decision call fails on a "fail" prompt; every
+  // other turn runs clean through the real lifecycle.
+  const harness = await startHarness(VALID_CONFIG, {
+    script: {
+      rules: [
+        { match: "route: fail", response: { result: "adapter sign-in expired", status: "error" } },
+        { match: "route:", response: { result: '{"decision":"dispatch"}' } },
+      ],
+      fallback: { deltas: ["done"], result: "done" },
+    },
+  });
+  const client = new Client(harness.service.port());
+  t.after(async () => {
+    client.close();
+    await harness.service.stop();
+    rmSync(harness.dir, { recursive: true, force: true });
+  });
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  const session = await client.expectOk("session.create", { projectId: project.id });
+  const turn = async (text: string, turns: number): Promise<SessionInfo | undefined> => {
+    const started = Date.now();
+    await client.expectOk("turn.submit", { sessionId: session.id, text });
+    const accepted = Date.now();
+    try {
+      // Real checkpoint/replay persistence and lease release contend with
+      // parallel macOS filesystem work; five seconds is no product latency contract.
+      await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id &&
+        m.session.turns === turns && !m.session.turnActive && !m.session.live, 30_000);
+    } catch (error) {
+      // Failure-only evidence: lifecycle fields, never prompt or provider content.
+      const compact = (item: SessionInfo) => ({
+        turns: item.turns, live: item.live, turnActive: item.turnActive,
+        failed: item.failed, recovery: item.recovery?.state, externalWriter: item.externalWriter,
+      });
+      const recent = client.messages.flatMap((message) =>
+        message.type === "session.state" && message.session.id === session.id
+          ? [compact(message.session)] : []).slice(-12);
+      const elapsedMs = Date.now() - started;
+      const waitMs = Date.now() - accepted;
+      const shared = createSessionStore({ sessionsDir: projectSessions(harness.dataDir, project.id) });
+      const observations = await Promise.allSettled([
+        client.expectOk("session.list", {}).then((items) => {
+          const item = items.find((entry) => entry.id === session.id);
+          return item ? compact(item) : null;
+        }),
+        shared.readManifest(session.id).then((manifest) => ({state: manifest.state})),
+        shared.readStream(session.id).then(({entries}) => entries.slice(-12).map(({record}) => ({
+          type: record.type, turnId: (record as {turnId?: unknown}).turnId,
+        }))),
+      ]);
+      const evidence = observations.map((result) => result.status === "fulfilled"
+        ? result.value : {error: result.reason instanceof Error ? result.reason.name : "unknown"});
+      throw new Error(`turn settlement timeout: ${JSON.stringify({turns, elapsedMs, waitMs, recent,
+        listed: evidence[0], checkpoint: evidence[1], records: evidence[2]})}`, {cause: error});
+    }
+    return (await client.expectOk("session.list", {})).find((item) => item.id === session.id);
+  };
+
+  // The first turn failed; the later clean turns stand it down.
+  assert.equal((await turn("fail the first attempt", 1))?.failed, true);
+  assert.equal((await turn("do it properly", 2))?.failed, false);
+  assert.equal((await turn("commit the work", 3))?.failed, false);
+  // The latest turn failing stands again.
+  assert.equal((await turn("fail once more", 4))?.failed, true);
+});
+
+test("core-service-32: a session's last activity is its last record, not a later manifest update", async (t) => {
+  const harness = await startHarness();
+  const client = new Client(harness.service.port());
+  t.after(async () => {
+    client.close();
+    await harness.service.stop();
+    rmSync(harness.dir, { recursive: true, force: true });
+  });
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  const session = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("turn.submit", { sessionId: session.id, text: "finish one turn" });
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id &&
+    m.session.turns === 1 && !m.session.turnActive && !m.session.live);
+
+  const sessionsDir = projectSessions(harness.dataDir);
+  const records = (await openSessionStore(sessionsDir).readStream(session.id)).entries.map(({ record }) => record);
+  const finished = records.filter((record) => record.type === "turn_finished").at(-1)?.timestamp;
+  const lastActivity = Math.max(...records.map(({ timestamp }) => typeof timestamp === "number" ? timestamp : 0));
+  // The release at settlement records its trace in the same moment.
+  assert.ok(typeof finished === "number" && lastActivity >= finished && lastActivity - finished < 5_000);
+  // Playbook rewrites the manifest's updatedAt when it releases the
+  // runtime, which can be long after the last turn: here, an hour.
+  const manifestPath = join(sessionsDir, `${session.id}.json`);
+  const manifest = (await readSessionManifest(manifestPath)) as { updatedAt: string };
+  manifest.updatedAt = new Date(lastActivity + 3_600_000).toISOString();
+  await writeSessionManifest(manifestPath, manifest);
+  // Registering the project again rescans its session store.
+  await client.expectOk("project.register", { path: harness.projectDir });
+  const listed = (await client.expectOk("session.list", {})).find((item) => item.id === session.id);
+  assert.equal(listed?.live, false);
+  // [core-service-32]: the last activity its own history records.
+  assert.equal(listed?.endedAt, lastActivity);
+});
+
+test("CORE-23: readiness is adapter-keyed with positions and requirements", async () => {
+  const harness = await startHarness(READINESS_CONFIG, {
+    env: { ANTHROPIC_API_KEY: "test-key" },
+  });
+  const client = new Client(harness.service.port());
+  await client.open();
+
+  const readiness = await client.expectOk("readiness.get", {});
+  // dev.unused is never bound, so its adapter never gates a run
+  // (DR-032): three adapters are configured, two are referenced, and
+  // the captain's makes the third entry.
+  assert.equal(readiness.length, 3, "one entry per adapter in use");
+  const byAdapter = new Map(
+    readiness.map((entry: ReadinessEntry) => [entry.adapter, entry]),
+  );
+  assert.equal(byAdapter.get("claude")?.ready, true);
+  // A position is a player lane and the roles it serves.
+  assert.deepEqual(byAdapter.get("claude")?.usedBy, [
+    "dev.coder (code.coder, review.coder)",
+  ]);
+  assert.equal(byAdapter.get("codex")?.ready, false);
+  assert.match(byAdapter.get("codex")?.requirement ?? "", /OPENAI_API_KEY/);
+  assert.deepEqual(byAdapter.get("codex")?.usedBy, [
+    "dev.reviewer (review.reviewer)",
+  ]);
+  assert.ok(
+    !readiness.some((entry: ReadinessEntry) => entry.adapter === "kimi"),
+    "an unbound player never enters the readiness gate",
+  );
+  // No preflight rule for gemini: unknown, verify yourself.
+  assert.equal(byAdapter.get("gemini")?.ready, null);
+  assert.deepEqual(byAdapter.get("gemini")?.usedBy, ["captain"]);
+
+  client.close();
+  await harness.service.stop();
+});
+
+test("settings-36: model discovery uses the captured environment without opening sessions or changing config", async (t) => {
+  const env = { ANTHROPIC_API_KEY: "test-key", SPEX_OPTIONS_TEST: "captured environment" };
+  const calls: string[] = [];
+  // The runtime's own words ride along untouched: a model's description
+  // and the default model its configuration runs (DR-091).
+  const discovered = {
+    status: "available" as const,
+    unreportedEffortValues: ["ultracode"],
+    defaultModel: "opus[1m]",
+    models: [
+      { id: "claude-fable-5-1", name: "Claude Fable 5.1", effortValues: ["high", "max"], fastModeSupported: false },
+      { id: "opus", name: "Opus", resolvedModel: "claude-opus-5-5", description: "Opus 5.5 · Best for everyday, complex tasks" },
+    ],
+  };
+  const harness = await startHarness(VALID_CONFIG, {
+    env,
+    discoverAgentModels: async (adapter, options) => {
+      assert.equal(options.env, env, "discovery receives the shell-supplied environment");
+      assert.equal(options.timeoutMs, 10_000, "the real reader bounds discovery to ten seconds");
+      calls.push(adapter);
+      if (adapter === "claude") return discovered;
+      if (adapter === "codex") throw new Error("Fixture discovery failed");
+      return { status: "unavailable", reason: "Fixture runtime is offline" };
+    },
+  });
+  const client = new Client(harness.service.port());
+  t.after(async () => { client.close(); await harness.service.stop(); rmSync(harness.dir, { recursive: true, force: true }); });
+  await client.open();
+  assert.equal((await client.expectOk("config.get", {})).status, "valid");
+  await client.expectOk("config.edit", { op: { kind: "captain.set", patch: { instruction: "Before discovery" } } });
+  assert.deepEqual(calls, [], "startup, config reads and saves do not discover models");
+
+  const configPath = join(harness.dir, "playbook.config.yaml");
+  const configBefore = readFileSync(configPath, "utf8");
+  // No session file appears in any spex repository (storage-6).
+  const workspace = join(harness.dataDir, "workspace");
+  const sessionFiles = () => readdirSync(workspace, { recursive: true, encoding: "utf8" }).filter((path) => path.split("/").includes("sessions")).sort();
+  const filesBefore = sessionFiles();
+  assert.deepEqual(await client.expectOk("agent.options", { adapter: "claude" }), {
+    adapter: "claude", effortValues: ["minimal", "low", "medium", "high", "xhigh", "max", "ultracode"],
+    fastModeSupported: true, subagentModelSupported: true,
+    // A subagent runs at the adapter's efforts less its orchestration
+    // value (DR-095).
+    subagentEffortValues: ["minimal", "low", "medium", "high", "xhigh", "max"],
+    discovery: discovered,
+  });
+  assert.deepEqual(await client.expectOk("agent.options", { adapter: "codex" }), {
+    adapter: "codex", effortValues: ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+    fastModeSupported: true, subagentModelSupported: false, subagentEffortValues: [],
+    discovery: { status: "unavailable", reason: "Fixture discovery failed" },
+  });
+  assert.deepEqual(await client.expectOk("agent.options", { adapter: "gemini" }), {
+    adapter: "gemini", effortValues: ["minimal", "low", "medium", "high", "xhigh", "max"],
+    fastModeSupported: false, subagentModelSupported: false, subagentEffortValues: [],
+    discovery: { status: "unavailable", reason: "Fixture runtime is offline" },
+  });
+  client.sendRaw(JSON.stringify({ type: "agent.options", id: "unknown-adapter", adapter: "unknown" }));
+  const rejected = await client.waitFor((m) => m.type === "reply" && m.id === "unknown-adapter");
+  assert.ok(rejected.type === "reply" && !rejected.ok);
+  assert.equal(rejected.error.code, "invalid_message");
+  assert.deepEqual(calls, ["claude", "codex", "gemini"], "unknown adapters never enter discovery");
+  assert.equal(readFileSync(configPath, "utf8"), configBefore);
+  assert.deepEqual(sessionFiles(), filesBefore);
+  assert.deepEqual(await client.expectOk("session.list", {}), []);
+  assert.equal(harness.stats.runs.length, 0, "discovery submits no agent task");
+
+  await client.expectOk("config.edit", { op: { kind: "captain.set", patch: { model: "manual-unlisted-model" } } });
+  assert.match(readFileSync(configPath, "utf8"), /manual-unlisted-model/);
+  assert.equal((await client.expectOk("config.get", {})).status, "valid");
+  assert.deepEqual(calls, ["claude", "codex", "gemini"], "unavailable discovery does not gate config editing");
+});
+
+test("playbook-library-39: role binding edits preserve tuning and distinguish disabled from inherited fast mode", async (t) => {
+  const config = VALID_CONFIG
+    .replace("    model: claude-test\nplaybooks:", "    model: claude-test\n    fastMode: true\nplaybooks:")
+    .replace("      coder: dev.coder", `      coder: # role comment
+        player: dev.coder
+        model: role-model # model comment
+        effort: high # effort comment
+        fastMode: false # explicit disabled`).trimStart();
+  const harness = await startHarness(config);
+  const client = new Client(harness.service.port());
+  t.after(async () => { client.close(); await harness.service.stop(); rmSync(harness.dir, { recursive: true, force: true }); });
+  await client.open();
+  const path = join(harness.dir, "playbook.config.yaml");
+  const readRole = () => parseYaml(readFileSync(path, "utf8")).playbooks.code.roles.coder;
+  const base = { kind: "playbook.role.bind" as const, playbookId: "code", role: "coder", playerId: "dev.coder" };
+  const untouched = config.slice(0, config.indexOf("playbooks:"));
+
+  await client.expectOk("config.edit", { op: base });
+  assert.deepEqual(readRole(), { player: "dev.coder", model: "role-model", effort: "high", fastMode: false });
+  await client.expectOk("config.edit", { op: { ...base, model: "another-role-model" } });
+  assert.deepEqual(readRole(), { player: "dev.coder", model: "another-role-model", effort: "high", fastMode: false });
+  const retained = readFileSync(path, "utf8");
+  for (const comment of ["# role comment", "# model comment", "# effort comment", "# explicit disabled"]) assert.ok(retained.includes(comment), comment);
+  assert.equal(retained.slice(0, retained.indexOf("playbooks:")), untouched);
+
+  for (const fastMode of [true, false, null] as const) {
+    await client.expectOk("config.edit", { op: { ...base, fastMode } });
+    assert.deepEqual(readRole(), {
+      player: "dev.coder", model: "another-role-model", effort: "high",
+      ...(fastMode === null ? {} : { fastMode }),
+    });
+    const state = await client.expectOk("config.get", {});
+    assert.ok(state.status === "valid");
+    assert.equal(state.summary.playbooks[0].roles.coder.fastMode, fastMode ?? undefined);
+    assert.equal(state.summary.players[0].agent.fastMode, true, "the player's default stays unchanged");
+  }
+
+  // Promote a real shorthand without losing its comment; false must not
+  // be mistaken for an absent override against this fast-enabled player.
+  writeFileSync(path, config.replace(/      coder:[\s\S]*$/, "      coder: dev.coder # shorthand comment\n"));
+  await harness.service.reloadConfig();
+  await client.expectOk("config.edit", { op: { ...base, fastMode: false } });
+  assert.deepEqual(readRole(), { player: "dev.coder", fastMode: false });
+  assert.match(readFileSync(path, "utf8"), /# shorthand comment/);
+
+  // Invalid user data must be refused intact, not silently dropped by
+  // rebuilding a role block from only the fields this editor knows.
+  const invalid = readFileSync(path, "utf8").replace("        fastMode: false", "        unknownTuning: keep-me\n        fastMode: false");
+  writeFileSync(path, invalid);
+  const refused = await client.command("config.edit", { op: { ...base, effort: "low" } });
+  assert.ok(!refused.ok && refused.error.code === "invalid_config");
+  assert.match(refused.error.message, /unknownTuning/);
+  assert.equal(readFileSync(path, "utf8"), invalid);
+  assert.equal(harness.stats.runs.length, 0);
+});
+
+test("a reload superseded while probing broadcasts no stale readiness", async () => {
+  // The race: an older reload snapshots one config, waits on a slow
+  // runtime probe, and would broadcast after a newer reload for a changed
+  // config already has — leaving clients holding readiness for the wrong
+  // configuration. The superseded reload must discard its result instead.
+  let gate: Promise<void> | undefined;
+  let openGate = (): void => {};
+  const harness = await startHarness(VALID_CONFIG, {
+    env: { ANTHROPIC_API_KEY: "test-key" },
+    adapterRuntime: async () => {
+      if (gate) await gate;
+      return { usable: true };
+    },
+  });
+  const client = new Client(harness.service.port());
+  await client.open();
+  const configPath = join(harness.dir, "playbook.config.yaml");
+  const readinessBroadcasts = () =>
+    client.messages.filter((message) => message.type === "readiness.state");
+  const baseline = readinessBroadcasts().length;
+
+  // Older reload: probes block on the gate after its config commit.
+  gate = new Promise((resolve) => {
+    openGate = resolve;
+  });
+  const older = harness.service.reloadConfig();
+  // Newer reload: the config now uses a different adapter set, and its
+  // probes must not block — reopen the gate for it only after the older
+  // reload is already parked on it.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  writeFileSync(configPath, READINESS_CONFIG);
+  gate = undefined;
+  await harness.service.reloadConfig();
+  // Broadcast delivery is asynchronous; wait for it rather than sampling.
+  await client.waitFor(
+    (message) => message.type === "readiness.state",
+  );
+  const afterNewer = readinessBroadcasts();
+  assert.equal(afterNewer.length, baseline + 1, "newer reload broadcast once");
+  const newest = afterNewer.at(-1) as { entries: ReadinessEntry[] };
+  assert.deepEqual(
+    newest.entries.map((entry) => entry.adapter).sort(),
+    ["claude", "codex", "gemini"],
+    "broadcast readiness is the newer config's",
+  );
+
+  // Release the older reload; it must commit nothing.
+  openGate();
+  await older;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(
+    readinessBroadcasts().length,
+    baseline + 1,
+    "the superseded reload broadcast nothing",
+  );
+  client.close();
+  await harness.service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// CORE-28: readiness deduplication across positions
+// ---------------------------------------------------------------------------
+
+test("CORE-28: the starter template yields one readiness entry per adapter it names", async () => {
+  // The template is the installed playbook's own (core-service-3), so
+  // the expectation derives from it rather than restating a roster.
+  const template = readFileSync(templatePath(), "utf8");
+  const parsed = (await import("yaml")).parse(template) as {
+    captain: { adapter: string };
+    players: Record<string, { adapter: string }>;
+  };
+  const adapters = [
+    ...new Set([parsed.captain.adapter, ...Object.values(parsed.players).map((p) => p.adapter)]),
+  ].sort();
+  const harness = await startHarness(starterText(template), {
+    env: { ANTHROPIC_API_KEY: "test-key", OPENAI_API_KEY: "test-key" },
+  });
+  const client = new Client(harness.service.port());
+  await client.open();
+
+  const readiness = await client.expectOk("readiness.get", {});
+  // One entry per adapter; its positions are the captain and each
+  // referenced lane with the roles it serves (DR-032).
+  assert.deepEqual(readiness.map((entry) => entry.adapter).sort(), adapters);
+  const captainEntry = readiness.find((entry) => entry.adapter === parsed.captain.adapter);
+  assert.ok(captainEntry?.usedBy.includes("captain"));
+  for (const [id, player] of Object.entries(parsed.players)) {
+    const entry = readiness.find((e) => e.adapter === player.adapter);
+    assert.ok(entry?.usedBy.some((position) => position.startsWith(`${id} (`)), `${id} listed`);
+  }
+
+  // A config edit pushes readiness.state with the entries payload.
+  await client.expectOk("config.edit", {
+    op: { kind: "theme.set", theme: "dark" },
+  });
+  const pushed = await client.waitFor((m) => m.type === "readiness.state");
+  if (pushed.type === "readiness.state") {
+    assert.ok(Array.isArray(pushed.entries));
+    assert.ok(adapters.includes(pushed.entries[0]?.adapter as string));
+  }
+
+  client.close();
+  await harness.service.stop();
+});
+
+const SHORTHAND_CONFIG = `
+captain: claude
+players:
+  dev.coder: claude
+  dev.reviewer: codex
+playbooks:
+  code:
+    roles:
+      coder: dev.coder
+  review:
+    roles:
+      coder: dev.coder
+      reviewer: dev.reviewer
+`;
+
+test("CORE-28: scalar shorthands compose and share adapter entries", async () => {
+  const harness = await startHarness(SHORTHAND_CONFIG, {
+    env: { ANTHROPIC_API_KEY: "test-key" },
+  });
+  const client = new Client(harness.service.port());
+  await client.open();
+
+  // A scalar reads as its adapter's defaults (bare-adapter block).
+  const state = await client.expectOk("config.get", {});
+  assert.equal(state.status, "valid");
+  if (state.status === "valid") {
+    assert.deepEqual(state.summary.captain, { adapter: "claude" });
+    // A scalar player reads as its adapter's defaults, and the
+    // reviewer role binds to that lane (DR-032).
+    const reviewer = state.summary.players.find(
+      (player) => player.id === "dev.reviewer",
+    );
+    assert.deepEqual(reviewer?.agent, { adapter: "codex" });
+    assert.equal(reviewer?.display, "codex");
+    assert.deepEqual(reviewer?.boundBy, ["review.reviewer"]);
+    assert.equal(
+      state.summary.playbooks[1].roles.reviewer.playerId,
+      "dev.reviewer",
+    );
+    // dev.coder answers both playbooks: one lane, one conversation.
+    const coder = state.summary.players.find(
+      (player) => player.id === "dev.coder",
+    );
+    assert.deepEqual(coder?.boundBy, ["code.coder", "review.coder"]);
+  }
+
+  const readiness = await client.expectOk("readiness.get", {});
+  // The captain and the coder are both "claude": one deduped entry.
+  const claude = readiness.filter(
+    (entry: ReadinessEntry) => entry.adapter === "claude",
+  );
+  assert.equal(claude.length, 1);
+  assert.equal(claude[0].ready, true);
+  assert.deepEqual(claude[0].usedBy, [
+    "captain",
+    "dev.coder (code.coder, review.coder)",
+  ]);
+  const codex = readiness.find(
+    (entry: ReadinessEntry) => entry.adapter === "codex",
+  );
+  assert.equal(codex?.ready, false);
+  assert.match(codex?.requirement ?? "", /OPENAI_API_KEY/);
+
+  client.close();
+  await harness.service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// CORE-27: compile busy rejection and cancellation
+// ---------------------------------------------------------------------------
+
+/** Compile spawner whose slc run hangs until its signal aborts,
+ * mirroring how node:child_process spawn honors { signal }. */
+function hangingCompileSpawner(): LineSpawner {
+  return (command, args, cwd, onLine, signal) => {
+    if (args[0] === "--version") {
+      onLine("v24.0.0");
+      return Promise.resolve(0);
+    }
+    onLine("slc: working");
+    return new Promise((_resolve, reject) => {
+      const abort = () => reject(new Error("The operation was aborted"));
+      if (signal?.aborted) {
+        abort();
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+}
+
+const COMPILE_INPUT = {
+  playbookId: "demo",
+  sourceText: "# Demo\n\nA one-player demo workflow.\n",
+  roles: ["helper"],
+  command: "demo",
+  intent: "demo workflow for tests",
+  bindings: { helper: "dev.helper" },
+  newPlayers: { "dev.helper": { adapter: "claude" } },
+};
+
+test("CORE-27: a second compile.run for the same playbook and project is refused busy; one abort cancels the first", async () => {
+  const harness = await startHarness(VALID_CONFIG, {
+    env: { SPEX_SLC: "fake-slc" },
+    compileSpawner: hangingCompileSpawner(),
+  });
+  const client = new Client(harness.service.port());
+  await client.open();
+  const { id: projectId } = await client.expectOk("project.register", { path: harness.projectDir });
+  const working = () => client.messages.filter((m) => m.type === "compile.progress" && m.line === "slc: working").length;
+
+  const first = client.command("compile.run", { ...COMPILE_INPUT, projectId });
+  await client.waitFor((m) => m.type === "compile.progress" && m.line === "slc: working");
+  // One job writes the artifact folder at a time (core-service-25).
+  const second = await client.command("compile.run", { ...COMPILE_INPUT, projectId });
+  assert.ok(!second.ok && second.error.code === "busy", JSON.stringify(second));
+  assert.match(second.error.message, /^a compile is writing /);
+  // At spex-packages/<org>/<id>/, the project's default org its key's
+  // first segment (environments-10, playbook-library-69).
+  assert.ok(second.error.message.includes(join("spex-packages", projectId.split("/")[0]!, "demo", "playbooks", "en", "demo")), second.error.message);
+  await sleep(50);
+  assert.equal(working(), 1, "the refused compile spawned nothing");
+
+  await client.expectOk("compile.abort", { playbookId: "demo" });
+  const reply = await first;
+  assert.ok(!reply.ok && reply.error.code === "aborted", JSON.stringify(reply));
+
+  client.close();
+  await harness.service.stop();
+});
+
+test("CORE-27: compile.abort cancels the run; the ◇ line closes progress", async () => {
+  const harness = await startHarness(VALID_CONFIG, {
+    env: { SPEX_SLC: "fake-slc" },
+    compileSpawner: hangingCompileSpawner(),
+  });
+  const client = new Client(harness.service.port());
+  await client.open();
+
+  // Aborting with nothing in flight is a not_found.
+  const idle = await client.command("compile.abort", { playbookId: "demo" });
+  assert.ok(!idle.ok && idle.error.code === "not_found");
+  const { id: projectId } = await client.expectOk("project.register", { path: harness.projectDir });
+
+  const pending = client.command("compile.run", { ...COMPILE_INPUT, projectId });
+  await client.waitFor(
+    (m) => m.type === "compile.progress" && m.line === "slc: working",
+  );
+  await client.expectOk("compile.abort", { playbookId: "demo" });
+
+  const reply = await pending;
+  assert.ok(!reply.ok, "aborted compile must not report success");
+  if (!reply.ok) {
+    assert.equal(reply.error.code, "aborted");
+    assert.equal(reply.error.message, "compile canceled");
+  }
+
+  // Give any stray post-abort output a beat to arrive, then assert
+  // the canceled marker is the final progress line.
+  await sleep(50);
+  const progress = client.messages.filter(
+    (m): m is CompileProgressMessage => m.type === "compile.progress",
+  );
+  assert.ok(progress.length > 0);
+  assert.equal(progress[progress.length - 1].line, "◇ compile canceled");
+
+  // The slot is free again: a new compile is accepted (not busy).
+  const again = client.command("compile.run", { ...COMPILE_INPUT, projectId });
+  await client.waitFor(
+    (m) =>
+      m.type === "compile.progress" &&
+      m.line === "slc: working" &&
+      client.messages.filter(
+        (n) => n.type === "compile.progress" && n.line === "slc: working",
+      ).length >= 2,
+  );
+  await client.expectOk("compile.abort", { playbookId: "demo" });
+  const againReply = await again;
+  assert.ok(!againReply.ok && againReply.error.code === "aborted");
+
+  client.close();
+  await harness.service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// PROJ-16..19: registration validation, create flow, stubbed forge, removal
+// ---------------------------------------------------------------------------
+
+test("PROJ: the create flow scaffolds with the supplied command, else the registry's, named on failure (projects-31)", async () => {
+  const { defaultRunCommand } = await import("./forge.js");
+  type Call = { command: string; args: string[]; cwd?: string; env?: Record<string, string> };
+  const calls: Call[] = [];
+  let exitCode = 0;
+  const recorder: import("./forge.js").RunCommand = async (command, args, cwd, env) => {
+    if (command === "git") return creationTestRun(command, args, cwd, env);
+    calls.push({ command, args, cwd, env });
+    if (exitCode === 0) {
+      mkdirSync(join(args[args.length - 1], "specs"), { recursive: true });
+      writeFileSync(join(args[args.length - 1], "specs", "map.md"), "# map\n");
+      writeFileSync(join(args[args.length - 1], "LICENSE"), "test license\n");
+    }
+    return { code: exitCode, stdout: "", stderr: exitCode ? `${command} refused` : "" };
+  };
+  const supplied = await startHarness(VALID_CONFIG, {
+    systemLanguages: ["en"],
+    runCommand: recorder,
+    scaffoldCommand: ["/opt/app/electron", "/opt/app/packages/cli/dist/cli.js"],
+    scaffoldEnv: { ELECTRON_RUN_AS_NODE: "1" },
+  });
+  const client = new Client(supplied.service.port());
+  await client.open();
+
+  // The supplied command runs on its variables, in the project, with
+  // `scaffold --lang <language> <path>` appended, and the project registers.
+  const made = join(supplied.dir, "made");
+  const created = await client.expectOk("project.create", { path: made, scaffold: true });
+  assert.equal(created.path, made);
+  assert.deepEqual(calls, [
+    {
+      command: "/opt/app/electron",
+      args: ["/opt/app/packages/cli/dist/cli.js", "scaffold", "--lang", "en", made],
+      cwd: made,
+      env: { ELECTRON_RUN_AS_NODE: "1" },
+    },
+  ]);
+  assert.ok(existsSync(join(made, "specs", "map.md")));
+
+  // A failure names the command that ran, and registers nothing.
+  exitCode = 1;
+  const failed = await client.command("project.create", {
+    path: join(supplied.dir, "refused"),
+    scaffold: true,
+  });
+  assert.ok(!failed.ok);
+  assert.match(
+    failed.error.message,
+    /scaffold failed running \/opt\/app\/electron \/opt\/app\/packages\/cli\/dist\/cli\.js scaffold: \/opt\/app\/electron refused/,
+  );
+  assert.doesNotMatch(failed.error.message, /registry/);
+  const projects = await client.expectOk("project.list", {});
+  assert.deepEqual(projects.map((project: { path: string }) => project.path), [made]);
+  client.close();
+  await supplied.service.stop();
+
+  // No command named: the registry's runs, and its failure says so.
+  calls.length = 0;
+  const bare = await startHarness(VALID_CONFIG, { runCommand: recorder });
+  const bareClient = new Client(bare.service.port());
+  await bareClient.open();
+  const fallback = await bareClient.command("project.create", {
+    path: join(bare.dir, "fallback"),
+    scaffold: true,
+  });
+  assert.ok(!fallback.ok);
+  assert.deepEqual(calls.map((call) => [call.command, ...call.args.slice(0, 3)]), [
+    ["npx", "--yes", "@sublang/spex", "scaffold"],
+  ]);
+  assert.equal(calls[0].env, undefined);
+  assert.match(
+    fallback.error.message,
+    /scaffold failed running npx --yes @sublang\/spex scaffold \(the app's own scaffold CLI was not supplied, so the registry's ran\): npx refused/,
+  );
+  bareClient.close();
+  await bare.service.stop();
+});
+
+test("projects-43: removed Academy reopens without replacing edits, other occupied paths refuse", async () => {
+  const harness = await startHarness(VALID_CONFIG);
+  const client = new Client(harness.service.port());
+  try {
+    await client.open();
+    const path = join(harness.dir, "academy");
+    const first = await client.expectOk("project.create", { path, example: true });
+    const readme = join(path, "README.md");
+    appendFileSync(readme, "\nMy committed Academy notes stay here.\n");
+    execFileSync("git", ["-C", path, "add", "README.md"]);
+    execFileSync("git", ["-C", path, "-c", "user.name=Test", "-c", "user.email=test@example.test", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "academy notes"]);
+    appendFileSync(readme, "My uncommitted notes stay here.\n");
+    const head = execFileSync("git", ["-C", path, "rev-parse", "HEAD"], { encoding: "utf8" });
+
+    await client.expectOk("project.remove", { projectId: first.id, confirm: true });
+    assert.ok(existsSync(readme), "removal keeps the working folder");
+    const reopened = await client.expectOk("project.create", { path, example: true });
+    assert.equal(reopened.path, path);
+    assert.match(readFileSync(readme, "utf8"), /My committed Academy notes stay here\.\nMy uncommitted notes stay here/);
+    assert.equal(execFileSync("git", ["-C", path, "rev-parse", "HEAD"], { encoding: "utf8" }), head);
+
+    const unrelated = join(harness.dir, "unrelated");
+    mkdirSync(unrelated);
+    writeFileSync(join(unrelated, "keep.txt"), "keep this\n");
+    execFileSync("git", ["init", "-q", unrelated]);
+    execFileSync("git", ["-C", unrelated, "add", "keep.txt"]);
+    execFileSync("git", ["-C", unrelated, "-c", "user.name=Test", "-c", "user.email=test@example.test", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "other project"]);
+    const refused = await client.command("project.create", { path: unrelated, example: true });
+    assert.ok(!refused.ok && refused.error.code === "invalid_request");
+    assert.match(refused.error.message, /not empty/);
+    const projects = await client.expectOk("project.list", {});
+    assert.ok(!projects.some((project) => project.path === unrelated));
+    assert.equal(readFileSync(join(unrelated, "keep.txt"), "utf8"), "keep this\n");
+  } finally {
+    client.close();
+    await harness.service.stop();
+  }
+});
+
+test("projects-18: real scaffolding uses the requested language or the core's language", async () => {
+  const scaffoldCli = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "cli", "dist", "cli.js");
+  const harness = await startHarness(VALID_CONFIG, {
+    systemLanguages: ["zh-CN"],
+    scaffoldCommand: [process.execPath, scaffoldCli],
+  });
+  const client = new Client(harness.service.port());
+  try {
+    await client.open();
+    for (const requested of [undefined, "en"] as const) {
+      const path = join(harness.dir, requested ?? "host-language");
+      await client.expectOk("project.create", {
+        path,
+        scaffold: true,
+        ...(requested ? { scaffoldLanguage: requested } : {}),
+      });
+      assert.match(readFileSync(join(path, "specs", "meta.md"), "utf8"),
+        new RegExp(`Authoring language: ${requested ?? "zh"}`));
+      // Every generated file committed; the environment pairing wrote at
+      // the root is the reader's to commit (environments-26).
+      assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: path, encoding: "utf8" }).trim(), "?? spex.lock\n?? spex.yaml");
+    }
+  } finally {
+    client.close();
+    await harness.service.stop();
+  }
+});
+
+test("projects-18: creation requires its initial commit", async () => {
+  const { defaultRunCommand } = await import("./forge.js");
+  const scaffoldCli = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "cli", "dist", "cli.js");
+  for (const failure of [undefined, "staging", "commit"] as const) {
+    const run: import("./forge.js").RunCommand = async (command, args, cwd, env) => {
+      const result = await defaultRunCommand(command, args, cwd, env);
+      if (command === "git" && args[0] === "init" && result.code === 0) {
+        const path = args[1];
+        for (const [key, value] of [
+          ["user.name", "Spex Test"],
+          ["user.email", "spex@example.test"],
+          ["commit.gpgsign", "false"],
+        ]) execFileSync("git", ["-C", path, "config", key, value]);
+        if (failure === "commit") {
+          writeFileSync(join(path, ".git", "hooks", "pre-commit"),
+            "#!/bin/sh\necho 'creation commit refused' >&2\nexit 1\n", { mode: 0o755 });
+        }
+      }
+      if (failure === "staging" && command === process.execPath && result.code === 0) {
+        writeFileSync(join(cwd!, ".git", "index.lock"), "held by test\n");
+      }
+      return result;
+    };
+    const harness = await startHarness(VALID_CONFIG, {
+      runCommand: run,
+      scaffoldCommand: [process.execPath, scaffoldCli],
+    });
+    const client = new Client(harness.service.port());
+    const path = join(harness.dir, failure ?? "without-scaffold");
+    try {
+      await client.open();
+      const result = await client.command("project.create", { path, scaffold: failure !== undefined });
+      const projects = await client.expectOk("project.list", {});
+      const head = await defaultRunCommand("git", ["rev-parse", "--verify", "HEAD"], path);
+      if (failure) {
+        assert.ok(!result.ok, `${failure} must refuse creation`);
+        if (failure === "staging") {
+          assert.match(result.error.message, /git add.*index\.lock/s);
+        } else {
+          // A refusal naming no case the core recognizes: the plain
+          // sentence, with Git's own words as its detail (projects-34).
+          assert.equal(
+            result.error.message,
+            "Git could not make the first commit. The generated files stay in the folder: finish the initial commit in your terminal, then use Add.",
+          );
+          assert.match(String(result.error.details?.output), /creation commit refused/);
+        }
+        assert.equal(projects.length, 0);
+        assert.notEqual(head.code, 0);
+        assert.ok(existsSync(join(path, "specs", "meta.md")), "generated files remain");
+      } else {
+        assert.ok(result.ok);
+        assert.equal(projects.length, 1);
+        assert.equal(head.code, 0, "creation without scaffolding still creates a baseline");
+        assert.equal(execFileSync("git", ["ls-tree", "--name-only", "HEAD"], { cwd: path, encoding: "utf8" }), "");
+        assert.equal(existsSync(join(path, "specs")), false);
+      }
+    } finally {
+      client.close();
+      await harness.service.stop();
+    }
+  }
+});
+
+test("projects-18: a first commit refused for signing says why in the core's own words, in English and Chinese", async () => {
+  const { defaultRunCommand } = await import("./forge.js");
+  // Real Git, signing every commit: the host's own config never
+  // decides, so the scratch repository's config alone does.
+  const isolated = join(scratchDir("spex-signing-"), "gitconfig");
+  writeFileSync(isolated, "");
+  const gitEnv = { GIT_CONFIG_GLOBAL: isolated, GIT_CONFIG_NOSYSTEM: "1" };
+  const cases = {
+    // SSH signing with no key and no key command: Git names the key.
+    key: {
+      config: [["gpg.format", "ssh"]],
+      git: /either user\.signingkey or gpg\.ssh\.defaultKeyCommand needs to be configured/,
+      en: "Git could not make the first commit: commit signing is on, but no key is configured. The generated files stay in the folder: finish the initial commit in your terminal, then use Add.",
+      zh: "Git 无法完成初始提交：已开启提交签名，但未配置签名密钥。生成的文件仍在该文件夹中：请在终端中完成初始提交，然后使用“添加”。",
+    },
+    // A signing program that cannot run, as on a machine without gpg.
+    program: {
+      config: [["gpg.program", join(dirname(isolated), "no-such-gpg")]],
+      git: /gpg failed to sign the data/,
+      en: "Git could not make the first commit: commit signing is on, but signing failed. The generated files stay in the folder: finish the initial commit in your terminal, then use Add.",
+      zh: "Git 无法完成初始提交：已开启提交签名，但签名失败。生成的文件仍在该文件夹中：请在终端中完成初始提交，然后使用“添加”。",
+    },
+  } as const;
+  for (const language of ["en", "zh"] as const) {
+    for (const [name, signing] of Object.entries(cases)) {
+      const run: RunCommand = async (command, args, cwd, env) => {
+        const result = await defaultRunCommand(command, args, cwd, command === "git" ? { ...env, ...gitEnv } : env);
+        if (command === "git" && args[0] === "init" && result.code === 0) {
+          for (const [key, value] of [
+            ["user.name", "Spex Test"],
+            ["user.email", "spex@example.test"],
+            ["commit.gpgsign", "true"],
+            ...signing.config,
+          ]) execFileSync("git", ["-C", args[1], "config", key, value], { env: { ...process.env, ...gitEnv } });
+        }
+        return result;
+      };
+      const harness = await startHarness(VALID_CONFIG, {
+        runCommand: run,
+        systemLanguages: [language === "zh" ? "zh-CN" : "en"],
+      });
+      const client = new Client(harness.service.port());
+      const path = join(harness.dir, `${name}-${language}`);
+      try {
+        await client.open();
+        const result = await client.command("project.create", { path, scaffold: false });
+        assert.ok(!result.ok, `${name} signing must refuse creation`);
+        // The core's sentence in its own language, the case's key
+        // phrase and the way on; Git's own line whole as the detail.
+        assert.equal(result.error.message, signing[language]);
+        assert.match(String(result.error.details?.output), signing.git);
+        assert.equal((await client.expectOk("project.list", {})).length, 0);
+        assert.notEqual((await defaultRunCommand("git", ["rev-parse", "--verify", "HEAD"], path)).code, 0);
+      } finally {
+        client.close();
+        await harness.service.stop();
+      }
+    }
+  }
+});
+
+test("projects-18: Create preserves an existing repository and its staged files", async () => {
+  const harness = await startHarness();
+  const client = new Client(harness.service.port());
+  try {
+    await client.open();
+    for (const hasCommit of [false, true]) {
+      if (hasCommit) seedRepository(harness.projectDir);
+      const userContent = `work owned by the user: ${hasCommit ? "changed" : "first"}\n`;
+      writeFileSync(join(harness.projectDir, "existing.txt"), userContent);
+      execFileSync("git", ["add", "existing.txt"], { cwd: harness.projectDir });
+      const gitOutput = (args: string[]) => execFileSync("git", args, {
+        cwd: harness.projectDir, encoding: "utf8",
+      });
+      const indexBefore = gitOutput(["ls-files", "--stage"]);
+      const headBefore = hasCommit ? gitOutput(["rev-parse", "HEAD"]) : undefined;
+      const result = await client.command("project.create", { path: harness.projectDir, scaffold: false });
+      assert.ok(!result.ok);
+      assert.match(result.error.message, hasCommit ? /Use Add/ : /Finish the initial commit.*use Add/);
+      assert.equal((await client.expectOk("project.list", {})).length, 0);
+      assert.equal(gitOutput(["ls-files", "--stage"]), indexBefore);
+      assert.equal(readFileSync(join(harness.projectDir, "existing.txt"), "utf8"), userContent);
+      if (hasCommit) assert.equal(gitOutput(["rev-parse", "HEAD"]), headBefore);
+      else assert.notEqual((await defaultRunCommand("git", ["rev-parse", "--verify", "HEAD"], harness.projectDir)).code, 0);
+    }
+  } finally {
+    client.close();
+    await harness.service.stop();
+  }
+});
+
+test("PROJ: work-tree validation, create flow, forge states, removal", async () => {
+  const { defaultRunCommand } = await import("./forge.js");
+  // The real scaffold generator, as the palette's Create runs it
+  // (projects-3): the CLI this checkout builds beside the core.
+  const scaffoldCli = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "cli",
+    "dist",
+    "cli.js",
+  );
+  assert.ok(existsSync(scaffoldCli), `built CLI at ${scaffoldCli}`);
+  // The host's own git identity must not decide the holder: the
+  // scaffold sees no global or system config, only the repository's.
+  const noIdentity = join(scratchDir("spex-no-identity-"), "gitconfig");
+  writeFileSync(noIdentity, "");
+  const identified = new Set<string>();
+  const ghStub: import("./forge.js").RunCommand = async (command, args, cwd) => {
+    if (command === process.execPath && args[0] === scaffoldCli) {
+      return new Promise((done) => {
+        const child = spawn(command, args, {
+          cwd,
+          env: { ...process.env, GIT_CONFIG_GLOBAL: noIdentity, GIT_CONFIG_NOSYSTEM: "1" },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+        child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+        child.on("close", (code) => done({ code: code ?? 1, stdout, stderr }));
+      });
+    }
+    if (command === "git" && args[0] === "init") {
+      const result = await defaultRunCommand(command, args, cwd);
+      execFileSync("git", ["-C", args[1], "config", "user.useConfigOnly", "true"]);
+      // Only the first created project carries an identity, as a
+      // repository the creator configured would.
+      if (identified.has(args[1])) {
+        for (const [key, value] of [
+          ["user.name", "Spex Test"],
+          ["user.email", "spex@example.test"],
+          ["commit.gpgsign", "false"],
+        ]) execFileSync("git", ["-C", args[1], "config", key, value]);
+      }
+      return result;
+    }
+    if (command !== "gh") return defaultRunCommand(command, args, cwd,
+      { GIT_CONFIG_GLOBAL: noIdentity, GIT_CONFIG_NOSYSTEM: "1" });
+    if (args[0] === "auth") return { code: 0, stdout: "ok", stderr: "" };
+    return {
+      code: 0,
+      stdout: JSON.stringify([
+        { number: 3, title: "Stub item", url: "https://github.com/o/r/issues/3" },
+      ]),
+      stderr: "",
+    };
+  };
+  const harness = await startHarness(VALID_CONFIG, {
+    runCommand: ghStub,
+    scaffoldCommand: [process.execPath, scaffoldCli],
+  });
+  const client = new Client(harness.service.port());
+  await client.open();
+
+  // Non-repo directory is rejected with guidance (PROJ-1).
+  const plain = join(harness.dir, "plain");
+  mkdirSync(plain);
+  const rejected = await client.command("project.register", { path: plain });
+  assert.ok(!rejected.ok && rejected.error.code === "invalid_request");
+  assert.match(rejected.error.message, /git work tree/);
+
+  // Create flow produces a registered, statusable repo (PROJ-2/3)
+  // whose scaffold names the creator as the copyright holder
+  // (projects-18).
+  identified.add(join(harness.dir, "fresh"));
+  const created = await client.expectOk("project.create", {
+    path: join(harness.dir, "fresh"),
+    scaffold: true,
+  });
+  const status = await client.expectOk("project.status", {
+    projectId: created.id,
+  });
+  assert.ok(status.branch.length > 0);
+  // The generated files are committed; the environment the pairing
+  // wrote at the root waits for the reader's commit (environments-26).
+  assert.equal(status.dirty, true);
+  assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: created.path, encoding: "utf8" }).trim(), "?? spex.lock\n?? spex.yaml");
+  const licensing = readFileSync(
+    join(created.path, "specs", "packages", "licensing.md"),
+    "utf-8",
+  );
+  const pinned = licensing.slice(licensing.indexOf("### licensing-9"));
+  assert.ok(
+    pinned.includes(
+      `<!-- SPDX-FileCopyrightText: ${new Date().getFullYear()} Spex Test <spex@example.test> -->`,
+    ),
+    `licensing-9 names the configured holder:\n${pinned}`,
+  );
+  assert.doesNotMatch(pinned, /<holder>|SubLang/);
+  assert.match(
+    licensing.split("\n")[1] ?? "",
+    /SubLang International/,
+    "the template keeps its upstream line",
+  );
+
+  // Without a git identity the scaffold leaves the placeholder, never
+  // the template's holder (projects-18).
+  const anonymousPath = join(harness.dir, "anonymous");
+  const anonymous = await client.command("project.create", {
+    path: anonymousPath,
+    scaffold: true,
+  });
+  assert.ok(!anonymous.ok);
+  // In the app's words, the missing identity named; Git's own words as
+  // the refusal's detail (projects-34).
+  assert.equal(
+    anonymous.error.message,
+    "Git could not make the first commit: no Git name and email are configured. The generated files stay in the folder: finish the initial commit in your terminal, then use Add.",
+  );
+  assert.match(String(anonymous.error.details?.output), /Please tell me who you are/);
+  const unpinned = readFileSync(
+    join(anonymousPath, "specs", "packages", "licensing.md"),
+    "utf-8",
+  );
+  const left = unpinned.slice(unpinned.indexOf("### licensing-9"));
+  assert.ok(left.includes("SPDX-FileCopyrightText: " + new Date().getFullYear() + " <holder>"));
+  assert.doesNotMatch(left, /SubLang/);
+  assert.ok(!(await client.expectOk("project.list", {})).some((project) => project.path === anonymousPath));
+
+  // Creating on a registered folder is a conflict carrying the
+  // registered path as a fact, apart from its words (core-service-111).
+  const again = await client.command("project.create", {
+    path: join(harness.dir, "fresh"),
+  });
+  assert.ok(!again.ok);
+  assert.equal(again.error.code, "conflict");
+  assert.deepEqual(again.error.details, { path: created.path });
+
+  // Unbound, the guidance names which condition holds in place of the
+  // lists while the repository state stays served (projects-20,
+  // projects-7): no origin at all, then a remote withheld until the
+  // instance reports its Git origin, never carrying its credential.
+  const unbound = () =>
+    client.expectOk("forge.items", { projectId: created.id, refresh: true });
+  const noOrigin = await unbound();
+  assert.equal(
+    noOrigin.guidance,
+    "No GitHub remote — run git remote add origin … to see issues and PRs",
+  );
+  assert.deepEqual([noOrigin.issues, noOrigin.prs], [[], []]);
+  execFileSync("git", [
+    "-C",
+    created.path,
+    "remote",
+    "add",
+    "origin",
+    "https://oauth2:glpat-secret@gitlab.com/spex-internal/demo-app.git",
+  ]);
+  const elsewhere = await unbound();
+  assert.equal(
+    elsewhere.guidance,
+    "Issues and PRs come from GitHub",
+  );
+  assert.deepEqual([elsewhere.issues, elsewhere.prs], [[], []]);
+  assert.equal(
+    (await client.expectOk("project.status", { projectId: created.id })).branch,
+    status.branch,
+  );
+
+  // Forge state via the stubbed gh (PROJ-5/6): bind a GitHub origin.
+  execFileSync("git", [
+    "-C",
+    created.path,
+    "remote",
+    "set-url",
+    "origin",
+    "https://github.com/sublang-ai/demo.git",
+  ]);
+  const forge = await client.expectOk("forge.items", {
+    projectId: created.id,
+    refresh: true,
+  });
+  assert.equal(forge.authenticated, true);
+  assert.equal(forge.repo, "sublang-ai/demo");
+  assert.equal(forge.issues[0]?.number, 3);
+  // The lists carry their fetch moment, and a read within the cache
+  // window serves that same moment (dashboard-14).
+  assert.equal(typeof forge.at, "number");
+  const cachedForge = await client.expectOk("forge.items", {
+    projectId: created.id,
+  });
+  assert.equal(cachedForge.at, forge.at);
+
+  // Removal keeps the repo on disk (PROJ-8/19). The local-only spex
+  // repository holds its environment, which has not reached a host, so
+  // removal asks the second confirm (projects-9, storage-6).
+  await client.expectOk("project.remove", { projectId: created.id, confirm: true });
+  assert.ok(existsSync(join(created.path, ".git")));
+
+  client.close();
+  await harness.service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// Real Playbook Captain shell through the Spex pipeline (DR-003) on the
+// installed template, the config a first run seeds: registry loading
+// via the injected module loader, player binding, visible replies, and
+// pane visibility — no LLM, no network.
+// ---------------------------------------------------------------------------
+
+test("real captain shell: the installed template's session binds its roster, and a Boss turn round-trips the captain reply", async () => {
+  const dir = scratchDir("spex-shell-it-");
+  const configPath = join(dir, "playbook.config.yaml");
+  // The installed template with every effort it names left to the
+  // adapter: the substitute adapter speaks no effort vocabulary and
+  // refuses a call carrying one. Its roster and playbooks stay the
+  // template's own.
+  const template = parseYaml(starterText(readFileSync(templatePath(), "utf8"))) as {
+    players: Record<string, unknown>;
+  };
+  const dropEfforts = (node: unknown): void => {
+    if (typeof node !== "object" || node === null) return;
+    delete (node as Record<string, unknown>).effort;
+    for (const child of Object.values(node)) dropEfforts(child);
+  };
+  dropEfforts(template);
+  writeFileSync(configPath, stringifyYaml(template));
+  const projectDir = join(dir, "project");
+  mkdirSync(projectDir);
+  execFileSync("git", ["init", "-q", projectDir]);
+
+  const { imports } = fakeAdapterImports({
+    fallback: { result: "not json on purpose" },
+  });
+  // No captainFactory: the service instantiates the REAL shell from
+  // @sublang/playbook/playbook-captain with the core loadModule.
+  const service = await CoreService.start({
+    token: "test",
+    configPath,
+    dataDir: join(dir, "state"),
+    adapterImports: imports,
+    env: {},
+    home: join(dir, "home"),
+    watchConfig: false,
+  });
+  const client = new Client(service.port());
+  await client.open();
+
+  const project = await client.expectOk("project.register", {
+    path: projectDir,
+  });
+  const session = await client.expectOk("session.create", {
+    projectId: project.id,
+  });
+  // Every player the template names, in its order, each in view from
+  // the start — reaching a live session over the real registries is
+  // the first-run path that once failed with invalid_config.
+  const roster = Object.keys(template.players);
+  assert.deepEqual(
+    session.players.map((p) => p.id),
+    roster,
+  );
+  assert.deepEqual(session.initialVisible, roster);
+  await client.expectOk("subscribe", {
+    channel: { kind: "session", sessionId: session.id },
+  });
+
+  // Playbook 7's controller Captain answers every Boss turn through
+  // the session Captain — a model call — so the faked adapter's text
+  // comes back as the visible reply. Core owns the wiring: registry
+  // loading, real shell construction, and the reply reaching the
+  // session channel with the turn completing.
+  await client.expectOk("turn.submit", { sessionId: session.id, text: "/code" });
+  await client.waitFor(
+    (m) => m.type === "record" && m.record.type === "turn_finished",
+  );
+
+  const transcript = JSON.stringify(client.records("session"));
+  assert.ok(
+    transcript.includes("not json on purpose"),
+    `captain reply missing from the session channel; got: ${transcript.slice(0, 600)}`,
+  );
+
+  client.close();
+  await service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// core-service-99/105: a parked run survives its settlement (DR-074)
+// ---------------------------------------------------------------------------
+
+/** Wait out a turn and the settlement that releases its runtime, and
+ * return the summary published with that release. */
+async function settledSession(
+  client: Client,
+  sessionId: string,
+  turns: number,
+): Promise<SessionInfo> {
+  const message = await client.waitFor(
+    (m) =>
+      m.type === "session.state" &&
+      m.session.id === sessionId &&
+      m.session.turns === turns &&
+      !m.session.turnActive &&
+      !m.session.live,
+    60_000,
+  );
+  if (message.type !== "session.state") throw new Error("unreachable");
+  return message.session;
+}
+
+/** The preferences as the file holds them. */
+function storedPrefs(dataDir: string): Record<string, unknown> {
+  return (
+    JSON.parse(readFileSync(join(dataDir, "local", "prefs.json"), "utf8")) as {
+      prefs: Record<string, unknown>;
+    }
+  ).prefs;
+}
+
+test(
+  "core-service-99: a settled run parked on unresolved effects releases its runtime, publishes its controls, and answers a named one after a restart",
+  { timeout: 180_000 },
+  async (t) => {
+    const harness = await startHarness(VALID_CONFIG, {
+      realShell: true,
+      script: parkingScript(),
+      seedCommit: true,
+    });
+    let service = harness.service;
+    let client = new Client(service.port());
+    t.after(async () => {
+      client.close();
+      await service.stop();
+    });
+    await client.open();
+    const project = await client.expectOk("project.register", {
+      path: harness.projectDir,
+    });
+    const session = await client.expectOk("session.create", {
+      projectId: project.id,
+    });
+    await client.expectOk("subscribe", {
+      channel: { kind: "session", sessionId: session.id },
+    });
+    await client.expectOk("turn.submit", {
+      sessionId: session.id,
+      text: "Add a line to work.txt",
+    });
+    const released = await settledSession(client, session.id, 1);
+
+    // The evidence really stands in the checkpoint.
+    const manifest = (await readSessionManifest(join(projectSessions(harness.dataDir), `${session.id}.json`))) as { state: string; unresolvedEffects: unknown[] };
+    assert.equal(manifest.state, "settled");
+    assert.equal(manifest.unresolvedEffects.length, 1);
+    // The failure the stream reports carries the runtime's own
+    // structured cause, so the interface phrases what the runtime
+    // decided rather than a message it parsed (core-service-49).
+    const failure = client
+      .records("session")
+      .flatMap(({ record }) => {
+        const entry = record as unknown as {
+          type: string;
+          data?: { lastError?: { cause?: { code?: string; evidence?: Record<string, unknown> } } };
+        };
+        const cause = entry.type === "captain_status" ? entry.data?.lastError?.cause : undefined;
+        return cause ? [cause] : [];
+      })
+      .at(-1);
+    assert.equal(failure?.code, "commit-residual");
+    assert.deepEqual((failure?.evidence?.paths as {uncommitted?: unknown})?.uncommitted, ["stray-1.txt"]);
+    // Released at settlement all the same, and continuable exactly as
+    // Playbook's validation says (core-service-91, core-service-73).
+    assert.equal(released.live, false);
+    assert.equal(released.continuable, true, released.continuationReason ?? "no reason given");
+    assert.equal(released.continuationReason, undefined);
+    // The controls the fenced run advertises, read while the shell was
+    // still held and published with the summary (core-service-32).
+    assert.equal(released.parked?.reason, "failure");
+    assert.deepEqual(
+      released.parked?.actions.map((action) => action.id),
+      ["reconcile:unresolved-effect", "abandon:unresolved-effect"],
+    );
+    assert.ok(
+      released.parked?.actions.every((action) => action.label.length > 0),
+      "each advertised action carries its Boss-facing label",
+    );
+    assert.equal(released.parked?.ending?.id, "give-up");
+    assert.match(released.parked?.ending?.label ?? "", /\/code/);
+    assert.ok(
+      Object.hasOwn(storedPrefs(harness.dataDir), `session:${session.id}:parked`),
+      "the reading is kept where a restart can find it",
+    );
+
+    // Busy means busy: an idle parked session blocks nothing.
+    const second = await client.expectOk("session.create", {
+      projectId: project.id,
+    });
+    await client.expectOk("session.dispose", { sessionId: second.id });
+
+    // A fresh core over the same home reads both from the files.
+    client.close();
+    await service.stop();
+    service = await CoreService.start({
+      token: "test",
+      configPath: join(harness.dir, "playbook.config.yaml"),
+      dataDir: harness.dataDir,
+      adapterImports: harness.imports,
+      adapterRuntime: () => ({ usable: true }),
+      env: {},
+      home: join(harness.dir, "home"),
+      watchConfig: false,
+    });
+    client = new Client(service.port());
+    await client.open();
+    await client.expectOk("subscribe", {
+      channel: { kind: "session", sessionId: session.id },
+    });
+    const restarted = (await client.expectOk("session.list", {})).find(
+      (entry) => entry.id === session.id,
+    );
+    assert.equal(restarted?.live, false);
+    assert.equal(restarted?.continuable, true, restarted?.continuationReason ?? "no reason given");
+    assert.deepEqual(restarted?.parked, released.parked);
+
+    // A control names the action it selects; one the opened run does
+    // not advertise is refused with its cause (core-service-98).
+    const refused = await client.command("session.control", {
+      sessionId: session.id,
+      kind: "recovery",
+      actionId: "no-such-action",
+    });
+    assert.ok(!refused.ok, "an unadvertised action is refused");
+    assert.match(refused.error.message, /no-such-action/);
+    const unmoved = (await client.expectOk("session.list", {})).find(
+      (entry) => entry.id === session.id,
+    );
+    assert.equal(unmoved?.turns, 1, "a refused control starts no turn");
+    assert.equal(
+      unmoved?.live,
+      false,
+      "the runtime the refused control opened is let go again",
+    );
+
+    // The second advertised action — unreachable while the first was
+    // taken — runs through the settled session the control opens.
+    await client.expectOk("session.control", {
+      sessionId: session.id,
+      kind: "recovery",
+      actionId: "abandon:unresolved-effect",
+    });
+    // A second request adds no turn of its own, whether it lands on the
+    // running turn or on the run that is no longer parked.
+    assert.ok(
+      !(
+        await client.command("session.control", {
+          sessionId: session.id,
+          kind: "recovery",
+          actionId: "abandon:unresolved-effect",
+        })
+      ).ok,
+      "a repeated control is refused rather than run twice",
+    );
+    const ended = await settledSession(client, session.id, 2);
+    assert.equal(ended.parked, undefined, "the run left its park");
+    assert.equal(ended.continuable, true, ended.continuationReason ?? "no reason given");
+    assert.ok(
+      !Object.hasOwn(storedPrefs(harness.dataDir), `session:${session.id}:parked`),
+      "the reading leaves with the park",
+    );
+    const { records } = await client.expectOk("history.get", {
+      sessionId: session.id,
+    });
+    const prompts = records.flatMap(({ record }) => {
+      const entry = record as unknown as { type: string; turn?: { prompt: string } };
+      return entry.type === "turn_started" && entry.turn ? [entry.turn.prompt] : [];
+    });
+    assert.equal(prompts.length, 2);
+    assert.equal(prompts[1], "Abandon unresolved workflow attempt");
+    // The run it abandoned summons nobody, though the effect stays in
+    // the checkpoint as evidence: what stands is the finished turn's
+    // own entry, not an interrupted one.
+    const ledger = await client.expectOk("ledger.get", {});
+    assert.deepEqual(
+      ledger.attention
+        .filter((entry) => entry.sessionId === session.id)
+        .map((entry) => entry.band),
+      ["finished"],
+    );
+  },
+);
+
+test(
+  "core-service-114: a Boss abort mid-step settles at the saved step and publishes the run's controls",
+  { timeout: 180_000 },
+  async (t) => {
+    const harness = await startHarness(VALID_CONFIG, {
+      realShell: true,
+      script: parkingScript({ held: true }),
+      seedCommit: true,
+    });
+    const client = new Client(harness.service.port());
+    t.after(async () => {
+      client.close();
+      await harness.service.stop();
+    });
+    await client.open();
+    const project = await client.expectOk("project.register", {
+      path: harness.projectDir,
+    });
+    const session = await client.expectOk("session.create", {
+      projectId: project.id,
+    });
+    await client.expectOk("subscribe", {
+      channel: { kind: "session", sessionId: session.id },
+    });
+    await client.expectOk("turn.submit", {
+      sessionId: session.id,
+      text: "Add a line to work.txt",
+    });
+    // The coder's call is in flight with its commit made: the step's
+    // start is saved, its result is not.
+    const deadline = Date.now() + 60_000;
+    while (!readFileSync(join(harness.projectDir, "work.txt"), "utf8").includes("phase 1")) {
+      if (Date.now() > deadline) throw new Error("the coder never committed");
+      await sleep(20);
+    }
+    await client.expectOk("turn.abort", { sessionId: session.id });
+    const stopped = await settledSession(client, session.id, 1);
+
+    // Playbook settles the stop at the saved step, so the conversation
+    // continues and owes no recovery (core-service-6) ...
+    assert.equal(stopped.recovery, undefined);
+    assert.equal(stopped.continuable, true, stopped.continuationReason ?? "no reason given");
+    assert.ok(client.records("session").some(({ record }) => record.type === "turn_aborted"));
+    // ... and the run it left parked publishes its controls, read at
+    // that settlement as at any other (core-service-91, core-service-32).
+    assert.equal(stopped.parked?.reason, "failure");
+    assert.deepEqual(
+      stopped.parked?.actions.map((action) => action.id),
+      ["reconcile:unresolved-effect", "abandon:unresolved-effect"],
+    );
+    assert.equal(stopped.parked?.ending?.id, "give-up");
+    assert.ok(
+      Object.hasOwn(storedPrefs(harness.dataDir), `session:${session.id}:parked`),
+      "the reading is kept where a restart can find it",
+    );
+  },
+);
+
+test(
+  "core-service-114: a Boss abort during the Captain's own call settles stopped, parking nothing",
+  { timeout: 180_000 },
+  async (t) => {
+    // The Captain's decision is the call held in flight: the abort
+    // lands before any playbook run starts, and moves the shell's own
+    // machine to its failure state.
+    const script = parkingScript();
+    const harness = await startHarness(VALID_CONFIG, {
+      realShell: true,
+      script: { rules: [{ match: /"action"/, response: { result: "", untilAborted: true } }, ...(script.rules ?? [])], fallback: script.fallback },
+      seedCommit: true,
+    });
+    const client = new Client(harness.service.port());
+    t.after(async () => {
+      client.close();
+      await harness.service.stop();
+    });
+    await client.open();
+    const project = await client.expectOk("project.register", { path: harness.projectDir });
+    const first = await client.expectOk("intent.queue", { projectId: project.id, text: "Add a line to work.txt" });
+    await client.expectOk("intent.queue", { projectId: project.id, text: "Then another" });
+    const session = await client.expectOk("session.create", { projectId: project.id });
+    await client.expectOk("subscribe", { channel: { kind: "session", sessionId: session.id } });
+    await client.expectOk("turn.submit", { sessionId: session.id, text: first.text, intentId: first.id });
+    await client.waitFor((m) => m.type === "record" && m.record.type === "captain_telemetry" &&
+      (m.record as { topic?: unknown }).topic === "playbook.trace" &&
+      (m.record as { payload?: { type?: unknown } }).payload?.type === "captain.call.started", 60_000);
+    await client.expectOk("turn.abort", { sessionId: session.id });
+    const stopped = await settledSession(client, session.id, 1);
+    assert.ok(client.records("session").some(({ record }) => record.type === "turn_aborted"));
+    assert.ok(client.records("session").some(({ record }) =>
+      (record as { topic?: unknown; payload?: { playbookId?: unknown; type?: unknown; payload?: { to?: unknown } } }).topic === "playbook.trace" &&
+      (record as { payload?: { playbookId?: unknown; payload?: { to?: unknown } } }).payload?.playbookId === "captain" &&
+      (record as { payload?: { payload?: { to?: unknown } } }).payload?.payload?.to === "failed"),
+      "the shell's own machine moved to its failure state");
+    // The stop settles and continues (core-service-6); the shell's own
+    // machine is no run, so nothing stands parked and no control is
+    // kept (core-service-91) ...
+    assert.equal(stopped.recovery, undefined);
+    assert.equal(stopped.continuable, true, stopped.continuationReason ?? "no reason given");
+    assert.equal(stopped.parked, undefined);
+    // ... and the queue reads the stop, not a failure park, with Start
+    // available (core-service-107).
+    const ledger = await client.expectOk("ledger.get", {});
+    const row = ledger.intents.find((entry) => entry.intent.id === first.id);
+    assert.equal(row?.state, "queued");
+    assert.deepEqual([row?.next?.standing, row?.next?.manualStart], ["stopped", true]);
+    assert.deepEqual(ledger.attention.filter((entry) => entry.sessionId === session.id), []);
+  },
+);
+
+test(
+  "core-service-131: an abort before the runtime begins the turn is held and takes effect as it begins",
+  { timeout: 180_000 },
+  async (t) => {
+    // The turn is active from its acceptance, while the shared lifecycle
+    // prepares it — the lease marked, the repository reconciled — before
+    // the runtime has a turn to abort. The seam holds the lifecycle at
+    // the checkpoint marking the turn begun, and the Captain's decision
+    // call is scripted far past the settlement bound: a lost abort lets
+    // it run its whole length, as the long-turn journey saw.
+    const script = parkingScript();
+    let holding = true;
+    const held: (() => void)[] = [];
+    const release = () => {
+      holding = false;
+      for (const resume of held.splice(0)) resume();
+    };
+    const harness = await startHarness(VALID_CONFIG, {
+      realShell: true,
+      script: { rules: [{ match: /"action"/, response: { result: "", delayMs: 120_000 } }, ...(script.rules ?? [])], fallback: script.fallback },
+      seedCommit: true,
+      sessionStatePublished: async (session) => {
+        if (holding && session.turnActive) await new Promise<void>((resume) => held.push(resume));
+      },
+    });
+    const client = new Client(harness.service.port());
+    t.after(async () => {
+      release();
+      client.close();
+      await harness.service.stop();
+    });
+    await client.open();
+    const project = await client.expectOk("project.register", { path: harness.projectDir });
+    const session = await client.expectOk("session.create", { projectId: project.id });
+    await client.expectOk("subscribe", { channel: { kind: "session", sessionId: session.id } });
+    await client.expectOk("turn.submit", { sessionId: session.id, text: "Add a line to work.txt" });
+    // The turn publishes its state as it is accepted and again at the
+    // lifecycle's checkpoint; with both held, the runtime has not begun
+    // the turn and no call has started.
+    const deadline = Date.now() + 60_000;
+    while (held.length < 2) {
+      if (Date.now() > deadline) throw new Error("the turn's checkpoint was never published");
+      await sleep(10);
+    }
+    assert.equal(harness.stats.runs.length, 0, "no call has started while the turn is held");
+    const reply = await client.expectOk("turn.abort", { sessionId: session.id });
+    assert.equal(reply.aborted, true, "the abort is taken while the turn is active");
+    release();
+
+    // The stop settles well inside the call's scripted length: the
+    // abort took effect as the runtime began the turn (core-service-6),
+    // and a call under an aborted signal never reaches the agent.
+    const stopped = await settledSession(client, session.id, 1);
+    assert.ok(client.records("session").some(({ record }) => record.type === "turn_aborted"));
+    assert.equal(harness.stats.runs.length, 0, "no agent call ran under the aborted turn");
+    assert.equal(stopped.recovery, undefined);
+    assert.equal(stopped.continuable, true, stopped.continuationReason ?? "no reason given");
+    assert.equal(stopped.parked, undefined);
+  },
+);
+
+test(
+  "core-service-133: a real coder failure parking the run summons as a failure, for the session's own entry and for its intent",
+  { timeout: 180_000 },
+  async (t) => {
+    // The real /code coder's call fails before it touches the repository
+    // (DR-117): the run parks in its failure state inside a turn that
+    // finishes, the stream's one runtime_error naming no turn — the park
+    // the fold used to read as an unread turn, or as an intent's finish.
+    const harness = await startHarness(VALID_CONFIG, {
+      realShell: true,
+      script: failingScript(),
+      seedCommit: true,
+    });
+    const client = new Client(harness.service.port());
+    t.after(async () => {
+      client.close();
+      await harness.service.stop();
+    });
+    await client.open();
+    const project = await client.expectOk("project.register", { path: harness.projectDir });
+    const own = await client.expectOk("session.create", { projectId: project.id });
+    await client.expectOk("subscribe", { channel: { kind: "session", sessionId: own.id } });
+    await client.expectOk("turn.submit", { sessionId: own.id, text: "Add a line to work.txt" });
+    const parked = await settledSession(client, own.id, 1);
+    assert.equal(parked.parked?.reason, "failure");
+    assert.equal(parked.failed, true);
+    // The one runtime_error the stream holds is the core's record of the
+    // Captain's failed call, naming its turn (core-service-135); it follows
+    // the run's move, so the entry's onset stays the move, the attempt's
+    // first failure (core-service-49).
+    assert.deepEqual(
+      client.records("session").filter(({ record }) => record.type === "runtime_error").map(({ record }) => (record as { turnId?: unknown }).turnId),
+      [1],
+    );
+    const move = client.records("session").find(({ record }) =>
+      (record as { topic?: unknown }).topic === "playbook.trace" &&
+      (record as { payload?: { playbookId?: unknown; payload?: { to?: unknown } } }).payload?.playbookId === "code" &&
+      (record as { payload?: { payload?: { to?: unknown } } }).payload?.payload?.to === "failed");
+    assert.ok(move, "the run's own move into its failure state streams");
+    // The session's own entry: an interrupted-band failure, parked, with
+    // the runtime's cause, naming no intent (core-service-49).
+    const standIn = (await client.expectOk("ledger.get", {})).attention.filter((entry) => entry.sessionId === own.id);
+    assert.deepEqual(
+      standIn.map((entry) => [entry.band, entry.kind, entry.parked, entry.intentId, entry.turnId]),
+      [["interrupted", "failure", true, undefined, 1]],
+    );
+    assert.equal(typeof standIn[0]?.cause?.code, "string", "the entry carries the cause the runtime attached");
+    assert.equal(standIn[0]?.since, move.record.timestamp, "the entry's onset is the move, not the later error");
+
+    // The same park under an intent: interrupted on the failure, never
+    // finished awaiting a verdict, its session's summary failed.
+    const intent = await client.expectOk("intent.queue", { projectId: project.id, text: "Add another line to work.txt" });
+    const dispatched = await client.expectOk("session.create", { projectId: project.id });
+    await client.expectOk("turn.submit", { sessionId: dispatched.id, text: intent.text, intentId: intent.id });
+    await settledSession(client, dispatched.id, 1);
+    const ledger = await client.expectOk("ledger.get", {});
+    const row = ledger.intents.find((entry) => entry.intent.id === intent.id);
+    assert.equal(row?.state, "interrupted");
+    assert.equal(row?.reason, "failure");
+    const entries = ledger.attention.filter((entry) => entry.sessionId === dispatched.id);
+    assert.deepEqual(
+      entries.map((entry) => [entry.band, entry.kind, entry.parked, entry.intentId]),
+      [["interrupted", "failure", true, intent.id]],
+    );
+    // Its onset is its own run's move, ahead of the core's record.
+    const { records: dispatchedRecords } = await client.expectOk("history.get", { sessionId: dispatched.id });
+    const dispatchedMove = dispatchedRecords.find(({ record }) =>
+      (record as { topic?: unknown }).topic === "playbook.trace" &&
+      (record as { payload?: { playbookId?: unknown } }).payload?.playbookId === "code" &&
+      (record as { payload?: { payload?: { to?: unknown } } }).payload?.payload?.to === "failed");
+    assert.ok(dispatchedMove, "the dispatched run's own move into its failure state is stored");
+    assert.ok(dispatchedRecords.some(({ record }) => record.type === "runtime_error" && record.timestamp > dispatchedMove.record.timestamp),
+      "the core's own record follows the move");
+    assert.equal(entries[0]?.since, dispatchedMove.record.timestamp);
+    assert.equal((await client.expectOk("session.list", {})).find((entry) => entry.id === dispatched.id)?.failed, true);
+  },
+);
+
+test(
+  "core-service-134: the core names the turn for its own failures within one, and none for one before its turn started",
+  { timeout: 180_000 },
+  async (t) => {
+    const harness = await startHarness(VALID_CONFIG, {
+      captainScript: async (turn, context, session) => {
+        if (turn.prompt.includes("explode")) throw new Error("the Captain exploded");
+        await session.emitStatus(`◇ turn ${turn.id}`);
+        await context.callCaptain(`route: ${turn.prompt}`, { visibility: "hidden" });
+        await context.callPlayer("dev.coder", `${turn.prompt}`);
+        await context.emitReply("Finished the scripted turn.");
+      },
+    });
+    const client = new Client(harness.service.port());
+    t.after(async () => {
+      client.close();
+      await harness.service.stop();
+    });
+    await client.open();
+    const project = await client.expectOk("project.register", { path: harness.projectDir });
+    const errorsOf = async (sessionId: string) =>
+      (await client.expectOk("history.get", { sessionId })).records.flatMap(({ record }) =>
+        record.type === "runtime_error" ? [record as unknown as { turnId: number | null; timestamp: number; message: string }] : []);
+
+    // A throw inside the turn: the runtime's record and the core's own
+    // both name it, and the session's own entry stands at the first.
+    const thrown = await client.expectOk("session.create", { projectId: project.id });
+    await client.expectOk("turn.submit", { sessionId: thrown.id, text: "explode it" });
+    await settledSession(client, thrown.id, 1);
+    const thrownErrors = await errorsOf(thrown.id);
+    assert.ok(thrownErrors.length >= 2, `the runtime and the core both record the throw; got ${JSON.stringify(thrownErrors)}`);
+    assert.deepEqual(thrownErrors.map((error) => error.turnId), thrownErrors.map(() => 1));
+    const standIn = (await client.expectOk("ledger.get", {})).attention.filter((entry) => entry.sessionId === thrown.id);
+    assert.deepEqual(standIn.map((entry) => [entry.band, entry.kind, entry.turnId, entry.since]),
+      [["interrupted", "failure", 1, thrownErrors[0]!.timestamp]]);
+
+    // An intent's turn finishes; a second intent's whitespace-only
+    // message then fails before its turn starts.
+    const later = await client.expectOk("session.create", { projectId: project.id });
+    const first = await client.expectOk("intent.queue", { projectId: project.id, text: "Tidy the changelog" });
+    await client.expectOk("turn.submit", { sessionId: later.id, text: first.text, intentId: first.id });
+    await settledSession(client, later.id, 1);
+    const second = await client.expectOk("intent.queue", { projectId: project.id, text: "Then the readme" });
+    await client.expectOk("turn.submit", { sessionId: later.id, text: "   ", intentId: second.id });
+    const deadline = Date.now() + 60_000;
+    let prestart: { turnId: number | null; message: string } | undefined;
+    while (!(prestart = (await errorsOf(later.id)).at(-1))) {
+      if (Date.now() > deadline) throw new Error("the pre-start failure was never recorded");
+      await sleep(50);
+    }
+    await harness.service["sessions"].settled(later.id);
+    assert.match(prestart.message, /must contain text/);
+    assert.equal(prestart.turnId, null, "a failure before any turn of its own started names none");
+    const ledger = await client.expectOk("ledger.get", {});
+    assert.equal(ledger.intents.find((entry) => entry.intent.id === first.id)?.state, "finished");
+    assert.deepEqual(
+      ledger.attention.filter((entry) => entry.sessionId === later.id).map((entry) => [entry.band, entry.kind, entry.intentId]),
+      [["finished", "finish", first.id]],
+    );
+    const queued = ledger.intents.find((entry) => entry.intent.id === second.id);
+    assert.equal(queued?.state, "queued");
+    assert.equal(queued?.next?.standing, "failed");
+    assert.equal((await client.expectOk("session.list", {})).find((entry) => entry.id === later.id)?.failed, true);
+  },
+);
+
+test(
+  "core-service-120: while the answer's turn runs, its session owes no restore and its question has left",
+  { timeout: 180_000 },
+  async (t) => {
+    // The real /code coder asks the Boss, and its resumed call holds
+    // long enough for the answer's turn to be read while it runs.
+    const harness = await startHarness(VALID_CONFIG, {
+      realShell: true,
+      script: askingScript({ delayMs: 1500 }),
+      seedCommit: true,
+    });
+    const client = new Client(harness.service.port());
+    t.after(async () => {
+      client.close();
+      await harness.service.stop();
+    });
+    await client.open();
+    const project = await client.expectOk("project.register", {
+      path: harness.projectDir,
+    });
+    const session = await client.expectOk("session.create", {
+      projectId: project.id,
+    });
+    await client.expectOk("subscribe", {
+      channel: { kind: "session", sessionId: session.id },
+    });
+    const listed = async () =>
+      (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+    await client.expectOk("turn.submit", { sessionId: session.id, text: ASKING.request });
+    const asked = await settledSession(client, session.id, 1);
+    // The settlement found the run waiting on the Boss and kept its
+    // park (core-service-32).
+    assert.equal(asked.parked?.reason, "question");
+    assert.equal(asked.recovery, undefined);
+
+    const mark = client.messages.length;
+    await client.expectOk("turn.submit", { sessionId: session.id, text: ASKING.answer });
+    await client.waitFor(
+      (m) =>
+        client.messages.indexOf(m) >= mark &&
+        m.type === "session.state" &&
+        m.session.id === session.id &&
+        m.session.turns === 2 &&
+        m.session.turnActive === true,
+    );
+    const running = await listed();
+    assert.equal(running?.turnActive, true);
+    // The checkpoint written ahead of the turn really reads uncertain
+    // now — the evidence a turn cut off would leave ...
+    const manifest = (await readSessionManifest(join(projectSessions(harness.dataDir), `${session.id}.json`))) as { state: string };
+    assert.equal(manifest.state, "uncertain");
+    // ... yet the summary reads the turn the core holds, listed and in
+    // every state reported since it was accepted: no interrupted turn,
+    // no reason to restore it, and the question it answers gone
+    // (core-service-32).
+    const reported = client.messages.slice(mark).flatMap((m) =>
+      m.type === "session.state" && m.session.id === session.id && m.session.turnActive
+        ? [m.session]
+        : []);
+    assert.ok(reported.length > 0);
+    for (const summary of [running, ...reported]) {
+      assert.equal(summary?.recovery, undefined, "no interrupted turn while it runs");
+      assert.equal(summary?.continuationReason, undefined, "no reason to restore it first");
+      assert.equal(summary?.parked, undefined, "the answered question has left");
+    }
+    assert.equal(
+      storedPrefs(harness.dataDir)[`session:${session.id}:parked`],
+      undefined,
+      "the park leaves the preferences when the answer is accepted",
+    );
+
+    // Settled, the run has finished: nothing is owed and nothing parks
+    // (core-service-32, core-service-91).
+    const answered = await settledSession(client, session.id, 2);
+    assert.equal(answered.recovery, undefined);
+    assert.equal(answered.parked, undefined);
+    assert.equal(answered.continuable, true, answered.continuationReason ?? "no reason given");
+    assert.equal((await listed())?.recovery, undefined);
+  },
+);
+
+test(
+  "core-service-105: the ending runs by fallback on a restored parked run, and deletion forgets its controls",
+  { timeout: 180_000 },
+  async (t) => {
+    const harness = await startHarness(VALID_CONFIG, {
+      realShell: true,
+      script: parkingScript(),
+      seedCommit: true,
+    });
+    const client = new Client(harness.service.port());
+    t.after(async () => {
+      client.close();
+      await harness.service.stop();
+    });
+    await client.open();
+    const project = await client.expectOk("project.register", {
+      path: harness.projectDir,
+    });
+    const session = await client.expectOk("session.create", {
+      projectId: project.id,
+    });
+    await client.expectOk("subscribe", {
+      channel: { kind: "session", sessionId: session.id },
+    });
+    await client.expectOk("turn.submit", {
+      sessionId: session.id,
+      text: "Add a line to work.txt",
+    });
+    const parked = await settledSession(client, session.id, 1);
+    assert.equal(parked.parked?.ending?.id, "give-up");
+
+    // No name: the first advertised control of that kind, as the
+    // interface that has not yet moved to named actions sends it.
+    await client.expectOk("session.control", {
+      sessionId: session.id,
+      kind: "ending",
+    });
+    const stopped = await settledSession(client, session.id, 2);
+    assert.equal(stopped.parked, undefined);
+    assert.equal(stopped.continuable, true, stopped.continuationReason ?? "no reason given");
+
+    // A Boss message continues the session the ending left behind, and
+    // its own run parks the same way.
+    await client.expectOk("turn.submit", {
+      sessionId: session.id,
+      text: "Add another line to work.txt",
+    });
+    const reparked = await settledSession(client, session.id, 3);
+    assert.equal(reparked.parked?.reason, "failure");
+    assert.ok(
+      Object.hasOwn(storedPrefs(harness.dataDir), `session:${session.id}:parked`),
+      "the new park is published in its turn",
+    );
+
+    // Deleting the session — idle, though its run stands parked —
+    // forgets the reading with it (storage-5).
+    await client.expectOk("session.delete", { sessionId: session.id });
+    assert.ok(
+      !Object.hasOwn(storedPrefs(harness.dataDir), `session:${session.id}:parked`),
+      "no reading outlives the session it describes",
+    );
+  },
+);
+
+// ---------------------------------------------------------------------------
+// CORE-13: malformed messages leave the connection open with no state change
+// ---------------------------------------------------------------------------
+
+test("CORE-13: invalid messages get error replies and the connection survives", async () => {
+  const harness = await startHarness();
+  const client = new Client(harness.service.port());
+  await client.open();
+
+  client.sendRaw("{not json");
+  const errorReply = await client.waitFor(
+    (m) => m.type === "reply" && !m.ok,
+  );
+  assert.equal(errorReply.type, "reply");
+  if (errorReply.type === "reply" && !errorReply.ok) {
+    assert.equal(errorReply.error.code, "invalid_message");
+  }
+
+  // Connection still serves commands.
+  const projects = await client.expectOk("project.list", {});
+  assert.deepEqual(projects, []);
+
+  client.close();
+  await harness.service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// CORE-63: one core per state root
+// ---------------------------------------------------------------------------
+
+test("core-service-63: a second core service on a held root refuses naming the holder, and a fresh start succeeds after stop", async () => {
+  const dir = scratchDir("spex-root-");
+  const options = {
+    token: "test",
+    configPath: join(dir, "playbook.config.yaml"),
+    dataDir: join(dir, "state"),
+    env: {},
+    home: join(dir, "home"),
+    watchConfig: false,
+  };
+  const first = await CoreService.start(options);
+  await assert.rejects(
+    CoreService.start(options),
+    (error: Error) => {
+      assert.match(error.message, /held by pid/);
+      assert.match(error.message, new RegExp(String(process.pid)));
+      return true;
+    },
+  );
+  await first.stop();
+  // The stopped service's lease stands retired, permanently (storage-26).
+  const retired = join(options.dataDir, ".lease.retired");
+  assert.equal(readdirSync(retired).length, 1);
+  const third = await CoreService.start(options);
+  await third.stop();
+  assert.equal(readdirSync(retired).length, 2);
+  assert.equal(existsSync(join(options.dataDir, ".lease")), false);
+
+  // A lease a killed process of this machine left is reclaimed by the
+  // next start: the child takes the root with this home's identity.
+  const identity = readFileSync(join(options.home, ".local", "state", "playbook", "machine-id"), "utf8").trim();
+  const holder = spawn(process.execPath, ["--input-type=module", "--eval", `
+    import { acquireRootLease } from ${JSON.stringify(new URL("./root-lease.js", import.meta.url).href)};
+    acquireRootLease(${JSON.stringify(options.dataDir)}, { machineIdentity: ${JSON.stringify(identity)} });
+    process.stdout.write("held\\n");
+    setInterval(() => {}, 1000);
+  `], { stdio: ["ignore", "pipe", "inherit"] });
+  await new Promise<void>((resolveHeld) => holder.stdout?.once("data", () => resolveHeld()));
+  holder.kill("SIGKILL");
+  await new Promise<void>((resolveExit) => holder.once("exit", () => resolveExit()));
+  const fourth = await CoreService.start(options);
+  await fourth.stop();
+  assert.equal(readdirSync(retired).length, 4);
+
+  // Another machine's identity is never broken, and is named as one.
+  mkdirSync(join(options.dataDir, ".lease"), { mode: 0o700 });
+  writeFileSync(join(options.dataDir, ".lease", "owner.json"), JSON.stringify({ pid: 4242, hostname: `machine-id:v1:${randomUUID()}`, acquiredAt: Date.now(), token: randomUUID() }), { mode: 0o600 });
+  await assert.rejects(CoreService.start(options), /held by another machine \(identity machine-id:v1:/);
+  rmSync(join(options.dataDir, ".lease"), { recursive: true });
+
+  // An unusable identity file refuses the start naming it, before the
+  // lease is inspected. The identity is read once per process, so the
+  // unusable one belongs to another home.
+  const brokenHome = join(dir, "broken-home");
+  const identityFile = join(brokenHome, ".local", "state", "playbook", "machine-id");
+  mkdirSync(dirname(identityFile), { recursive: true, mode: 0o700 });
+  writeFileSync(identityFile, "nonsense\n", { mode: 0o600 });
+  const brokenDataDir = join(dir, "broken-state");
+  await assert.rejects(CoreService.start({ ...options, home: brokenHome, dataDir: brokenDataDir }), (error: Error) => {
+    assert.match(error.message, /^Spex cannot identify this computer: /);
+    assert.ok(error.message.includes(identityFile));
+    return true;
+  });
+  assert.equal(existsSync(join(brokenDataDir, ".lease")), false);
+  assert.equal(readFileSync(identityFile, "utf8"), "nonsense\n");
+});
+
+// ---------------------------------------------------------------------------
+// CORE-64: the legacy library relocation riding the import
+// ---------------------------------------------------------------------------
+
+test("core-service-64: a legacy library relocates into the root with config from paths rewritten and comments kept", async () => {
+  const dir = scratchDir("spex-lib-");
+  const legacyLib = join(dir, "legacy-lib");
+  mkdirSync(join(legacyLib, "demo"), { recursive: true });
+  writeFileSync(join(legacyLib, "demo", "demo.registry.mjs"), "export default {};\n");
+  const configPath = join(dir, "playbook.config.yaml");
+  writeFileSync(
+    configPath,
+    "# hand-written comment that must survive\n" +
+      "playbooks:\n" +
+      "  demo:\n" +
+      `    from: ${join(legacyLib, "demo", "demo.registry.mjs")}\n` +
+      "    roles: {}\n",
+  );
+  const dataDir = join(dir, "state");
+  const service = await CoreService.start({
+    token: "test",
+    configPath,
+    dataDir,
+    legacyLibraryDir: legacyLib,
+    env: {},
+    home: join(dir, "home"),
+    watchConfig: false,
+  });
+  const relocated = join(dataDir, "playbooks", "demo", "demo.registry.mjs");
+  assert.ok(existsSync(relocated), "the library file relocated into the root");
+  assert.ok(!existsSync(legacyLib), "the legacy directory is gone after the move");
+  const rewritten = readFileSync(configPath, "utf8");
+  assert.equal(resolve(dirname(configPath), parseYaml(rewritten).playbooks.demo.from), relocated, "the relative module locator follows the library");
+  assert.ok(
+    rewritten.includes("# hand-written comment that must survive"),
+    "comments survive the rewrite",
+  );
+  await service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// CORE-60/65: sessions another host wrote into the shared session store
+// ---------------------------------------------------------------------------
+
+/** A captain-session record and replay stream as the playbook CLI writes
+ * them: `<id>.json` naming the working directory, `<id>.records.jsonl`
+ * carrying the history in the shared v1 envelope. */
+function writeForeignSession(
+  sessionsDir: string,
+  id: string,
+  cwd: string,
+  records: Record<string, unknown>[],
+): void {
+  writeForeignRecordEntries(
+    sessionsDir,
+    id,
+    cwd,
+    records.map((record) => ({ record })),
+  );
+}
+
+function writeForeignRecordEntries(
+  sessionsDir: string,
+  id: string,
+  cwd: string,
+  entries: { record: Record<string, unknown>; role?: string }[],
+): void {
+  mkdirSync(sessionsDir, { recursive: true });
+  writeFileSync(
+    join(sessionsDir, `${id}.json`),
+    JSON.stringify({ schemaVersion: 6, sessionId: id, state: "settled", cwd }), {mode:0o600},
+  );
+  writeFileSync(
+    join(sessionsDir, `${id}.records.jsonl`),
+    entries
+      .map((entry, index) =>
+        JSON.stringify({ v: 1, seq: index + 1, ...entry }),
+      )
+      .join("\n") + "\n", {mode:0o600},
+  );
+}
+
+test("core-service-103: stored call spans fold to per-agent active time", async (t) => {
+  const dir = scratchDir("spex-agent-active-");
+  const projectDir = join(dir, "project");
+  mkdirSync(projectDir);
+  execFileSync("git", ["init", "-q", projectDir]);
+  // Another host writes into the session store of the spex repository
+  // the project pairs with (storage-6).
+  const { sessionsDir } = pairedHome(join(dir, "state"), projectDir);
+  const configPath = join(dir, "playbook.config.yaml");
+  writeFileSync(configPath, VALID_CONFIG);
+
+  const measuredId = "10300000-0000-4000-8000-000000000001";
+  const noPairId = "10300000-0000-4000-8000-000000000002";
+  const incompleteId = "10300000-0000-4000-8000-000000000003";
+  const measured: { record: Record<string, unknown>; role?: string }[] = [
+    { record: { type: "turn_started", turnId: 1, turn: { id: 1, prompt: "measure calls" }, timestamp: 0 } },
+    { record: { type: "captain_prompt", turnId: 1, prompt: "route", visibility: "hidden", timestamp: 50 } },
+    { record: { type: "player_prompt", turnId: 1, playerId: "dev.shared", prompt: "code", timestamp: 100 }, role: "code.coder" },
+    { record: { type: "player_prompt", turnId: 1, playerId: "dev.other", prompt: "review", timestamp: 200 }, role: "review.reviewer" },
+    { record: { type: "player_event", turnId: 1, playerId: "dev.shared", timestamp: 300, event: { type: "done", payload: { durationMs: 9_999 } } }, role: "code.coder" },
+    { record: { type: "captain_finished", turnId: 1, visibility: "hidden", timestamp: 450, result: { status: "success" } } },
+    { record: { type: "player_finished", turnId: 1, playerId: "dev.shared", timestamp: 600, result: { status: "success" } }, role: "code.coder" },
+    { record: { type: "player_prompt", turnId: 1, playerId: "dev.shared", prompt: "review", timestamp: 650 }, role: "review.reviewer" },
+    { record: { type: "player_event", turnId: 1, playerId: "dev.shared", timestamp: 700, event: { type: "tool_result", payload: { durationMs: 8_888 } } }, role: "review.reviewer" },
+    { record: { type: "player_finished", turnId: 1, playerId: "dev.other", timestamp: 800, result: { status: "aborted" } }, role: "review.reviewer" },
+    { record: { type: "player_finished", turnId: 1, playerId: "dev.shared", timestamp: 900, result: { status: "error" } }, role: "review.reviewer" },
+    { record: { type: "turn_finished", turnId: 1, timestamp: 1_000 } },
+    { record: { type: "turn_started", turnId: 2, turn: { id: 2, prompt: "edge cases" }, timestamp: 1_100 } },
+    { record: { type: "player_prompt", turnId: 2, playerId: "dev.zero", prompt: "zero", timestamp: 1_200 } },
+    { record: { type: "player_finished", turnId: 2, playerId: "dev.zero", timestamp: 1_200, result: { status: "success" } } },
+    { record: { type: "player_prompt", turnId: 2, playerId: "dev.backward", prompt: "backward", timestamp: 1_400 } },
+    { record: { type: "player_finished", turnId: 2, playerId: "dev.backward", timestamp: 1_300, result: { status: "success" } } },
+    { record: { type: "player_finished", turnId: 2, playerId: "dev.backward", timestamp: 1_500, result: { status: "success" } } },
+    { record: { type: "player_prompt", turnId: 2, playerId: "dev.prior", prompt: "measured", timestamp: 1_600 } },
+    { record: { type: "player_finished", turnId: 2, playerId: "dev.prior", timestamp: 1_700, result: { status: "success" } } },
+    { record: { type: "player_finished", turnId: 2, playerId: "dev.prior", timestamp: 1_800, result: { status: "success" } } },
+    { record: { type: "player_prompt", turnId: 2, playerId: "dev.invalid", prompt: "ignored", timestamp: "bad" } },
+    { record: { type: "player_prompt", turnId: 2, playerId: "dev.invalid", prompt: "valid", timestamp: 1_900 } },
+    { record: { type: "player_finished", turnId: 2, playerId: "dev.invalid", timestamp: "bad", result: { status: "success" } } },
+    { record: { type: "player_finished", turnId: 2, playerId: "dev.invalid", timestamp: 2_200, result: { status: "success" } } },
+    { record: { type: "turn_finished", turnId: 2, timestamp: 2_250 } },
+    { record: { type: "turn_started", turnId: 3, turn: { id: 3, prompt: "unfinished calls" }, timestamp: 2_260 } },
+    { record: { type: "player_prompt", turnId: 2, playerId: "dev.later", prompt: "dangling", timestamp: 2_300 } },
+    { record: { type: "player_prompt", turnId: 3, playerId: "dev.later", prompt: "matched", timestamp: 2_400 } },
+    { record: { type: "player_finished", turnId: 3, playerId: "dev.later", timestamp: 2_600, result: { status: "success" } } },
+    { record: { type: "player_prompt", turnId: 3, playerId: "dev.open", prompt: "still open", timestamp: 2_700 } },
+    { record: { type: "player_finished", turnId: 3, playerId: "dev.none", timestamp: 2_800, result: { status: "success" } } },
+  ];
+  writeForeignRecordEntries(sessionsDir, measuredId, projectDir, measured);
+  writeForeignSession(sessionsDir, noPairId, projectDir, [
+    { type: "player_prompt", turnId: 1, playerId: "dev.never", prompt: "open", timestamp: 10 },
+    { type: "player_finished", turnId: 2, playerId: "dev.never", timestamp: 20, result: { status: "success" } },
+  ]);
+  writeForeignSession(sessionsDir, incompleteId, projectDir, [
+    { type: "captain_prompt", turnId: 1, prompt: "measured prefix", timestamp: 10, visibility: "hidden" },
+    { type: "captain_finished", turnId: 1, timestamp: 20, visibility: "hidden", result: { status: "success" } },
+  ]);
+  appendFileSync(join(sessionsDir, `${incompleteId}.records.jsonl`), '{"v":1,"seq":3\n');
+
+  const service = await CoreService.start({
+    token: "test",
+    configPath,
+    dataDir: join(dir, "state"),
+    env: {},
+    home: join(dir, "home"),
+    watchConfig: true,
+  });
+  const client = new Client(service.port());
+  t.after(async () => {
+    client.close();
+    await service.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  await client.open();
+  await client.expectOk("project.register", { path: projectDir });
+
+  const sessions = await client.expectOk("session.list", {});
+  const folded = sessions.find((session) => session.id === measuredId);
+  assert.deepEqual(folded?.agentActiveMs, {
+    captain: 400,
+    "dev.shared": 750,
+    "dev.other": 600,
+    "dev.zero": 0,
+    "dev.backward": 0,
+    "dev.prior": 100,
+    "dev.invalid": 300,
+    "dev.later": 200,
+  });
+  assert.ok(
+    (folded?.agentActiveMs?.["dev.shared"] ?? 0) +
+      (folded?.agentActiveMs?.["dev.other"] ?? 0) > 1_000,
+    "overlapping player spans remain whole rather than partitioning the turn",
+  );
+  assert.ok(!Object.hasOwn(folded?.agentActiveMs ?? {}, "dev.open"));
+  assert.ok(!Object.hasOwn(folded?.agentActiveMs ?? {}, "dev.none"));
+  assert.equal(sessions.find((session) => session.id === noPairId)?.agentActiveMs, undefined);
+  const incomplete = sessions.find((session) => session.id === incompleteId);
+  assert.notEqual(incomplete?.streamIncompleteAfterSeq, undefined);
+  assert.equal(incomplete?.agentActiveMs, undefined);
+
+  const visible = await client.expectOk("history.get", { sessionId: measuredId });
+  assert.ok(
+    !visible.records.some((entry) => entry.record.type === "captain_prompt" || entry.record.type === "captain_finished"),
+    "the Captain's hidden calls contribute without leaking into visible replay",
+  );
+
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId: measuredId } });
+  const stream = join(sessionsDir, `${measuredId}.records.jsonl`);
+  const finishSeq = measured.length + 1;
+  appendFileSync(stream, JSON.stringify({
+    v: 1,
+    seq: finishSeq,
+    record: { type: "player_finished", turnId: 3, playerId: "dev.open", timestamp: 3_100, result: { status: "success" } },
+  }) + "\n");
+  await client.waitFor((message) =>
+    message.type === "session.state" && message.session.id === measuredId &&
+    message.session.agentActiveMs?.["dev.open"] === 400,
+  );
+  await client.waitFor((message) =>
+    message.type === "record" && message.sessionId === measuredId && message.seq === finishSeq,
+  );
+
+  appendFileSync(stream, `{"v":1,"seq":${finishSeq + 1}\n`);
+  await client.waitFor((message) =>
+    message.type === "session.state" && message.session.id === measuredId &&
+    message.session.streamIncompleteAfterSeq !== undefined &&
+    message.session.agentActiveMs === undefined,
+  );
+});
+
+test("core-service-116: stored init reports fold to the model each agent's runtime named", async (t) => {
+  const dir = scratchDir("spex-reported-models-");
+  const projectDir = join(dir, "project");
+  mkdirSync(projectDir);
+  execFileSync("git", ["init", "-q", projectDir]);
+  // Another host writes into the session store of the spex repository
+  // the project pairs with (storage-6).
+  const { sessionsDir } = pairedHome(join(dir, "state"), projectDir);
+  const configPath = join(dir, "playbook.config.yaml");
+  writeFileSync(configPath, VALID_CONFIG);
+
+  // An execution context as the stream records it: every model and
+  // effort a complete selection, and each role binding resolved. The
+  // fold keeps a call's adapter and model setting, never its effort.
+  const pick = (value?: string) => value === undefined ? { kind: "provider-default" } : { kind: "value", value };
+  const block = (model?: string, effort?: string, fastMode?: boolean) =>
+    ({ adapter: "claude", model: pick(model), effort: pick(effort), ...(fastMode === undefined ? {} : { fastMode }) });
+  const context = (
+    timestamp: number,
+    captain: Record<string, unknown>,
+    players: Record<string, Record<string, unknown>>,
+    roles: Record<string, { playerId: string; model?: string }>,
+  ) => ({
+    type: "session_context", timestamp, contextVersion: 1, captainId: "captain-session",
+    configuration: {
+      schemaVersion: 2,
+      captain,
+      players: Object.entries(players).map(([id, agent]) => ({ id, ...agent })),
+      catalog: { code: { id: "code", roles: Object.fromEntries(Object.entries(roles).map(([role, binding]) =>
+        [role, { playerId: binding.playerId, model: pick(binding.model), effort: pick() }])) } },
+    },
+    graphs: [], initialVisible: [],
+  });
+  const init = (playerId: string | undefined, timestamp: number, payload: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    playerId === undefined
+      ? { type: "captain_event", turnId: 1, timestamp, visibility: "hidden", event: { type: "init", payload }, ...extra }
+      : { type: "player_event", turnId: 1, playerId, timestamp, event: { type: "init", payload }, ...extra };
+
+  const reportedId = "11600000-0000-4000-8000-000000000001";
+  const silentId = "11600000-0000-4000-8000-000000000002";
+  const incompleteId = "11600000-0000-4000-8000-000000000003";
+  const reported: Record<string, unknown>[] = [
+    context(10, block("opus", "high"), {
+      "dev.coder": block(),
+      "dev.other": block("gpt-5.6-sol", "high", true),
+      "dev.shared": block("sonnet"),
+    }, { coder: { playerId: "dev.coder" }, lead: { playerId: "dev.shared", model: "opus" }, helper: { playerId: "dev.shared", model: "sonnet" } }),
+    { type: "turn_started", turnId: 1, turn: { id: 1, prompt: "first" }, timestamp: 20 },
+    { type: "captain_prompt", turnId: 1, prompt: "route", visibility: "hidden", timestamp: 30 },
+    init(undefined, 31, { model: "opus", reportedModel: "claude-opus-5-5" }, { contextSeq: 1 }),
+    { type: "captain_finished", turnId: 1, visibility: "hidden", timestamp: 40, result: { status: "success" } },
+    { type: "player_prompt", turnId: 1, playerId: "dev.coder", prompt: "code", timestamp: 50 },
+    init("dev.coder", 51, { model: "unknown", reportedModel: "claude-opus-5-5" }, { contextSeq: 1 }),
+    { type: "player_prompt", turnId: 1, playerId: "dev.shared", prompt: "lead", timestamp: 60 },
+    init("dev.shared", 61, { model: "opus", reportedModel: "claude-opus-5-5" }, { contextSeq: 1 }),
+    { type: "player_prompt", turnId: 1, playerId: "dev.other", prompt: "review", timestamp: 70 },
+    init("dev.other", 71, { model: "gpt-5.6-sol" }, { contextSeq: 1 }),
+    { type: "turn_finished", turnId: 1, timestamp: 80 },
+    // A second turn opens on changed settings.
+    context(90, block("sonnet", "high"), {
+      "dev.coder": block("haiku"),
+      "dev.other": block("gpt-6-astra", "max", false),
+      "dev.shared": block("sonnet"),
+    }, { coder: { playerId: "dev.coder", model: "haiku" }, helper: { playerId: "dev.shared", model: "sonnet" } }),
+    { type: "turn_started", turnId: 2, turn: { id: 2, prompt: "second" }, timestamp: 100 },
+    // The Captain's runtime names no model this time: its earlier
+    // report stands, with the settings that call began under.
+    init(undefined, 110, { model: "sonnet" }, { contextSeq: 13 }),
+    // A record naming the earlier context reads that one...
+    init("dev.coder", 120, { model: "unknown", reportedModel: "claude-opus-5-6" }, { contextSeq: 1 }),
+    // ...and one naming none reads the latest context before it.
+    init("dev.other", 130, { model: "gpt-6-astra", reportedModel: "gpt-6-astra-2026-09" }),
+    { type: "turn_finished", turnId: 2, timestamp: 140 },
+  ];
+  writeForeignSession(sessionsDir, reportedId, projectDir, reported);
+  writeForeignSession(sessionsDir, silentId, projectDir, [
+    context(10, block("opus"), { "dev.coder": block() }, { coder: { playerId: "dev.coder" } }),
+    init(undefined, 20, { model: "opus" }),
+    init("dev.coder", 30, { model: "unknown", reportedModel: "" }),
+  ]);
+  writeForeignSession(sessionsDir, incompleteId, projectDir, [
+    context(10, block("opus"), { "dev.coder": block() }, { coder: { playerId: "dev.coder" } }),
+    init(undefined, 20, { model: "opus", reportedModel: "claude-opus-5-5" }),
+  ]);
+  appendFileSync(join(sessionsDir, `${incompleteId}.records.jsonl`), '{"v":1,"seq":3\n');
+
+  const service = await CoreService.start({
+    token: "test", configPath, dataDir: join(dir, "state"), env: {}, home: join(dir, "home"), watchConfig: true,
+  });
+  const client = new Client(service.port());
+  t.after(async () => {
+    client.close();
+    await service.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  await client.open();
+  await client.expectOk("project.register", { path: projectDir });
+
+  const sessions = await client.expectOk("session.list", {});
+  assert.deepEqual(sessions.find((session) => session.id === reportedId)?.agentReportedModels, {
+    captain: { model: "claude-opus-5-5", settings: { adapter: "claude", model: "opus" } },
+    "dev.coder": { model: "claude-opus-5-6", settings: { adapter: "claude", model: false } },
+    "dev.other": { model: "gpt-6-astra-2026-09", settings: { adapter: "claude", model: "gpt-6-astra" } },
+  }, "a lane its bindings run on two models names none, and a silent call leaves the earlier report");
+  assert.equal(sessions.find((session) => session.id === silentId)?.agentReportedModels, undefined);
+  const incomplete = sessions.find((session) => session.id === incompleteId);
+  assert.notEqual(incomplete?.streamIncompleteAfterSeq, undefined);
+  assert.equal(incomplete?.agentReportedModels, undefined);
+
+  // The hidden Captain report leaks nothing into the visible replay.
+  const visible = await client.expectOk("history.get", { sessionId: reportedId });
+  assert.ok(!visible.records.some((entry) => entry.record.type === "captain_event"));
+
+  // A report stored later is folded and published as it lands.
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId: reportedId } });
+  appendFileSync(join(sessionsDir, `${reportedId}.records.jsonl`), JSON.stringify({
+    v: 1, seq: reported.length + 1,
+    record: init("dev.other", 150, { model: "gpt-6-astra", reportedModel: "gpt-6-astra-2026-10" }),
+  }) + "\n");
+  await client.waitFor((message) =>
+    message.type === "session.state" && message.session.id === reportedId &&
+    message.session.agentReportedModels?.["dev.other"]?.model === "gpt-6-astra-2026-10",
+  );
+});
+
+test("core-service-116: a live session's runtime reports reach its summary as sent", async (t) => {
+  const harness = await startHarness(
+    VALID_CONFIG.replace("captain:\n  adapter: claude\n  model: claude-test", "captain:\n  adapter: claude\n  model: claude-captain"),
+    {
+      script: {
+        rules: [{ match: "route:", response: { result: '{"decision":"dispatch"}' } }],
+        fallback: { deltas: ["done"], result: "done" },
+        reportModel: (requested) => requested === undefined ? undefined : `${requested}@runtime`,
+      },
+    },
+  );
+  const client = new Client(harness.service.port());
+  t.after(async () => {
+    client.close();
+    await harness.service.stop();
+    rmSync(harness.dir, { recursive: true, force: true });
+  });
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  const session = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId: session.id } });
+  await client.expectOk("turn.submit", { sessionId: session.id, text: "build it" });
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && m.session.turns === 1 && m.session.live === false);
+
+  const first = (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+  assert.deepEqual(first?.agentReportedModels, {
+    captain: { model: "claude-captain@runtime", settings: { adapter: "claude", model: "claude-captain" } },
+    "dev.coder": { model: "claude-test@runtime", settings: { adapter: "claude", model: "claude-test" } },
+  });
+  const history = await client.expectOk("history.get", { sessionId: session.id });
+  const report = history.records.find((entry) =>
+    entry.record.type === "player_event" && (entry.record as { event: { type: string } }).event.type === "init");
+  assert.equal((report?.record as { event?: { payload?: { reportedModel?: unknown } } } | undefined)?.event?.payload?.reportedModel,
+    "claude-test@runtime", "the record keeps the report as the runtime sent it");
+
+  // This conversation's own model for the player: its next call reports
+  // under the new settings.
+  await client.expectOk("session.agent.set", { sessionId: session.id, agentId: "dev.coder", model: "claude-tuned" });
+  await client.expectOk("turn.submit", { sessionId: session.id, text: "and again" });
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && m.session.turns === 2 && m.session.live === false);
+  const second = (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+  assert.deepEqual(second?.agentReportedModels?.["dev.coder"], {
+    model: "claude-tuned@runtime", settings: { adapter: "claude", model: "claude-tuned" },
+  });
+});
+
+/** The lease directory the CLI guards a writer with: `.<id>.lock`
+ * holding `owner.json` naming the pid and host. */
+function writeForeignLease(
+  sessionsDir: string,
+  id: string,
+  owner: { pid: number; hostname: string },
+): string {
+  const lock = join(sessionsDir, `.${id}.lock`);
+  mkdirSync(lock, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    join(lock, "owner.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      kind: "captain-session-lease",
+      sessionId: id,
+      ownerToken: "11111111-2222-4333-8444-555555555555",
+      ...owner,
+      acquiredAt: new Date().toISOString(),
+    }), {mode:0o600},
+  );
+  return lock;
+}
+
+/** A pid that has already exited, so a lease naming it is dead. */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ["-e", ""]);
+  if (child.pid === undefined) throw new Error("no child pid");
+  return child.pid;
+}
+
+function foreignTurn(prompt: string): Record<string, unknown>[] {
+  return [
+    {
+      type: "turn_started",
+      turnId: 1,
+      turn: { id: 1, prompt },
+      timestamp: 1000,
+    },
+    {
+      type: "captain_prompt",
+      turnId: 1,
+      timestamp: 1500,
+      prompt: "routing",
+      visibility: "hidden",
+    },
+    { type: "turn_finished", turnId: 1, timestamp: 2000 },
+  ];
+}
+
+test("core-service-60: sessions another host wrote are served, bound to their project by the clone that holds them", async () => {
+  const dir = scratchDir("spex-foreign-");
+  const projectDir = join(dir, "project");
+  mkdirSync(projectDir);
+  execFileSync("git", ["init", "-q", projectDir]);
+  // Another host writes into the session store of the spex repository
+  // the project pairs with (storage-6).
+  const { sessionsDir } = pairedHome(join(dir, "state"), projectDir);
+  const configPath = join(dir, "playbook.config.yaml");
+  writeFileSync(configPath, VALID_CONFIG);
+
+  // One session is already there when the service starts...
+  const atStartup = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+  writeForeignSession(sessionsDir, atStartup, projectDir, foreignTurn("from the terminal"));
+  // ...one recorded in a directory no project is registered for, yet
+  // held by the project's clone, so the project's all the same
+  // (storage-6)...
+  const elsewhere = "ccccccc1-3333-4333-8333-cccccccccccc";
+  writeForeignSession(sessionsDir, elsewhere, join(dir, "elsewhere"), foreignTurn("elsewhere"));
+  // ...and one in a clone no folder pairs — your own group's — whose
+  // records stay unlisted though its directory is the project's
+  // (storage-12).
+  const unpaired = "ccccccc2-3333-4333-8333-cccccccccccc";
+  writeForeignSession(join(clonePath(join(dir, "state"), `${OWN}/${OWN}-spex`), "sessions"), unpaired, projectDir, foreignTurn("unpaired"));
+
+  const service = await CoreService.start({
+    token: "test",
+    configPath,
+    dataDir: join(dir, "state"),
+    env: {},
+    home: join(dir, "home"),
+    // The sessions watcher rides the same option as the config watcher.
+    watchConfig: true,
+  });
+  const client = new Client(service.port());
+  await client.open();
+  const project = await client.expectOk("project.register", { path: projectDir });
+  // Registering the project lists the history its clone already holds,
+  // with no new record needed.
+  const afterRegister = await client.expectOk("session.list", {});
+  assert.ok(afterRegister.some((s: SessionInfo) => s.id === atStartup));
+
+  // A record that lands while the service runs binds on arrival.
+  const arrival = "bbbbbbb2-2222-4222-8222-bbbbbbbbbbbb";
+  writeForeignSession(sessionsDir, arrival, projectDir, foreignTurn("while running"));
+
+  const listed = await client.waitFor(
+    (m) =>
+      m.type === "session.state" &&
+      (m as { session: SessionInfo }).session.id === arrival,
+  );
+  assert.ok(listed, "an arrival while running is announced");
+
+  // A record written before the CLI teed its stream carries only its
+  // Boss journal; it lists from that (core-service-60).
+  const journaled = "ddddddd4-4444-4444-8444-dddddddddddd";
+  writeFileSync(
+    join(sessionsDir, `${journaled}.json`),
+    JSON.stringify({
+      schemaVersion: 3,
+      kind: "captain-session",
+      sessionId: journaled,
+      state: "settled",
+      cwd: projectDir,
+      createdAt: "2026-08-29T01:35:22.228Z",
+      updatedAt: "2026-08-29T14:39:13.668Z",
+      snapshot: {
+        journal: [
+          { seq: 1, turnId: 1, kind: "boss", payload: "Resolve issue 42" },
+          { seq: 2, turnId: 1, kind: "action", payload: "{}" },
+          { seq: 3, turnId: 1, kind: "reply", payload: "Kicked off /code." },
+          { seq: 4, turnId: 2, kind: "boss", payload: "Continue with /review" },
+          { seq: 5, turnId: 2, kind: "reply", payload: "Review passed." },
+        ],
+      },
+    }), {mode:0o600},
+  );
+  await client.waitFor(
+    (m) =>
+      m.type === "session.state" &&
+      (m as { session: SessionInfo }).session.id === journaled,
+  );
+
+  const sessions = await client.expectOk("session.list", {});
+  const ids = sessions.map((s: SessionInfo) => s.id);
+  const fromJournal = sessions.find((s: SessionInfo) => s.id === journaled);
+  assert.equal(fromJournal?.title, "Resolve issue 42");
+  assert.equal(fromJournal?.turns, 2);
+  const journalHistory = await client.expectOk("history.get", { sessionId: journaled });
+  assert.deepEqual(
+    journalHistory.records.map((r: StoredRecord) => r.record.type),
+    ["turn_started", "captain_reply", "turn_finished", "turn_started", "captain_reply", "turn_finished"],
+  );
+  assert.ok(ids.includes(atStartup), "the session present at startup is served");
+  assert.ok(ids.includes(arrival), "the session that arrived is served");
+  assert.equal(
+    sessions.find((s: SessionInfo) => s.id === elsewhere)?.projectId,
+    project.id,
+    "a session is its clone's project's, whatever its working directory",
+  );
+  assert.ok(
+    !ids.includes(unpaired),
+    "a session of a clone no folder pairs is not listed",
+  );
+  const served = sessions.find((s: SessionInfo) => s.id === atStartup);
+  assert.equal(served?.live, false, "another host's session is never live here");
+  assert.equal(served?.title, "from the terminal", "the title folds from the stream");
+  assert.equal(served?.turns, 1);
+
+  // Hidden records stay off the session channel on replay (CORE-10).
+  const history = await client.expectOk("history.get", { sessionId: atStartup });
+  assert.deepEqual(
+    history.records.map((r: StoredRecord) => r.record.type),
+    ["turn_started", "turn_finished"],
+  );
+
+  // CORE-65: this core writes none of another host's files.
+  const before = readFileSync(join(sessionsDir, `${atStartup}.records.jsonl`), "utf8");
+  assert.ok(!existsSync(join(sessionsDir, `${atStartup}.spex.json`)));
+  client.close();
+  await service.stop();
+  assert.equal(
+    readFileSync(join(sessionsDir, `${atStartup}.records.jsonl`), "utf8"),
+    before,
+    "the foreign stream is byte-identical afterwards",
+  );
+});
+
+test("core-service-62: CLI stream changes refresh history and subscribers without duplicating folds or writing foreign files", async (t) => {
+  const dir = scratchDir("spex-foreign-refresh-");
+  const projectDir = join(dir, "project");
+  mkdirSync(projectDir);
+  execFileSync("git", ["init", "-q", projectDir]);
+  // Another host writes into the session store of the spex repository
+  // the project pairs with (storage-6).
+  const { sessionsDir } = pairedHome(join(dir, "state"), projectDir);
+  const configPath = join(dir, "playbook.config.yaml");
+  writeFileSync(configPath, VALID_CONFIG);
+  const sessionId = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+  const manifest = join(sessionsDir, `${sessionId}.json`);
+  const stream = join(sessionsDir, `${sessionId}.records.jsonl`);
+  const opening = { type: "captain_status", turnId: null, message: "ready", timestamp: 1000 };
+  writeForeignSession(sessionsDir, sessionId, projectDir, [opening]);
+  // Sorting ahead of the healthy manifest exposed the old whole-scan
+  // catch, which let one malformed neighbor hide every later session.
+  const malformed = join(sessionsDir, "00000000-0000-4000-8000-000000000000.json");
+  writeFileSync(malformed, '{"sessionId":');
+  const invalidStreamId = "00000000-0000-4000-8000-000000000001";
+  writeForeignSession(sessionsDir, invalidStreamId, projectDir, [opening]);
+  const invalidStream = join(sessionsDir, `${invalidStreamId}.records.jsonl`);
+  const invalidStreamBefore = '{"v":1,"seq":1,"record":null}\n';
+  writeFileSync(invalidStream, invalidStreamBefore);
+  const manifestBefore = readFileSync(manifest, "utf8");
+  const malformedBefore = readFileSync(malformed, "utf8");
+
+  const service = await CoreService.start({
+    token: "test",
+    configPath,
+    dataDir: join(dir, "state"),
+    env: {},
+    home: join(dir, "home"),
+    watchConfig: true,
+  });
+  const client = new Client(service.port());
+  t.after(async () => {
+    client.close();
+    await service.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  await client.open();
+  await client.expectOk("project.register", { path: projectDir });
+  const initial = (await client.expectOk("session.list", {})).find((session) => session.id === sessionId);
+  assert.ok(initial, "a malformed neighbor hides no healthy session");
+  assert.equal(initial.title, undefined);
+  assert.equal(initial.turns, 0);
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId } });
+  await client.expectOk("subscribe", { channel: { kind: "debug", sessionId } });
+
+  const usage = (turnId: number, timestamp: number, input: number, output: number) => ({
+    type: "player_event",
+    playerId: "dev.coder",
+    turnId,
+    timestamp,
+    event: {
+      type: "done",
+      payload: { usage: { tokens: { totals: { input: { total: input }, output: { total: output } } }, toolUses: 1 } },
+    },
+  });
+  const firstTurn = [
+    { type: "turn_started", turnId: 1, turn: { id: 1, prompt: "first terminal turn" }, timestamp: 2000 },
+    { type: "captain_prompt", turnId: 1, prompt: "routing", visibility: "hidden", timestamp: 3000 },
+    { type: "captain_reply", turnId: 1, text: "first reply", timestamp: 4000 },
+    { type: "captain_finished", turnId: 1, visibility: "hidden", timestamp: 4500, result: { status: "ok", turnId: 1 } },
+    usage(1, 5000, 10, 4),
+    { type: "turn_finished", turnId: 1, timestamp: 6000 },
+  ];
+  const secondStart = { type: "turn_started", turnId: 2, turn: { id: 2, prompt: "second terminal turn" }, timestamp: 7000 };
+  const line = (seq: number, record: Record<string, unknown>) => JSON.stringify({ v: 1, seq, record });
+  // Only the stream changes. The parseable last record is deliberately
+  // not newline-terminated, just as a reader can catch an append.
+  appendFileSync(stream, firstTurn.map((record, index) => line(index + 2, record)).join("\n") + "\n" + line(8, secondStart));
+  // Continuing directory activity must not postpone this stream's
+  // subscriber updates until the writer goes quiet.
+  const activity = setInterval(() => writeFileSync(malformed, malformedBefore), 25);
+  try {
+    await client.waitFor((message) => message.type === "session.state" && message.session.id === sessionId && message.session.turns === 1);
+    await client.waitFor((message) => message.type === "record" && message.sessionId === sessionId && message.seq === 7);
+  } finally {
+    clearInterval(activity);
+  }
+  const first = (await client.expectOk("session.list", {})).find((session) => session.id === sessionId);
+  assert.equal(first?.title, "first terminal turn");
+  assert.equal(first?.turns, 1, "the unterminated second turn is not read");
+  assert.deepEqual(first?.agentActiveMs, { captain: 1500 });
+  const firstHistory = await client.expectOk("history.get", { sessionId });
+  assert.deepEqual(firstHistory.records.map((entry) => entry.seq), [1, 2, 4, 6, 7]);
+  assert.deepEqual(client.records("session").map((entry) => entry.seq), [2, 4, 6, 7]);
+  assert.deepEqual(client.records("debug").map((entry) => entry.seq), [3, 5]);
+  assert.equal((await client.expectOk("usage.get", { sessionId })).inputTokens, 10);
+
+  appendFileSync(stream, "\n");
+  await client.waitFor((message) => message.type === "session.state" && message.session.id === sessionId && message.session.turns === 2);
+  await client.waitFor((message) => message.type === "record" && message.sessionId === sessionId && message.seq === 8);
+  assert.equal((await client.expectOk("history.get", { sessionId })).records.at(-1)?.seq, 8);
+  const secondEnd = [usage(2, 8000, 6, 2), { type: "turn_finished", turnId: 2, timestamp: 9000 }];
+  appendFileSync(stream, secondEnd.map((record, index) => line(index + 9, record)).join("\n") + "\n");
+  await client.waitFor((message) => message.type === "session.state" && message.session.id === sessionId && message.session.endedAt === 9000);
+  await client.waitFor((message) => message.type === "record" && message.sessionId === sessionId && message.seq === 10);
+  const completeHistory = await client.expectOk("history.get", { sessionId });
+  const expectedUsage = await client.expectOk("usage.get", { sessionId });
+  assert.equal(expectedUsage.inputTokens, 16);
+  assert.equal(expectedUsage.outputTokens, 6);
+  assert.equal(expectedUsage.toolUses, 2);
+  const announced = client.messages.filter((message) => message.type === "session.state").length;
+
+  // Registering an existing project synchronously rescans the directory.
+  // Repeated notifications/read cycles must neither inflate usage nor
+  // send the same records or unchanged session state again.
+  for (let count = 0; count < 3; count += 1) {
+    await client.expectOk("project.register", { path: projectDir });
+    assert.deepEqual(await client.expectOk("usage.get", { sessionId }), expectedUsage);
+    assert.deepEqual(await client.expectOk("history.get", { sessionId }), completeHistory);
+    const rescanned = (await client.expectOk("session.list", {}))
+      .find((session) => session.id === sessionId);
+    assert.deepEqual(rescanned?.agentActiveMs, { captain: 1500 });
+  }
+  assert.deepEqual(client.records("session").map((entry) => entry.seq), [2, 4, 6, 7, 8, 9, 10]);
+  assert.equal(client.messages.filter((message) => message.type === "session.state").length, announced);
+
+  // A replacement is a new readable history, not a second addition to
+  // the prior fold. It announces state but emits no invented append.
+  const replacement = [
+    opening,
+    { ...firstTurn[0], turn: { id: 1, prompt: "replaced terminal history" } },
+    ...firstTurn.slice(1, 3),
+    { ...firstTurn[3], timestamp: 5500 },
+    ...firstTurn.slice(4),
+  ];
+  writeFileSync(stream, replacement.map((record, index) => line(index + 1, record)).join("\n") + "\n");
+  await client.waitFor((message) => message.type === "session.state" && message.session.id === sessionId && message.session.title === "replaced terminal history");
+  const resetIndex = client.messages.findIndex((message) => message.type === "session.history-replaced" && message.sessionId === sessionId);
+  const stateIndex = client.messages.findIndex((message) => message.type === "session.state" && message.session.id === sessionId && message.session.title === "replaced terminal history");
+  assert.ok(resetIndex >= 0 && resetIndex < stateIndex, "history replacement is announced before its summary");
+  const replaced = (await client.expectOk("session.list", {})).find((session) => session.id === sessionId);
+  assert.equal(replaced?.turns, 1);
+  assert.deepEqual(replaced?.agentActiveMs, { captain: 2500 });
+  assert.equal((await client.expectOk("usage.get", { sessionId })).inputTokens, 10);
+  const replacedHistory = await client.expectOk("history.get", { sessionId });
+  assert.deepEqual(replacedHistory.records.map((entry) => entry.seq), [1, 2, 4, 6, 7]);
+  assert.deepEqual(client.records("session").map((entry) => entry.seq), [2, 4, 6, 7, 8, 9, 10]);
+
+  const streamAfterExternalWrites = (await readSessionReplay(stream)).toString("utf8");
+  client.close();
+  await service.stop();
+  assert.equal((await readSessionReplay(stream)).toString("utf8"), streamAfterExternalWrites);
+  assert.equal(readFileSync(manifest, "utf8"), manifestBefore);
+  assert.equal(readFileSync(malformed, "utf8"), malformedBefore);
+  assert.equal(readFileSync(invalidStream, "utf8"), invalidStreamBefore);
+  assert.ok(!existsSync(join(sessionsDir, `${sessionId}.spex.json`)));
+});
+
+
+// ---------------------------------------------------------------------------
+// CORE-70/71: session deletion
+// ---------------------------------------------------------------------------
+
+test("core-service-85: a rebind keeps the clone's sessions listed, and a recorded path alias decides only where they continue", async () => {
+  const harness = await startHarness();
+  const client = new Client(harness.service.port());
+  try {
+    await client.open();
+    const project = await client.expectOk("project.register", { path: harness.projectDir });
+    const session = await client.expectOk("session.create", { projectId: project.id });
+    await client.expectOk("subscribe", { channel: { kind: "session", sessionId: session.id } });
+    await client.expectOk("turn.submit", { sessionId: session.id, text: "first" });
+    await settledSession(client, session.id, 1);
+    const history = await client.expectOk("history.get", { sessionId: session.id });
+    const paths = ["json", "replay.json", "hints.json"].map((suffix) => join(projectSessions(harness.dataDir), `${session.id}.${suffix}`));
+    const before = paths.map((path) => existsSync(path) ? readFileSync(path) : undefined);
+    const relocated = join(harness.dir, "relocated-project");
+    mkdirSync(relocated);
+    execFileSync("git", ["init", "-q", relocated]);
+
+    // Rebound without the recorded path: the clone still holds the
+    // session, so it stays the project's with its history (storage-6)...
+    await client.expectOk("project.rebind", { projectId: project.id, path: relocated, aliases: [] });
+    const kept = (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+    assert.equal(kept?.projectId, project.id);
+    assert.equal(kept?.projectPath, relocated);
+    assert.equal(kept?.continuable, undefined);
+    assert.match(kept?.continuationReason ?? "", /continue it on the computer whose folder it ran in/);
+    assert.ok(client.messages.some((message) => message.type === "session.state" && message.session.id === session.id &&
+      message.session.projectPath === relocated && !message.session.continuable &&
+      /continue it on the computer whose folder it ran in/.test(message.session.continuationReason ?? "")));
+    assert.deepEqual(await client.expectOk("history.get", { sessionId: session.id }), history);
+    // ...but it ran in a directory that is neither the folder nor an
+    // alias, so it cannot continue here (core-service-73).
+    const refused = await client.command("turn.submit", { sessionId: session.id, text: "second" });
+    assert.ok(!refused.ok && refused.error.code === "invalid_request", JSON.stringify(refused));
+    assert.match(refused.error.message, /continue it on the computer whose folder it ran in/);
+    assert.deepEqual(paths.map((path) => existsSync(path) ? readFileSync(path) : undefined), before);
+
+    // The recorded path as an alias passes the folder rule
+    // (core-service-85); the checkpoint, recorded in another directory
+    // than the folder it would now run in, is then Playbook's to refuse
+    // as a relocation, its history still readable (core-service-73).
+    await client.expectOk("project.rebind", { projectId: project.id, path: relocated, aliases: [harness.projectDir] });
+    const aliasReading = (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+    assert.equal(aliasReading?.continuable, undefined);
+    assert.match(aliasReading?.continuationReason ?? "", /relocation is unsupported/);
+    const relocation = await client.command("turn.submit", { sessionId: session.id, text: "second" });
+    assert.ok(!relocation.ok && relocation.error.code === "invalid_request", JSON.stringify(relocation));
+    assert.doesNotMatch(relocation.error.message, /continue it on the computer whose folder it ran in/);
+    assert.match(relocation.error.message, /relocation is unsupported/);
+    assert.deepEqual(await client.expectOk("history.get", { sessionId: session.id }), history);
+    assert.equal((await client.expectOk("session.list", {})).find((entry) => entry.id === session.id)?.projectId, project.id);
+    await client.expectOk("project.rebind", {projectId: project.id, path: harness.projectDir, aliases: []});
+    assert.equal((await client.expectOk("session.list", {})).find((entry) => entry.id === session.id)?.continuable, true);
+    assert.deepEqual(paths.map((path) => existsSync(path) ? readFileSync(path) : undefined), before);
+
+    // A sync/editor can change the binding before the watcher runs.
+    const homePath = join(harness.dataDir, "home.yaml");
+    const homeBytes = readFileSync(homePath);
+    const home = parseYaml(homeBytes.toString("utf8"));
+    home.folders.find((folder: {repository: string}) => folder.repository === project.id).path = relocated;
+    writeFileSync(homePath, stringifyYaml(home));
+    const edited = (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+    assert.equal(edited?.projectPath, relocated);
+    assert.equal(edited?.continuable, undefined);
+    assert.match(edited?.continuationReason ?? "", /continue it on the computer whose folder it ran in/);
+    writeFileSync(homePath, homeBytes);
+    assert.equal((await client.expectOk("session.list", {})).find((entry) => entry.id === session.id)?.continuable, true);
+  } finally {
+    client.close();
+    await harness.service.stop();
+    rmSync(harness.dir, { recursive: true, force: true });
+  }
+});
+
+test("core-service-71: session.delete removes an ended session and its traces, refuses a live one, and refuses another host's while its lease is held", async () => {
+  const harness = await startHarness();
+  const sessionsDir = projectSessions(harness.dataDir);
+  const client = new Client(harness.service.port());
+  await client.open();
+  const watcher = new Client(harness.service.port());
+  await watcher.open();
+
+  // A session another host wrote into the project's clone, adopted when
+  // the folder registers again: a paired folder selects its pair, and
+  // the registration rescans (storage-6, core-service-60).
+  const foreignId = "eeeeeee5-5555-4555-8555-eeeeeeeeeeee";
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  writeForeignSession(sessionsDir, foreignId, harness.projectDir, foreignTurn("from the terminal"));
+  assert.equal((await client.expectOk("project.register", { path: harness.projectDir })).id, project.id);
+
+  // A settled session that served an intent, with its runtime released.
+  const ended = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("subscribe", {
+    channel: { kind: "session", sessionId: ended.id },
+  });
+  const served = await client.expectOk("intent.queue", {
+    projectId: project.id,
+    text: "Served by the session to delete",
+  });
+  await client.expectOk("turn.submit", {
+    sessionId: ended.id,
+    text: "hello",
+    intentId: served.id,
+  });
+  const finished = await client.waitFor(
+    (m) => m.type === "record" && m.sessionId === ended.id && m.record.type === "turn_finished",
+  );
+  const turnId = finished.type === "record" ? (finished.record.turnId ?? -1) : -1;
+  await client.expectOk("session.viewed", { sessionId: ended.id, turnId });
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === ended.id && m.session.turns === 1 && !m.session.turnActive && !m.session.live);
+  const live = await client.expectOk("session.create", { projectId: project.id });
+
+  const sidecar = join(sessionsDir, `${ended.id}.json`);
+  const stream = join(sessionsDir, `${ended.id}.replay.json`);
+  const prefsFile = join(harness.dataDir, "local", "prefs.json");
+  assert.ok(existsSync(sidecar) && existsSync(stream), "the ended session's files exist");
+  assert.ok(readFileSync(prefsFile, "utf8").includes(`viewed:${ended.id}`));
+
+  // The live session ends first (core-service-70).
+  const busy = await client.command("session.delete", { sessionId: live.id });
+  assert.ok(!busy.ok && busy.error.code === "busy");
+
+  // Another host's session is listed as such (core-service-32); while
+  // a live writer holds its lease it is refused busy naming the
+  // holder, its files byte-identical (core-service-75).
+  const listedForeign = (await client.expectOk("session.list", {})).find(
+    (s: SessionInfo) => s.id === foreignId,
+  );
+  assert.equal(listedForeign?.live, false, "CLI history has the same ended session shape");
+  assert.equal(ended.foreign, undefined, "a session this core ran is not");
+  writeForeignLease(sessionsDir, foreignId, { pid: process.pid, hostname: hostname() });
+  const manifestBefore = readFileSync(join(sessionsDir, `${foreignId}.json`), "utf8");
+  const streamBefore = readFileSync(join(sessionsDir, `${foreignId}.records.jsonl`), "utf8");
+  const refused = await client.command("session.delete", { sessionId: foreignId });
+  assert.ok(!refused.ok && refused.error.code === "busy");
+  assert.ok(!refused.ok && refused.error.message.includes(String(process.pid)));
+  assert.equal(readFileSync(join(sessionsDir, `${foreignId}.json`), "utf8"), manifestBefore);
+  assert.equal(readFileSync(join(sessionsDir, `${foreignId}.records.jsonl`), "utf8"), streamBefore);
+
+  // The ended session deletes: files, listing, history, viewed marker.
+  await client.expectOk("session.delete", { sessionId: ended.id });
+  assert.ok(!existsSync(sidecar) && !existsSync(stream), "the files are gone");
+  const listed = await client.expectOk("session.list", {});
+  assert.ok(!listed.some((s: SessionInfo) => s.id === ended.id), "dropped from the listing");
+  assert.ok(listed.some((s: SessionInfo) => s.id === live.id), "the live session stays");
+  const history = await client.command("history.get", { sessionId: ended.id });
+  assert.ok(!history.ok && history.error.code === "not_found");
+  assert.ok(!readFileSync(prefsFile, "utf8").includes(`viewed:${ended.id}`));
+  const removed = await watcher.waitFor(
+    (m) => m.type === "session.removed" && m.sessionId === ended.id,
+  );
+  assert.equal(
+    removed.type === "session.removed" ? removed.projectId : undefined,
+    project.id,
+    "subscribed clients learn the removal",
+  );
+  const again = await client.command("session.delete", { sessionId: ended.id });
+  assert.ok(!again.ok && again.error.code === "not_found");
+
+  // The intent the session served re-derives as queued (core-service-49).
+  await client.waitFor(
+    (m) => m.type === "intents.changed" && m.projectIds.includes(project.id),
+  );
+  const ledger = await client.expectOk("ledger.get", {});
+  assert.equal(
+    ledger.intents.find((entry) => entry.intent.id === served.id)?.state,
+    "queued",
+  );
+
+  // A restart serves nothing of it, and still serves the other host's.
+  client.close();
+  watcher.close();
+  await harness.service.stop();
+  const restarted = await CoreService.start({
+    token: "test",
+    configPath: join(harness.dir, "playbook.config.yaml"),
+    dataDir: harness.dataDir,
+    env: {},
+    home: join(harness.dir, "home"),
+    watchConfig: false,
+  });
+  const client2 = new Client(restarted.port());
+  await client2.open();
+  const afterRestart = (await client2.expectOk("session.list", {})).map((s: SessionInfo) => s.id);
+  assert.ok(!afterRestart.includes(ended.id));
+  assert.ok(afterRestart.includes(foreignId));
+  client2.close();
+  await restarted.stop();
+});
+
+// ---------------------------------------------------------------------------
+// CORE-70/75/76/78: deleting another host's session, and its vanishing
+// ---------------------------------------------------------------------------
+
+test("core-service-78: another host's session deletes lease-free, its lock dirs untouched, and one that vanishes leaves the listing", async () => {
+  const dir = scratchDir("spex-foreign-delete-");
+  const projectDir = join(dir, "project");
+  mkdirSync(projectDir);
+  execFileSync("git", ["init", "-q", projectDir]);
+  // Another host writes into the session store of the spex repository
+  // the project pairs with (storage-6).
+  const { sessionsDir } = pairedHome(join(dir, "state"), projectDir);
+  const configPath = join(dir, "playbook.config.yaml");
+  writeFileSync(configPath, VALID_CONFIG);
+
+  const held = "f0000001-1111-4111-8111-f00000000001";
+  const released = "f0000002-2222-4222-8222-f00000000002";
+  const abroad = "f0000003-3333-4333-8333-f00000000003";
+  const vanishing = "f0000004-4444-4444-8444-f00000000004";
+  for (const id of [held, released, abroad, vanishing]) {
+    writeForeignSession(sessionsDir, id, projectDir, foreignTurn(`terminal ${id}`));
+  }
+  // A dead pid on this host holds nothing; a retired lease beside it
+  // is the CLI's own transient and stays.
+  const releasedLock = writeForeignLease(sessionsDir, released, {
+    pid: deadPid(),
+    hostname: hostname(),
+  });
+  const retired = join(sessionsDir, `.${released}.lock.retired.aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee`);
+  mkdirSync(retired, { recursive: true, mode:0o700 });
+  writeFileSync(join(retired, "owner.json"), JSON.stringify({schemaVersion:1,kind:"captain-session-lease",sessionId:released,ownerToken:"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",pid:deadPid(),hostname:hostname(),acquiredAt:new Date().toISOString()}), {mode:0o600});
+  // Another host's lease can never be probed: it always holds.
+  writeForeignLease(sessionsDir, abroad, { pid: 1, hostname: "elsewhere.invalid" });
+
+  const service = await CoreService.start({
+    token: "test",
+    configPath,
+    dataDir: join(dir, "state"),
+    env: {},
+    home: join(dir, "home"),
+    watchConfig: true,
+  });
+  const client = new Client(service.port());
+  await client.open();
+  const watcher = new Client(service.port());
+  await watcher.open();
+  const project = await client.expectOk("project.register", { path: projectDir });
+  const listed = (await client.expectOk("session.list", {})).map((s: SessionInfo) => s.id);
+  for (const id of [held, released, abroad, vanishing]) {
+    assert.ok(listed.includes(id), `${id} is served`);
+  }
+
+  // Lease-free: the record and the stream go, the lock directories
+  // stay, and subscribed clients learn the removal (core-service-70).
+  await client.expectOk("session.delete", { sessionId: released });
+  assert.ok(!existsSync(join(sessionsDir, `${released}.json`)), "the record is gone");
+  assert.ok(!existsSync(join(sessionsDir, `${released}.records.jsonl`)), "the stream is gone");
+  assert.ok(!existsSync(releasedLock), "the shared owner reclaims and releases the dead lease");
+  assert.ok(existsSync(join(retired, "owner.json")), "a retired lease is never removed");
+  const removed = await watcher.waitFor(
+    (m) => m.type === "session.removed" && m.sessionId === released,
+  );
+  assert.equal(removed.type === "session.removed" ? removed.projectId : undefined, project.id);
+  assert.ok(
+    !(await client.expectOk("session.list", {})).some((s: SessionInfo) => s.id === released),
+    "dropped from the listing",
+  );
+
+  // Held on another host: refused busy naming the holder (core-service-75).
+  const foreignHeld = await client.command("session.delete", { sessionId: abroad });
+  assert.ok(!foreignHeld.ok && foreignHeld.error.code === "busy", JSON.stringify(foreignHeld));
+  assert.ok(!foreignHeld.ok && foreignHeld.error.message.includes("elsewhere.invalid"));
+  assert.ok(existsSync(join(sessionsDir, `${abroad}.json`)));
+
+  // Vanishing from the shared store while the service runs: the CLI
+  // removed it, and the listing follows (core-service-76).
+  rmSync(join(sessionsDir, `${vanishing}.json`));
+  rmSync(join(sessionsDir, `${vanishing}.records.jsonl`));
+  const gone = await watcher.waitFor(
+    (m) => m.type === "session.removed" && m.sessionId === vanishing,
+  );
+  assert.equal(gone.type === "session.removed" ? gone.projectId : undefined, project.id);
+  assert.ok(
+    !(await client.expectOk("session.list", {})).some((s: SessionInfo) => s.id === vanishing),
+  );
+  const history = await client.command("history.get", { sessionId: vanishing });
+  assert.ok(!history.ok && history.error.code === "not_found");
+  // The others are untouched by either event.
+  assert.ok(existsSync(join(sessionsDir, `${held}.records.jsonl`)));
+
+  client.close();
+  watcher.close();
+  await service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// CORE-72/73/74/77: an ended session continues on a Boss message
+// ---------------------------------------------------------------------------
+
+/** The turn ids a session's history holds, in order. */
+function turnIds(records: StoredRecord[]): number[] {
+  return records
+    .filter((entry) => entry.record.type === "turn_started")
+    .map((entry) => (entry.record as { turn: { id: number } }).turn.id);
+}
+
+test("core-service-22/62: opaque v1 records survive native restart and CLI replay without truncating history", async (t) => {
+  const harness = await startHarness();
+  let service = harness.service;
+  let client = new Client(service.port());
+  t.after(async () => {
+    client.close();
+    await service.stop();
+    rmSync(harness.dir, { recursive: true, force: true });
+  });
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  const native = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId: native.id } });
+  await client.expectOk("turn.submit", { sessionId: native.id, text: "known native turn" });
+  await client.waitFor((message) => message.type === "record" && message.sessionId === native.id && message.record.type === "turn_finished");
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === native.id && m.session.turns === 1 && !m.session.turnActive && !m.session.live);
+  const nativeUsage = await client.expectOk("usage.get", { sessionId: native.id });
+  const nativeActive = (await client.expectOk("session.list", {}))
+    .find((session) => session.id === native.id)?.agentActiveMs;
+  assert.ok(nativeActive, "the known native turn establishes an active-time fold");
+  client.close();
+  await service.stop();
+
+  const sessionsDir = projectSessions(harness.dataDir);
+  const nativeStream = join(sessionsDir, `${native.id}.records.jsonl`);
+  const original = (await readSessionReplay(nativeStream)).toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
+  const opaque = [
+    {},
+    { type: "future_context", playerId: "not-a-player", timestamp: 1700 },
+    { type: "opaque_record", nested: { retained: true } },
+    { type: 7, timestamp: "not a presentation timestamp" },
+    { type: "turn_started" },
+    { type: "player_event", playerId: "not-a-player" },
+    { type: "runtime_error", message: "not a presentation record" },
+  ];
+  const nativeEntries = [...original, ...opaque.map((record, index) => ({v:1,seq:original.length + index + 1,record}))];
+  const nativeBytes = nativeEntries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+  await writeSessionReplay(nativeStream, nativeBytes);
+
+  const foreignId = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+  const foreignRecords = [
+    opaque[0], ...foreignTurn("known CLI turn").slice(0, 1),
+    ...opaque.slice(1), ...foreignTurn("known CLI turn").slice(1), {},
+  ];
+  writeForeignSession(sessionsDir, foreignId, harness.projectDir, foreignRecords);
+  const foreignStream = join(sessionsDir, `${foreignId}.records.jsonl`);
+  // The released Playbook reader is the compatibility oracle, including
+  // its private-file boundary; no duplicate mock parser defines v1 here.
+  chmodSync(sessionsDir, 0o700);
+  chmodSync(foreignStream, 0o600);
+  const playbook = openSessionStore(sessionsDir);
+  const expectedForeign = (await playbook.readStream(foreignId)).entries;
+  assert.equal(expectedForeign.length, foreignRecords.length);
+  const foreignBytes = (await readSessionReplay(foreignStream)).toString("utf8");
+  const opaqueId = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+  writeForeignSession(sessionsDir, opaqueId, harness.projectDir, [{}, { type: "future" }]);
+  const createdAt = "2026-09-01T01:00:00.000Z";
+  const updatedAt = "2026-09-01T02:00:00.000Z";
+  writeFileSync(join(sessionsDir, `${opaqueId}.json`), JSON.stringify({
+    sessionId: opaqueId, cwd: harness.projectDir, createdAt, updatedAt,
+  }));
+
+  service = await CoreService.start({
+    token: "test", configPath: join(harness.dir, "playbook.config.yaml"),
+    dataDir: harness.dataDir, env: {}, home: join(harness.dir, "home"),
+    watchConfig: true,
+  });
+  client = new Client(service.port());
+  await client.open();
+  const sessions = await client.expectOk("session.list", {});
+  const nativeInfo = sessions.find((session) => session.id === native.id);
+  assert.equal(nativeInfo?.title, "known native turn");
+  assert.equal(nativeInfo?.turns, 1);
+  assert.equal(nativeInfo?.failed, false);
+  assert.equal(nativeInfo?.streamIncompleteAfterSeq, undefined);
+  assert.equal(nativeInfo?.continuable, true);
+  assert.deepEqual(nativeInfo?.agentActiveMs, nativeActive);
+  assert.ok(!Object.hasOwn(nativeInfo?.agentActiveMs ?? {}, "not-a-player"));
+  assert.equal((await readSessionManifest(join(sessionsDir, `${native.id}.json`))).replay.incomplete, false);
+  assert.deepEqual(await client.expectOk("usage.get", { sessionId: native.id }), nativeUsage);
+  const withoutEnvelopeVersion = ({ v: _v, ...entry }: { v: number }) => entry;
+  const visible = (entry: { record: object }) => (entry.record as { visibility?: unknown }).visibility !== "hidden";
+  assert.deepEqual((await client.expectOk("history.get", { sessionId: native.id })).records,
+    nativeEntries.filter(visible).map(withoutEnvelopeVersion));
+  assert.deepEqual((await client.expectOk("history.get", { sessionId: foreignId })).records,
+    expectedForeign.filter(visible).map(withoutEnvelopeVersion));
+  const foreignInfo = sessions.find((session) => session.id === foreignId);
+  assert.equal(foreignInfo?.title, "known CLI turn");
+  assert.equal(foreignInfo?.turns, 1);
+  assert.equal(foreignInfo?.failed, false);
+  assert.deepEqual(foreignInfo?.players, []);
+  assert.equal(foreignInfo?.agentActiveMs, undefined);
+  assert.equal(foreignInfo?.createdAt, 1000);
+  assert.equal(foreignInfo?.endedAt, 2000);
+  const opaqueInfo = sessions.find((session) => session.id === opaqueId);
+  assert.equal(opaqueInfo?.createdAt, Date.parse(createdAt));
+  assert.equal(opaqueInfo?.endedAt, Date.parse(updatedAt));
+  assert.equal(opaqueInfo?.turns, 0);
+
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId: foreignId } });
+  const appended = [{ type: "future" }, { type: "captain_reply", turnId: 1, timestamp: 3000, text: "after opaque records" }];
+  appendFileSync(foreignStream, appended.map((record, index) => JSON.stringify({
+    v: 1, seq: foreignRecords.length + index + 1, record,
+  })).join("\n") + "\n");
+  await client.waitFor((message) => message.type === "record" && message.sessionId === foreignId && message.seq === foreignRecords.length + 2);
+  assert.deepEqual(client.records("session").map((message) => message.record), appended);
+  assert.equal((await client.expectOk("history.get", { sessionId: foreignId })).records.at(-1)?.seq, foreignRecords.length + 2);
+  assert.equal((await readSessionReplay(nativeStream)).toString("utf8"), nativeBytes);
+  assert.ok((await readSessionReplay(foreignStream)).toString("utf8").startsWith(foreignBytes));
+  assert.ok(!existsSync(join(sessionsDir, `${foreignId}.spex.json`)));
+});
+
+test("core-service-22: damaged native streams remain readable but cannot continue after restart", async (t) => {
+  const harness = await startHarness();
+  let service = harness.service;
+  let client = new Client(service.port());
+  t.after(async () => {
+    client.close();
+    await service.stop();
+    rmSync(harness.dir, { recursive: true, force: true });
+  });
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  const envelope = (seq: number, v = 1) => JSON.stringify({
+    v, seq, record: { type: "captain_status", turnId: null, timestamp: 1, message: "unfinished append" },
+  });
+  const cases = [
+    { name: "unterminated record", suffix: (seq: number) => envelope(seq) },
+    { name: "torn JSON", suffix: () => '{"v":1,"seq":' },
+    { name: "malformed complete line", suffix: () => "{broken}\n" },
+    { name: "sequence gap", suffix: (seq: number) => envelope(seq + 1) + "\n" },
+    { name: "unknown version", suffix: (seq: number) => envelope(seq, 2) + "\n" },
+    { name: "non-object record", suffix: (seq: number) => JSON.stringify({ v: 1, seq, record: null }) + "\n" },
+    { name: "unknown envelope member", suffix: (seq: number) => JSON.stringify({ ...JSON.parse(envelope(seq)), extra: true }) + "\n" },
+    { name: "non-string role", suffix: (seq: number) => JSON.stringify({ ...JSON.parse(envelope(seq)), role: 7 }) + "\n" },
+    { name: "earlier incomplete marker", suffix: (seq: number) => envelope(seq), earlier: true },
+  ];
+  const damaged: {
+    id: string;
+    name: string;
+    stream: string;
+    sidecar: string;
+    bytes: string;
+    boundary: number;
+    history: CommandResults["history.get"];
+    earlier?: boolean;
+  }[] = [];
+  for (const example of cases) {
+    const session = await client.expectOk("session.create", { projectId: project.id });
+    await client.expectOk("subscribe", { channel: { kind: "session", sessionId: session.id } });
+    await client.expectOk("turn.submit", { sessionId: session.id, text: example.name });
+    await client.waitFor((message) => message.type === "record" && message.sessionId === session.id && message.record.type === "turn_finished");
+    await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && m.session.turns === 1 && !m.session.turnActive && !m.session.live);
+    const stream = join(projectSessions(harness.dataDir), `${session.id}.records.jsonl`);
+    const before = (await readSessionReplay(stream)).toString("utf8");
+    const records = before.trimEnd().split("\n").map((line) => JSON.parse(line) as StoredRecord);
+    const lastSeq = records.at(-1)?.seq ?? 0;
+    const history = await client.expectOk("history.get", { sessionId: session.id });
+    damaged.push({
+      id: session.id,
+      name: example.name,
+      stream,
+      sidecar: join(projectSessions(harness.dataDir), `${session.id}.json`),
+      bytes: before + example.suffix(lastSeq + 1),
+      boundary: (await readSessionManifest(join(projectSessions(harness.dataDir), `${session.id}.json`))).replay.seq,
+      history,
+      earlier: example.earlier,
+    });
+  }
+  client.close();
+  await service.stop();
+  for (const example of damaged) {
+    await writeSessionReplay(example.stream, example.bytes);
+    if (example.earlier) {
+      const meta = (await readSessionManifest(example.sidecar));
+      meta.replay.incomplete = true;
+      await writeSessionManifest(example.sidecar, meta);
+    }
+  }
+  service = await CoreService.start({
+    token: "test",
+    configPath: join(harness.dir, "playbook.config.yaml"),
+    dataDir: harness.dataDir,
+    adapterImports: fakeAdapterImports({ fallback: { result: "unexpected continuation" } }).imports,
+    adapterRuntime: () => ({ usable: true }),
+    captainFactory: async () => createScriptedCaptain(async () => {}),
+    env: {},
+    home: join(harness.dir, "home"),
+    watchConfig: false,
+  });
+  client = new Client(service.port());
+  await client.open();
+  const sessions = await client.expectOk("session.list", {});
+  for (const example of damaged) {
+    const listed = sessions.find((session) => session.id === example.id);
+    assert.equal(listed?.streamIncompleteAfterSeq, example.boundary, example.name);
+    assert.equal(listed?.continuable, undefined, example.name);
+    assert.equal(listed?.live, false, example.name);
+    assert.deepEqual(await client.expectOk("history.get", { sessionId: example.id }), example.history, example.name);
+    const refused = await client.command("turn.submit", { sessionId: example.id, text: "continue damaged history" });
+    assert.ok(!refused.ok, example.name);
+    assert.ok(!refused.ok && /incomplete|replay|checkpoint|damage/i.test(refused.error.message), example.name);
+    assert.equal((await readSessionReplay(example.stream)).toString("utf8"), example.bytes, example.name);
+    assert.ok(!existsSync(example.sidecar.replace(/\.json$/, ".spex.json")), "no desktop authority file");
+  }
+});
+
+test("core-service-77: a real session continues after restart and respects another active session", async (t) => {
+  const harness = await startHarness(VALID_CONFIG, {realShell:true});
+  let service = harness.service;
+  let client = new Client(service.port());
+  t.after(async () => {client.close(); await service.stop(); rmSync(harness.dir,{recursive:true,force:true});});
+  await client.open();
+  const project = await client.expectOk("project.register", {path:harness.projectDir});
+  const session = await client.expectOk("session.create", {projectId:project.id});
+  await client.expectOk("turn.submit", {sessionId:session.id,text:"first"});
+  // Settlement releases the runtime (core-service-91).
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && !m.session.live && m.session.turns === 1);
+  const stream = join(projectSessions(harness.dataDir),`${session.id}.records.jsonl`);
+  const before = (await readSessionReplay(stream)).toString("utf8");
+  client.close(); await service.stop();
+  service = await CoreService.start({token:"test",configPath:join(harness.dir,"playbook.config.yaml"),dataDir:harness.dataDir,adapterImports:fakeAdapterImports({fallback:{result:"continued answer"}}).imports,env:{},watchConfig:false});
+  client = new Client(service.port()); await client.open();
+  assert.equal((await client.expectOk("session.list",{})).find((item) => item.id === session.id)?.continuable,true);
+  // A freshly created session holds its runtime until its first turn
+  // settles, so the project refuses a message elsewhere, naming it.
+  const other = await client.expectOk("session.create",{projectId:project.id});
+  const busy = await client.command("turn.submit",{sessionId:session.id,text:"second"});
+  assert.ok(!busy.ok && busy.error.code === "busy");
+  assert.ok(!busy.ok && /still working|a session/.test(busy.error.message), busy.ok ? "" : busy.error.message);
+  await client.expectOk("session.dispose",{sessionId:other.id});
+  await client.expectOk("turn.submit",{sessionId:session.id,text:"second"});
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && !m.session.live && m.session.turns === 2);
+  assert.deepEqual(turnIds((await client.expectOk("history.get",{sessionId:session.id})).records),[1,2]);
+  assert.ok((await readSessionReplay(stream)).toString("utf8").startsWith(before),"continue appends to the same replay");
+});
+
+test("core-service-77: continuation summaries follow current configuration without opening or changing a session", async (t) => {
+  const base = VALID_CONFIG.slice(0, VALID_CONFIG.indexOf("  review:\n"));
+  const harness = await startHarness(base, {realShell: true, script: {fallback: {result: "not json on purpose"}}});
+  let service = harness.service;
+  let client = new Client(service.port());
+  t.after(async () => { client.close(); await service.stop(); rmSync(harness.dir, {recursive: true, force: true}); });
+  await client.open();
+  const project = await client.expectOk("project.register", {path: harness.projectDir});
+  const session = await client.expectOk("session.create", {projectId: project.id});
+  await client.expectOk("turn.submit", {sessionId: session.id, text: "first"});
+  const initial = await settledSession(client, session.id, 1);
+  assert.equal(initial.continuable, true);
+  assert.equal(initial.turnActive, false);
+  const history = await client.expectOk("history.get", {sessionId: session.id});
+  const sessionsDir = projectSessions(harness.dataDir);
+  const snapshot = (): unknown => readdirSync(sessionsDir, {recursive: true, encoding: "utf8"}).sort().map((name) => {
+    const path = join(sessionsDir, name);
+    const stat = statSync(path);
+    return [name, stat.mode, stat.isDirectory() ? null : [stat.mtimeMs, readFileSync(path)]];
+  });
+  const before = snapshot();
+  const constructed = harness.stats.constructed;
+  const runs = harness.stats.runs.length;
+  const changes: string[] = [];
+  const watcher = watch(sessionsDir, {recursive: true}, (event, name) => changes.push(`${event}:${name}`));
+  t.after(() => watcher.close());
+  const unchanged = async (): Promise<void> => {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(snapshot(), before, "checkpoint, replay, hints, assets and lease entries stay exact");
+    assert.deepEqual(changes, [], "no transient session lease or session-file write");
+    assert.equal(harness.stats.constructed, constructed, "no runtime constructed");
+    assert.equal(harness.stats.runs.length, runs, "no agent called");
+    assert.deepEqual(await client.expectOk("history.get", {sessionId: session.id}), history);
+  };
+  const listed = async (): Promise<SessionInfo | undefined> =>
+    (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+  const configPath = join(harness.dir, "playbook.config.yaml");
+
+  // Own tuning, session tuning and an unrelated playbook all preserve
+  // the stored-member projection. The config broadcast carries it too.
+  writeFileSync(configPath, base.replace("model: claude-test", "model: claude-tuned"));
+  await service.reloadConfig();
+  assert.equal((await listed())?.continuable, true);
+  await client.expectOk("session.agent.set", {sessionId: session.id, agentId: "dev.coder", model: "claude-session"});
+  assert.equal((await listed())?.continuable, true);
+  writeFileSync(configPath, base + "  review:\n    roles:\n      coder: dev.coder\n      reviewer: dev.coder\n");
+  await service.reloadConfig();
+  assert.equal((await listed())?.continuable, true);
+  await unchanged();
+
+  const broadcastStart = client.messages.length;
+  writeFileSync(configPath, base.replace(/dev\.coder/g, "dev.other"));
+  await service.reloadConfig();
+  const drifted = await listed();
+  assert.equal(drifted?.continuable, undefined);
+  assert.match(drifted?.continuationReason ?? "", /dev\.coder/);
+  assert.match(drifted?.continuationReason ?? "", /new session/);
+  assert.ok(client.messages.slice(broadcastStart).some((message) => message.type === "session.state" &&
+    message.session.id === session.id && message.session.continuationReason === drifted?.continuationReason));
+  await unchanged();
+
+  // No watcher or explicit reload: the next listing reads the current
+  // config, and an older negative reading cannot permanently block it.
+  writeFileSync(configPath, base);
+  assert.equal((await listed())?.continuable, true);
+  await unchanged();
+  // Conversely, a positive reading never admits a turn after a change.
+  writeFileSync(configPath, base.replace(/dev\.coder/g, "dev.other"));
+  const refused = await client.command("turn.submit", {sessionId: session.id, text: "must not run"});
+  assert.ok(!refused.ok && refused.error.code === "invalid_config");
+  assert.match(refused.error.message, /dev\.coder/);
+  await unchanged();
+  watcher.close();
+
+  // A restart derives the same current refusal, without a restoration.
+  client.close();
+  await service.stop();
+  service = await CoreService.start({token: "test", configPath, dataDir: harness.dataDir,
+    adapterImports: harness.imports, adapterRuntime: () => ({usable: true}), env: {},
+    home: join(harness.dir, "home"), own: OWN, watchConfig: false});
+  client = new Client(service.port());
+  await client.open();
+  assert.equal((await listed())?.continuable, undefined);
+  assert.match((await listed())?.continuationReason ?? "", /dev\.coder/);
+  assert.deepEqual(snapshot(), before);
+  assert.equal(harness.stats.constructed, constructed);
+  assert.equal(harness.stats.runs.length, runs);
+});
+
+test("core-service-77: continuation observations guard project inputs and preserve settlement and removals during races", async (t) => {
+  const harness = await startHarness(VALID_CONFIG, {realShell: true, script: {fallback: {result: "not json on purpose", delayMs: 50}}});
+  const client = new Client(harness.service.port());
+  let release = (): void => {};
+  t.after(async () => {release(); client.close(); await harness.service.stop(); rmSync(harness.dir, {recursive: true, force: true});});
+  await client.open();
+  const project = await client.expectOk("project.register", {path: harness.projectDir});
+  const session = await client.expectOk("session.create", {projectId: project.id});
+  await client.expectOk("turn.submit", {sessionId: session.id, text: "first"});
+  await settledSession(client, session.id, 1);
+  const store = harness.service["store"];
+  const repository = store.repository(project.id)!;
+  const shared = repository.store;
+  let afterValidation: (() => Promise<void>) | undefined;
+  repository.store = {...shared, validate: async (id, context) => {
+    const result = await shared.validate(id, context);
+    if (context && id === session.id) await afterValidation?.();
+    return result;
+  }};
+  // The project's lock stands at its working folder's root
+  // (environments-26).
+  const lock = join(harness.projectDir, "spex.lock");
+  const lockBytes = readFileSync(lock);
+  let edits = 0;
+  const editLock = (): void => {writeFileSync(lock, Buffer.concat([lockBytes, Buffer.from(`\n# concurrent edit ${++edits}\n`)]));};
+  // Composition has returned, but its lock still belongs to the
+  // reading while native checkpoint validation is awaited.
+  afterValidation = async () => {afterValidation = undefined; editLock();};
+  const raced = await client.command("session.list", {});
+  assert.ok(!raced.ok && raced.error.code === "conflict");
+  assert.match(raced.error.message, /changed/);
+  writeFileSync(lock, lockBytes);
+  assert.equal((await client.expectOk("session.list", {})).find((entry) => entry.id === session.id)?.continuable, true);
+
+  // Repeated concurrent edits cannot reject the durable settlement or
+  // lose its idle publication and queue-advancement notification.
+  const manager = harness.service["sessions"];
+  const onSettled = manager.onTurnSettled;
+  let settled = 0;
+  manager.onTurnSettled = (...args) => {settled += 1; return onSettled(...args);};
+  await client.expectOk("turn.submit", {sessionId: session.id, text: "second"});
+  afterValidation = async () => editLock();
+  const ended = await settledSession(client, session.id, 2);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(edits >= 3, "both background observation attempts raced");
+  assert.equal(ended.continuable, undefined);
+  assert.equal(ended.turnActive, false);
+  assert.match(ended.continuationReason ?? "", /changed/);
+  assert.equal(settled, 1, "successful turn still notifies queue advancement");
+  afterValidation = undefined;
+  writeFileSync(lock, lockBytes);
+  assert.equal((await client.expectOk("session.list", {})).find((entry) => entry.id === session.id)?.continuable, true);
+
+  // Deletion may finish while an idle reading is in flight. An old
+  // callback must not resurrect its state after session.removed.
+  let entered!: () => void;
+  const observed = new Promise<void>((resolve) => {entered = resolve;});
+  const gate = new Promise<void>((resolve) => {release = resolve;});
+  afterValidation = async () => {afterValidation = undefined; entered(); await gate;};
+  const publishing = manager.onSessionState(store.describeSession(session.id)!);
+  await observed;
+  await client.expectOk("session.delete", {sessionId: session.id});
+  const removed = client.messages.map((message) => message.type === "session.removed" && message.sessionId === session.id).lastIndexOf(true);
+  assert.ok(removed >= 0);
+  release();
+  await publishing;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(!client.messages.slice(removed + 1).some((message) => message.type === "session.state" && message.session.id === session.id));
+  assert.ok(!(await client.expectOk("session.list", {})).some((entry) => entry.id === session.id));
+});
+
+// The registry fixture imports the installed engine; only the external
+// providers are scripted. Public environment/config/session commands own
+// its loading, checkpoint release and continuation.
+test("core-service-77: a finished classified playbook reopens with exact new text and no prior-run exchanges", { timeout: 180_000 }, async (t) => {
+  const firstTask = "first classified task";
+  // A model-decided start may faithfully synthesize its standalone request.
+  // Assert raw Boss delivery and the selected child request separately.
+  const nextBoss = "  Start another classified fixture task.\n";
+  const nextTask = "  Perform another classified fixture task.\n";
+  const oldQuestion = "Which OLD_DATABASE should this run use?";
+  const oldAnswer = "Use OLD_SQLITE for this run.";
+  const playerPrompts: string[] = [];
+  const classificationPrompts: string[] = [];
+  const decisionPrompts: string[] = [];
+  const harness = await startHarness(VALID_CONFIG, {
+    realShell: true,
+    seedCommit: true,
+    script: {
+      rules: [
+        { match: "Task from classified fixture:", response: { result: "", resultFor: (prompt) => {
+          playerPrompts.push(prompt);
+          return playerPrompts.length === 1 ? oldQuestion : "Completed this run.";
+        } } },
+        { match: "Classify the following Boss message", response: { result: "", resultFor: (prompt) => {
+          classificationPrompts.push(prompt);
+          return JSON.stringify(playerPrompts.length === 1
+            ? { type: "BOSS_REPLY", questionId: "old-question" }
+            : { type: "START", mode: "build" });
+        } } },
+        { match: "Pick exactly one declared", response: { result: "", resultFor: () => JSON.stringify(
+          playerPrompts.length === 1 ? { guard: "needsBossReply" } : { guard: "completed" },
+        ) } },
+        { match: "Select exactly one action from the closed set", response: { result: "", resultFor: (prompt) => {
+          decisionPrompts.push(prompt);
+          return JSON.stringify(playerPrompts.length === 1 ? { action: "deliver" }
+            : { action: "start", playbookId: "probe", input: playerPrompts.length === 0 ? firstTask : nextTask });
+        } } },
+      ],
+      fallback: { result: "Finished the fixture turn." },
+    },
+  });
+  const client = new Client(harness.service.port());
+  t.after(async () => { client.close(); await harness.service.stop(); rmSync(harness.dir, { recursive: true, force: true }); });
+  await client.open();
+  const folder = join(harness.projectDir, "tools", "classified");
+  const artifact = join(folder, "playbooks", "en", "probe");
+  mkdirSync(artifact, { recursive: true });
+  writeFileSync(join(folder, "meta.yaml"), stringifyYaml({
+    format: 2, org: "fixture", name: "classified", version: "1.0.0",
+    description: "Classified-entry continuation integration fixture", license: "Apache-2.0",
+    artifacts: { probe: { kind: "playbook", language: "en" } },
+  }));
+  writeFileSync(join(artifact, "probe.md"), "# Probe\n\nA classified-entry integration fixture.\n");
+  writeFileSync(join(artifact, "probe.registry.mjs"), String.raw`
+import { assign, createMachine } from 'xstate';
+import { createXStatePlaybookRuntime, RUNTIME_ABI } from '@sublang/playbook/xstate-runtime';
+const meta = (stateId, role) => ({ playbook: { stateId, description: stateId, ...(role ? {role} : {}) } });
+const accepted = (target, outcome) => ({ type: 'playbook.acceptedOutcome', params: { source: 'work', target, acceptedOutcome: outcome } });
+const machine = createMachine({
+  id: 'classified-consumer', initial: 'ready',
+  context: () => ({ phase: 'ready', task: '', pendingBossQuestion: undefined, bossReply: undefined }),
+  states: {
+    ready: { meta: meta('ready'), tags: ['playbook.parked'], on: { START: {
+      guard: ({context,event}) => context.phase === 'ready' && event.mode === 'build',
+      target: 'work', actions: assign({ task: ({event}) => event.task }),
+    } } },
+    work: { meta: meta('work','coder'), tags: ['playbook.busy'], invoke: {
+      src: 'player',
+      input: ({context}) => ({ stateId: 'work', role: 'coder', sourceItem: 'PROBE-1',
+        prompt: 'Task from classified fixture: <task>', task: context.task,
+        ...(context.pendingBossQuestion && context.bossReply !== undefined
+          ? { pendingBossQuestion: context.pendingBossQuestion, bossReply: context.bossReply } : {}),
+        result: { needsBossReply: 'The player asks Boss a question. Output shall include \`question: <verbatim question>\`.', completed: 'The task is complete.' },
+      }),
+      onDone: [
+        { guard: ({event}) => event.output.guard === 'needsBossReply', target: 'awaitBossReply', actions: [
+          accepted('awaitBossReply','needsBossReply'),
+          assign({ pendingBossQuestion: ({event}) => ({ questionId: 'old-question', resumeStateId: 'work', sourceItem: 'PROBE-1', asker: {kind:'role',roleId:'coder'}, question: event.output.question }) }),
+        ] },
+        { target: 'done', actions: [accepted('done','completed'), assign({ phase: () => 'finished', pendingBossQuestion: () => undefined, bossReply: () => undefined })] },
+      ],
+    } },
+    awaitBossReply: { meta: meta('awaitBossReply'), tags: ['playbook.parked'], on: { BOSS_REPLY: {
+      target: 'work', actions: assign({ bossReply: ({event}) => event.answer }),
+    } } },
+    done: { type: 'final', meta: meta('done') },
+  },
+}, { actions: { 'playbook.acceptedOutcome': () => undefined } });
+const factory = createXStatePlaybookRuntime(machine, {
+  label: 'classified-consumer', compat: {artifactSchema:3,runtimeAbi:RUNTIME_ABI}, snapshotOptions: value => value ?? {},
+  bossEvents: [{ type: 'START', fields: {
+    mode: {source:'judge',required:true,values:['build']}, task: {source:'text',required:true},
+  } }],
+  roleStates: { work: {role:'coder',label:'work'} }, verbatimPayloadFields: new Set(['question']),
+  outcomeAuthority: { governedPlayerStates: { work: {
+    needsBossReply: {fields:{question:'presentation'},repositoryDisposition:'unchanged'},
+    completed: {fields:{},repositoryDisposition:'unchanged'},
+  } } },
+});
+export const spexRegistryContract = 3;
+export default { id:'probe',command:'probe',intent:'exercise classified continuation',artifactSchema:3,
+  runtimeProfile:{kind:'shared-factory',compat:factory.compat},requiredRoleIds:['coder'],concurrentRoleSets:[],
+  validateOptions: value => value ?? {},
+  createRuntime: (configuredOptions,hostCapabilities) => factory({configuredOptions,hostCapabilities}),
+};
+`);
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  await client.expectOk("environment.request", { repository: project.id, name: "fixture/classified", request: { kind: "path", path: "tools/classified" } });
+  // The request is asynchronous; config composition reads only an installed lock.
+  await client.waitFor((m) => m.type === "environment.state" && m.repository === project.id
+    && m.state.busy === null && m.state.packages.some((pkg) => pkg.name === "fixture/classified" && pkg.installed), 60_000);
+  const configured = await client.expectOk("config.edit", { repository: project.id,
+    op: { kind: "playbook.add", playbookId: "probe", roles: { coder: "dev.coder" } },
+  });
+  assert.equal(configured.status, "valid");
+  const session = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId: session.id } });
+  await client.expectOk("turn.submit", { sessionId: session.id, text: firstTask });
+  const asked = await settledSession(client, session.id, 1);
+  assert.equal(asked.live, false, "the pending-question turn releases its runtime");
+  assert.equal(asked.failed, false, JSON.stringify({ recovery: asked.recovery, parked: asked.parked }));
+  assert.equal(asked.recovery, undefined);
+  assert.equal(asked.parked?.reason, "question", "the real question stands without interrupted-turn recovery");
+  assert.equal(playerPrompts.length, 1);
+  await client.expectOk("turn.submit", { sessionId: session.id, text: oldAnswer });
+  const completed = await settledSession(client, session.id, 2);
+  assert.equal(completed.failed, false);
+  assert.equal(completed.parked, undefined, "the first run finished");
+  assert.equal(completed.recovery, undefined);
+  assert.equal(playerPrompts.length, 2);
+  // A selected provider conversation already contains its own question;
+  // Playbook supplies the answer without repeating it (runtime-92).
+  assert.ok(classificationPrompts[1]!.includes(`Pending Boss question: ${oldQuestion}`), "the real pending question reaches classification");
+  assert.ok(classificationPrompts[1]!.includes("Boss message:\n```\n" + oldAnswer + "\n```"), "the Boss answer reaches classification verbatim");
+  assert.ok(playerPrompts[1]!.includes(`Boss ⟶\n${oldAnswer}`), "the resumed worker receives the actual Boss reply");
+  assert.ok(harness.stats.runs.some((run) => run.prompt === playerPrompts[1] && run.resume), "the asking worker resumes its existing provider conversation");
+  const shared = createSessionStore({ sessionsDir: projectSessions(harness.dataDir, project.id) });
+  const before = Buffer.from((await shared.exportBundle(session.id)).replay);
+  await client.expectOk("turn.submit", { sessionId: session.id, text: nextBoss });
+  const restarted = await settledSession(client, session.id, 3);
+  assert.equal(restarted.live, false);
+  assert.equal(restarted.failed, false);
+  assert.equal(restarted.parked, undefined);
+  assert.equal(restarted.recovery, undefined);
+  assert.equal(restarted.continuable, true, restarted.continuationReason ?? "continuable");
+  assert.equal(playerPrompts.length, 3, "the continued session starts exactly one new worker call");
+  assert.ok(classificationPrompts.at(-1)!.includes("Current state: ready"), "classification sees the guarded initial state");
+  assert.ok(decisionPrompts.at(-1)!.includes(`[Boss message]\n${nextBoss}`), "the Captain sees the raw Boss text without trimming");
+  assert.ok(classificationPrompts.at(-1)!.includes("Boss message:\n```\n" + nextTask + "\n```"), "the classifier sees the selected standalone request without trimming");
+  assert.ok(playerPrompts[2]!.includes(`Task from classified fixture: ${nextTask}`), "current-run text keeps its whitespace and newline");
+  assert.ok(!playerPrompts[2]!.includes(oldQuestion) && !playerPrompts[2]!.includes(oldAnswer), "no prior-run exchange leaks into the second run");
+  const after = Buffer.from((await shared.exportBundle(session.id)).replay);
+  assert.deepEqual(after.subarray(0, before.length), before, "the recorded first run is retained byte for byte");
+  const records = after.toString("utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(records.filter(({record}) => record.type === "turn_started").map(({record}) => record.turn.prompt), [firstTask, oldAnswer, nextBoss]);
+  assert.equal((await client.expectOk("session.list", {})).find((item) => item.id === session.id)?.turns, 3);
+});
+
+test("core-service-77: the real shell continues from its token-free snapshot, ledger intact, and refuses config drift", async (t) => {
+  const dir = scratchDir("spex-shell-continue-");
+  const configPath = join(dir, "playbook.config.yaml");
+  // This session engages no packaged playbook, so its catalog stays code
+  // alone and the later addition of review reads as unrelated.
+  const base = VALID_CONFIG.slice(0, VALID_CONFIG.indexOf("  review:\n"));
+  writeFileSync(configPath, base);
+  const projectDir = join(dir, "project");
+  mkdirSync(projectDir);
+  execFileSync("git", ["init", "-q", projectDir]);
+
+  // The fake adapter issues resume tokens, so the shell's own export
+  // carries them; the manifest must not.
+  const { imports } = fakeAdapterImports({
+    fallback: { result: "not json on purpose" },
+  });
+  const service = await CoreService.start({
+    token: "test",
+    configPath,
+    dataDir: join(dir, "state"),
+    adapterImports: imports,
+    env: {},
+    home: join(dir, "home"),
+    watchConfig: false,
+  });
+  t.after(async () => { await service.stop(); rmSync(dir, {recursive:true,force:true}); });
+  const client = new Client(service.port());
+  t.after(() => client.close());
+  await client.open();
+  const project = await client.expectOk("project.register", { path: projectDir });
+  const session = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("subscribe", {
+    channel: { kind: "session", sessionId: session.id },
+  });
+  await client.expectOk("turn.submit", { sessionId: session.id, text: "hello" });
+  await client.waitFor(
+    (m) => m.type === "record" && m.record.type === "turn_finished",
+  );
+
+  // The turn's end persisted the shell's snapshot, token-free
+  // (core-service-72).
+  const manifest = join(projectSessions(join(dir, "state"), project.id), `${session.id}.json`);
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && m.session.turns === 1 && m.session.turnActive === false);
+  const text = JSON.stringify(await readSessionManifest(manifest));
+  assert.ok(!text.includes("resumeToken"), "no token key in the manifest");
+  assert.ok(!text.includes("fake-resume-"), "no token value in the manifest");
+  const snapshot = (JSON.parse(text) as {
+    snapshot: {
+
+        schemaVersion: number;
+        journal: unknown[];
+        captain: { conversation: { kind: string } };
+        effectLedger: unknown;
+    };
+  }).snapshot;
+  assert.equal(snapshot.schemaVersion, 4);
+  assert.ok(snapshot.journal.length > 0, "the journal is kept for the reseed");
+  assert.equal(snapshot.captain.conversation.kind, "needsSeeding");
+  const ledgerBefore = JSON.stringify(snapshot.effectLedger);
+
+  // Settlement released the runtime (core-service-91): the session is
+  // no longer live, and the provider hints written at settlement stay
+  // bound to the untouched manifest.
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && m.session.live === false);
+  const hints = JSON.parse(readFileSync(join(projectSessions(join(dir, "state"), project.id), `${session.id}.hints.json`), "utf8")) as { checkpointSha256: string; captain?: { kind: string } };
+  assert.equal(hints.checkpointSha256, createHash("sha256").update(readFileSync(manifest)).digest("hex"), "hints bound to the settled manifest");
+  assert.equal(hints.captain?.kind, "pinned");
+
+  // A tuning change lands on the next message (core-service-92): the
+  // message restores the snapshot into a fresh shell and a new runtime,
+  // seeded with the ledger (core-service-73, core-service-74) — the
+  // Captain replies again on the new model.
+  writeFileSync(configPath, base.replace("  model: claude-test\nplayers:", "  model: claude-tuned\nplayers:"));
+  await service.reloadConfig();
+  await client.expectOk("turn.submit", { sessionId: session.id, text: "hello again" });
+  await client.waitFor(
+    (m) => m.type === "record" && m.record.type === "turn_finished" && m.record.turnId === 2,
+  );
+  const transcript = JSON.stringify(client.records("session").filter((m) => m.record.turnId === 2));
+  assert.ok(transcript.includes("not json on purpose"), "the Captain replied on the continued turn");
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && m.session.turns === 2 && m.session.turnActive === false);
+  const after = (await readSessionManifest(manifest)) as {
+    snapshot: { effectLedger: unknown; sequences: { turn: number } };
+  };
+  assert.equal(JSON.stringify(after.snapshot.effectLedger), ledgerBefore, "ledger intact");
+  assert.equal(after.snapshot.sequences.turn, 2, "the shell counted both turns");
+  assert.ok(JSON.stringify((after as unknown as { lastAppliedExecutionProjection: { captain: unknown } }).lastAppliedExecutionProjection.captain).includes("claude-tuned"), "the new model was applied");
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && m.session.turns === 2 && m.session.live === false);
+
+  // An unrelated addition changes nothing (core-service-92): a second
+  // playbook with its own player enters the config, the session keeps
+  // its stored members, and a third message continues it.
+  writeFileSync(configPath, base
+    .replace("  model: claude-test\nplayers:", "  model: claude-tuned\nplayers:")
+    .replace("    model: claude-test\nplaybooks:", "    model: claude-test\n  dev.reviewer:\n    adapter: claude\n    model: claude-test\nplaybooks:")
+    + "  review:\n    roles:\n      coder: dev.coder\n      reviewer: dev.reviewer\n");
+  await service.reloadConfig();
+  await client.expectOk("turn.submit", { sessionId: session.id, text: "and again" });
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && m.session.turns === 3 && m.session.live === false);
+  const narrowed = (await readSessionManifest(manifest)) as { structuralProjection: { catalog: Record<string, unknown>; players: { id: string }[] } };
+  assert.deepEqual(Object.keys(narrowed.structuralProjection.catalog), ["code"], "the stored catalog is the session's own");
+  assert.deepEqual(narrowed.structuralProjection.players.map((player) => player.id), ["dev.coder"]);
+
+  // Structural drift: the roster changed since, so the refusal names the
+  // change and offers a new session, which the project then accepts
+  // (core-service-73, core-service-92).
+  writeFileSync(configPath, base.replace(/dev\.coder/g, "dev.other"));
+  await service.reloadConfig();
+  const drift = await client.command("turn.submit", { sessionId: session.id, text: "once more" });
+  assert.ok(!drift.ok && drift.error.code === "invalid_config");
+  assert.ok(!drift.ok && /dev\.coder/.test(drift.error.message), `names the change: ${!drift.ok ? drift.error.message : ""}`);
+  assert.ok(!drift.ok && /new session/.test(drift.error.message), "offers a new session");
+  const stillEnded = (await client.expectOk("session.list", {})).find(
+    (s: SessionInfo) => s.id === session.id,
+  );
+  assert.equal(stillEnded?.live, false, "the session stays as it was");
+  const fresh = await client.expectOk("session.create", { projectId: project.id });
+  assert.notEqual(fresh.id, session.id);
+
+  client.close();
+});
+
+// ---------------------------------------------------------------------------
+// CORE-66: the shared config relocates once from a former location
+// ---------------------------------------------------------------------------
+
+test("core-service-66: a config at the XDG location relocates once, bytes and mode kept, seeding nothing over it", async () => {
+  const dir = scratchDir("spex-relocate-");
+  const home = join(dir, "home");
+  const xdg = join(dir, "xdg");
+  const legacy = join(xdg, "playbook", "playbook.config.yaml");
+  mkdirSync(dirname(legacy), { recursive: true });
+  const text = `# the user's own comment\n${VALID_CONFIG}`;
+  writeFileSync(legacy, text, { mode: 0o640 });
+  const env = { HOME: home, XDG_CONFIG_HOME: xdg };
+  const canonical = ownConfig(join(dir, "state"));
+
+  const first = await CoreService.start({
+    token: "test",
+    dataDir: join(dir, "state"),
+    env,
+    home,
+    own: OWN,
+    watchConfig: false,
+  });
+  assert.equal(readFileSync(canonical, "utf8"), text, "bytes preserved");
+  // Permission bits are POSIX; Windows reports its own fixed mode.
+  if (process.platform !== "win32") {
+    assert.equal(statSync(canonical).mode & 0o777, 0o640, "mode preserved");
+  }
+  assert.equal(readFileSync(legacy, "utf8"), text, "the legacy file stays in place");
+  const client = new Client(first.port());
+  await client.open();
+  const state = await client.expectOk("config.get", {});
+  assert.equal(state.status, "valid");
+  assert.equal(
+    state.status === "valid" ? state.seeded : true,
+    false,
+    "the relocated config is the user's, not a seed",
+  );
+  client.close();
+  await first.stop();
+
+  // Editing the canonical copy afterwards never pulls the legacy one back.
+  writeFileSync(canonical, `${text}# edited after relocation\n`);
+  const second = await CoreService.start({
+    token: "test",
+    dataDir: join(dir, "state"),
+    env,
+    home,
+    own: OWN,
+    watchConfig: false,
+  });
+  assert.ok(readFileSync(canonical, "utf8").endsWith("# edited after relocation\n"));
+  await second.stop();
+});
+
+test("core-service-66: the home's own former config moves ahead of the XDG one, its emptied directory going with it", async () => {
+  const dir = scratchDir("spex-relocate-home-");
+  const home = join(dir, "home");
+  const xdg = join(dir, "xdg");
+  // The shell passes its own data directory, so the home the former
+  // location sits in is that one, not the process environment's.
+  const dataDir = join(dir, "state");
+  const former = join(dataDir, "playbook", "playbook.config.yaml");
+  const canonical = ownConfig(dataDir);
+  const legacy = join(xdg, "playbook", "playbook.config.yaml");
+  mkdirSync(dirname(former), { recursive: true });
+  mkdirSync(dirname(legacy), { recursive: true });
+  const text = `# the user's own comment\n${VALID_CONFIG}`;
+  writeFileSync(former, text, { mode: 0o640 });
+  const legacyText = `# another machine's older config\n${VALID_CONFIG}`;
+  writeFileSync(legacy, legacyText, { mode: 0o600 });
+  const env = { HOME: home, XDG_CONFIG_HOME: xdg };
+
+  const first = await CoreService.start({
+    token: "test",
+    dataDir,
+    env,
+    home,
+    own: OWN,
+    watchConfig: false,
+  });
+  assert.equal(readFileSync(canonical, "utf8"), text, "the nearer config moved, not the XDG one");
+  if (process.platform !== "win32") {
+    assert.equal(statSync(canonical).mode & 0o777, 0o640, "mode preserved");
+  }
+  assert.ok(!existsSync(former), "the former file is gone");
+  assert.ok(!existsSync(dirname(former)), "and its emptied directory with it");
+  assert.equal(readFileSync(legacy, "utf8"), legacyText, "the XDG file stays in place");
+  const client = new Client(first.port());
+  await client.open();
+  const state = await client.expectOk("config.get", {});
+  assert.equal(state.status, "valid");
+  assert.equal(
+    state.status === "valid" ? state.seeded : true,
+    false,
+    "the relocated config is the user's, not a seed",
+  );
+  client.close();
+  await first.stop();
+
+  // Editing the canonical copy afterwards never pulls a former one back.
+  writeFileSync(canonical, `${text}# edited after relocation\n`);
+  const second = await CoreService.start({
+    token: "test",
+    dataDir,
+    env,
+    home,
+    own: OWN,
+    watchConfig: false,
+  });
+  assert.ok(readFileSync(canonical, "utf8").endsWith("# edited after relocation\n"));
+  assert.ok(!existsSync(dirname(former)), "nothing returns to the former directory");
+  await second.stop();
+});
+
+test("core-service-136: the first-run config takes the agents Playbook seeds for these credentials", async () => {
+  const { seedConfigText } = await import("@sublang/playbook/seed-config");
+  const agents = (text: string) => {
+    const top = parseYaml(text) as {
+      captain: Record<string, unknown>;
+      players: Record<string, Record<string, unknown>>;
+      playbooks: Record<string, Record<string, unknown>>;
+    };
+    const settings = (agent: Record<string, unknown>) => ({
+      adapter: agent.adapter,
+      model: agent.model,
+      effort: agent.effort,
+      writablePaths: (agent.permissions as { writablePaths?: unknown } | undefined)?.writablePaths,
+    });
+    return {
+      captain: settings(top.captain),
+      players: Object.fromEntries(Object.entries(top.players).map(([id, agent]) => [id, settings(agent)])),
+      froms: Object.values(top.playbooks).filter((block) => Object.hasOwn(block, "from")).length,
+    };
+  };
+  const rows: [string, NodeJS.ProcessEnv, Record<string, string>][] = [
+    ["claude only", { ANTHROPIC_API_KEY: "a" }, { captain: "claude", "dev.reviewer": "claude", "dev.coder": "claude" }],
+    ["codex only", { OPENAI_API_KEY: "o" }, { captain: "codex", "dev.reviewer": "codex", "dev.coder": "codex" }],
+    ["both", { ANTHROPIC_API_KEY: "a", OPENAI_API_KEY: "o" }, { captain: "claude", "dev.reviewer": "codex", "dev.coder": "claude" }],
+    ["neither", {}, { captain: "claude", "dev.reviewer": "claude", "dev.coder": "claude" }],
+  ];
+  for (const [row, credentials, expected] of rows) {
+    const dir = scratchDir("spex-seed-");
+    const home = join(dir, "home");
+    mkdirSync(home, { recursive: true });
+    const dataDir = join(dir, "state");
+    const env = { HOME: home, ...credentials };
+    const service = await CoreService.start({ token: "test", dataDir, env, home, own: OWN, watchConfig: false });
+    const seeded = readFileSync(ownConfig(dataDir), "utf8");
+    await service.stop();
+    const got = agents(seeded);
+    const cli = agents(seedConfigText({ env, homeDir: home }).text);
+    assert.deepEqual({ captain: got.captain, players: got.players }, { captain: cli.captain, players: cli.players }, `${row}: the CLI's agent settings`);
+    assert.equal(got.froms, 0, `${row}: no playbooks.<id>.from`);
+    assert.equal(got.captain.adapter, expected.captain, `${row}: the Captain`);
+    assert.equal(got.players["dev.reviewer"].adapter, expected["dev.reviewer"], `${row}: the reviewer`);
+    assert.equal(got.players["dev.coder"].adapter, expected["dev.coder"], `${row}: the coder`);
+    // A second start under the same credentials leaves it as it is.
+    const again = await CoreService.start({ token: "test", dataDir, env, home, own: OWN, watchConfig: false });
+    await again.stop();
+    assert.equal(readFileSync(ownConfig(dataDir), "utf8"), seeded, `${row}: unchanged`);
+  }
+});
+
+test("core-service-138: an untouched seed follows the credentials until it is changed once", async () => {
+  const dir = scratchDir("spex-reseed-");
+  const home = join(dir, "home");
+  mkdirSync(home, { recursive: true });
+  const dataDir = join(dir, "state");
+  const claude = { HOME: home, ANTHROPIC_API_KEY: "a" };
+  const both = { ...claude, OPENAI_API_KEY: "o" };
+  const codex = { HOME: home, OPENAI_API_KEY: "o" };
+  const start = async (env: NodeJS.ProcessEnv) => {
+    const service = await CoreService.start({ token: "test", dataDir, env, home, own: OWN, watchConfig: false });
+    const state = service.configStateSnapshot();
+    await service.stop();
+    return { text: readFileSync(ownConfig(dataDir), "utf8"), reseeded: state.status === "valid" && state.reseeded === true };
+  };
+  const reviewer = (text: string) => (parseYaml(text) as { players: Record<string, { adapter: string }> }).players["dev.reviewer"].adapter;
+  const coder = (text: string) => (parseYaml(text) as { players: Record<string, { adapter: string }> }).players["dev.coder"].adapter;
+
+  const first = await start(claude);
+  assert.equal(reviewer(first.text), "claude");
+  chmodSync(ownConfig(dataDir), 0o640);
+
+  // Codex added: the untouched seed becomes the both-credentials seed.
+  const added = await start(both);
+  assert.equal(reviewer(added.text), "codex", "the reviewer moves to codex");
+  assert.equal(coder(added.text), "claude");
+  assert.equal(statSync(ownConfig(dataDir)).mode & 0o777, 0o640, "its permission bits kept");
+  assert.equal(added.reseeded, true, "reported as reseeded");
+  assert.deepEqual(storedPrefs(dataDir)["config:seed"], {
+    path: ownConfig(dataDir),
+    version: createHash("sha256").update(added.text).digest("hex"),
+  }, "the recorded version follows it");
+
+  // Unchanged credentials: unchanged bytes.
+  const same = await start(both);
+  assert.equal(same.text, added.text);
+  assert.equal(same.reseeded, false);
+
+  // One edit, then no credential row rewrites it again.
+  appendFileSync(ownConfig(dataDir), "# mine now\n");
+  const edited = readFileSync(ownConfig(dataDir), "utf8");
+  assert.equal((await start(codex)).text, edited, "an edited config stays");
+  assert.equal(storedPrefs(dataDir)["config:seed"], undefined, "its record gone");
+  assert.equal((await start(claude)).text, edited);
+
+  // A config standing with no record is never reseeded.
+  const bare = scratchDir("spex-reseed-bare-");
+  const bareData = join(bare, "state");
+  const service = await CoreService.start({ token: "test", dataDir: bareData, env: claude, home, own: OWN, watchConfig: false });
+  await service.stop();
+  const prefsFile = join(bareData, "local", "prefs.json");
+  const prefs = JSON.parse(readFileSync(prefsFile, "utf8")) as { format: number; prefs: Record<string, unknown> };
+  delete prefs.prefs["config:seed"];
+  writeFileSync(prefsFile, JSON.stringify(prefs));
+  const unrecorded = readFileSync(ownConfig(bareData), "utf8");
+  for (const env of [codex, both, { HOME: home }]) {
+    const again = await CoreService.start({ token: "test", dataDir: bareData, env, home, own: OWN, watchConfig: false });
+    await again.stop();
+    assert.equal(readFileSync(ownConfig(bareData), "utf8"), unrecorded, "no record, no reseed");
+  }
+});
+
+test("core-service-66: a former config whose locator points into its own directory stays, reported, and no older one is published past it", async () => {
+  const dir = scratchDir("spex-relocate-refused-");
+  const home = join(dir, "home");
+  const xdg = join(dir, "xdg");
+  const dataDir = join(dir, "state");
+  const former = join(dataDir, "playbook", "playbook.config.yaml");
+  const canonical = ownConfig(dataDir);
+  const legacy = join(xdg, "playbook", "playbook.config.yaml");
+  mkdirSync(dirname(former), { recursive: true });
+  mkdirSync(dirname(legacy), { recursive: true });
+  // `./records` names a directory inside the former one, which the move
+  // would leave behind: the file stays, and the reader hears why.
+  const text = `# the user's own comment\nsessions: ./records\n${VALID_CONFIG}`;
+  writeFileSync(former, text, { mode: 0o600 });
+  const legacyText = `# another machine's older config\n${VALID_CONFIG}`;
+  writeFileSync(legacy, legacyText, { mode: 0o600 });
+
+  const reported: string[] = [];
+  const wasReporting = console.error;
+  console.error = (...args: unknown[]) => { reported.push(args.map(String).join(" ")); };
+  let started: CoreService | undefined;
+  try {
+    started = await CoreService.start({
+      token: "test",
+      dataDir,
+      env: { HOME: home, XDG_CONFIG_HOME: xdg },
+      home,
+      own: OWN,
+      watchConfig: false,
+    });
+  } finally {
+    console.error = wasReporting;
+  }
+  const service = started;
+  assert.ok(service);
+  assert.equal(readFileSync(former, "utf8"), text, "the former file stays where it is");
+  assert.equal(readFileSync(legacy, "utf8"), legacyText, "the XDG file stays too");
+  const published = readFileSync(canonical, "utf8");
+  assert.notEqual(published, legacyText, "no older file is published past the nearer one");
+  assert.equal(published, starterText(readFileSync(templatePath(), "utf8")), "the starter is seeded instead");
+  assert.ok(
+    reported.some((line) => line.includes(former) && line.includes("sessions")),
+    `the refusal names the file and its locator: ${reported.join(" | ")}`,
+  );
+  const client = new Client(service.port());
+  await client.open();
+  const state = await client.expectOk("config.get", {});
+  assert.equal(state.status, "valid");
+  assert.equal(
+    state.status === "valid" ? state.seeded : false,
+    true,
+    "the core reports the starter it seeded",
+  );
+  client.close();
+  await service.stop();
+});
+
+test("core-service-66: the former directory stays when another file of the reader's sits beside the config", async () => {
+  const dir = scratchDir("spex-relocate-kept-");
+  const home = join(dir, "home");
+  const dataDir = join(dir, "state");
+  const former = join(dataDir, "playbook", "playbook.config.yaml");
+  const canonical = ownConfig(dataDir);
+  const beside = `${former}.bak`;
+  mkdirSync(dirname(former), { recursive: true });
+  const text = `# the user's own comment\n${VALID_CONFIG}`;
+  writeFileSync(former, text, { mode: 0o600 });
+  writeFileSync(beside, "# a backup the reader kept\n", { mode: 0o600 });
+
+  const service = await CoreService.start({
+    token: "test",
+    dataDir,
+    env: { HOME: home },
+    home,
+    own: OWN,
+    watchConfig: false,
+  });
+  assert.equal(readFileSync(canonical, "utf8"), text, "bytes preserved");
+  assert.ok(!existsSync(former), "the former file is gone");
+  assert.ok(existsSync(dirname(former)), "its directory stays");
+  assert.equal(
+    readFileSync(beside, "utf8"),
+    "# a backup the reader kept\n",
+    "the file beside it is untouched",
+  );
+  await service.stop();
+});
+
+// ---------------------------------------------------------------------------
+// playbook-library-17: compile.run over the protocol with a stub slc,
+// the bindings re-keyed onto the entry's derived role ids
+// (playbook-library-32)
+// ---------------------------------------------------------------------------
+
+test("playbook-library-32: compile.run binds derived roles however the form cased them", async () => {
+  const stubDir = scratchDir("spex-stub-slc-");
+  const stubPath = join(stubDir, "stub-slc.cjs");
+  // slc emits the ids as the gears declared them (DR-032): `Coder`
+  // and `Reviewer`, not their lowercase forms.
+  writeFileSync(stubPath, stubSlcSource("['Coder', 'Reviewer']"));
+  const slcEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+  const harness = await startHarness(VALID_CONFIG, {
+    env: { SPEX_SLC: `${process.execPath} ${stubPath}` },
+    // The toolchain probe wants a system Node slc can run on; the
+    // runner's own Node is whatever CI installed, so the probe is
+    // answered here and every other spawn — the stub slc — is real,
+    // its env recorded.
+    compileSpawner: (command, args, cwd, onLine, signal, env) => {
+      const probe = args.length === 1 && args[0] === "--version";
+      if (probe && command !== process.execPath) {
+        onLine("v24.1.0");
+        return Promise.resolve(0);
+      }
+      if (!probe) slcEnvs.push(env);
+      return defaultSpawner(command, args, cwd, onLine, signal, env);
+    },
+  });
+  const client = new Client(harness.service.port());
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+
+  // Another org's spec package of the same id, brought in by Git, is
+  // not the compile's: two orgs' packages of one name stand apart
+  // (environments-10, playbook-library-69).
+  const otherOrg = join(harness.projectDir, "spex-packages", "aaa", "pair");
+  mkdirSync(otherOrg, { recursive: true });
+  writeFileSync(join(otherOrg, "meta.yaml"), "format: 2\norg: aaa\nname: pair\nversion: 1.0.0\nartifacts: {}\n");
+  // The form keys one binding as the role reads and one lowercased;
+  // both must land on the derived ids. The compile writes the spec
+  // package under development in the project's working folder and
+  // enables it there (environments-10, playbook-library-69).
+  const state = await client.expectOk("compile.run", {
+    playbookId: "pair",
+    sourceText: "# Pair\n\nA two-player workflow.\n",
+    roles: ["Coder", "Reviewer"],
+    command: "pair",
+    intent: "pair workflow for tests",
+    bindings: { Coder: "dev.coder", reviewer: "dev.reviewer" },
+    newPlayers: { "dev.reviewer": { adapter: "claude" } },
+    projectId: project.id,
+  });
+  assert.equal(state.status, "valid");
+  // The form's compile ran on the Captain's block (playbook-library-17, playbook-library-42).
+  assert.equal(slcEnvs.length, 1, "one stub slc run");
+  assert.equal(slcEnvs[0]?.SLC_AGENT, "claude-code");
+  assert.equal(slcEnvs[0]?.SLC_MODEL, "claude-test");
+  assert.equal(slcEnvs[0]?.SLC_EFFORT, undefined);
+  // At spex-packages/<org>/<id>/, the project's default org
+  // (environments-10).
+  const org = project.id.split("/")[0]!;
+  const artifactDir = join(harness.projectDir, "spex-packages", org, "pair", "playbooks", "en", "pair");
+  assert.ok(existsSync(join(artifactDir, "pair.registry.mjs")), "the module stands in the playbook artifact's folder");
+  assert.deepEqual(readdirSync(otherOrg), ["meta.yaml"], "the other org's package of that id is untouched");
+  // The project's environment requests it by path, named under the
+  // project's default org (playbook-library-69); its config entry
+  // binds each derived role by its own id, and names no module.
+  const clone = clonePath(harness.dataDir, project.id);
+  assert.match(readFileSync(join(harness.projectDir, "spex.yaml"), "utf8"), new RegExp(`${org}/pair:\\n\\s+path: spex-packages/${org}/pair\\n`));
+  const config = readFileSync(join(clone, "config", "playbook.config.yaml"), "utf8");
+  const start = config.indexOf("  pair:\n");
+  assert.ok(start >= 0, "the pair entry is written");
+  const pairEntry = config.slice(start);
+  assert.match(pairEntry, /\n      Coder: dev\.coder\n/);
+  assert.match(pairEntry, /\n      Reviewer: dev\.reviewer\n/);
+  assert.doesNotMatch(pairEntry, /\n      (coder|reviewer): /);
+  assert.doesNotMatch(pairEntry, /from:/);
+  // The new player joined your own roster first (playbook-library-3).
+  assert.match(readFileSync(join(harness.dir, "playbook.config.yaml"), "utf8"), /dev\.reviewer:\n\s+adapter: claude/);
+  const listed = await client.expectOk("environment.playbooks", { projectId: project.id });
+  assert.deepEqual(listed.project?.find((row) => row.id === "pair")?.enabled, ["project"]);
+
+  // The new playbook's artifacts serve its machine.
+  const artifacts = await client.expectOk("playbook.artifacts", {
+    playbookId: "pair",
+  });
+  assert.ok(artifacts.machine, "machine graph served");
+  assert.ok(artifacts.machine.nodes.some((node) => node.id === "ready"));
+
+  client.close();
+  await harness.service.stop();
+});
+
+
+for (const selection of ["default", "home override", "sessions override"] as const) {
+  test(`storage-15: legacy default discovery respects ${selection}`, async (t) => {
+    const home = scratchDir("spex-legacy-default-");
+    const dataDir = selection === "home override" ? join(home,"custom") : join(home,".spex");
+    const legacyDir = join(home,"old-state","playbook","sessions");
+    const projectPath = join(home,"project");
+    const configPath = join(home,"custom-config.yaml");
+    mkdirSync(legacyDir,{recursive:true,mode:0o700}); mkdirSync(projectPath);
+    execFileSync("git",["init","-q",projectPath]);
+    writeFileSync(configPath,(selection === "sessions override" ? `sessions: ${join(dataDir,"sessions")}\n` : "") + VALID_CONFIG);
+    const plan = await loadLaunchPlan({userConfigPath:configPath,modules:builtinLaunchModules(configPath)});
+    const {imports} = fakeAdapterImports({fallback:{result:"Done"}});
+    const seedDir = join(home,"seed-sessions");
+    const seed = await openSessionHost({store:createSessionStore({sessionsDir:seedDir}),mode:"new",cwd:projectPath,
+      config:executionConfigFromPlan(plan),adapterImports:imports});
+    await seed.handleBossTurn("Prior CLI work");
+    const sessionId = seed.sessionId;
+    const source = join(legacyDir,`${sessionId}.json`);
+    const original = JSON.stringify(await seed.read());
+    assert.equal(JSON.parse(original).schemaVersion,6,"the public lifecycle exports the released legacy recovery projection");
+    await seed.dispose();
+    writeFileSync(source,original,{mode:0o600});
+    writeFileSync(join(legacyDir,`${sessionId}.records.jsonl`),await readSessionReplay(join(seedDir,`${sessionId}.records.jsonl`)),{mode:0o600});
+    const service = await CoreService.start({token:"test",configPath,dataDir,home,own:OWN,watchConfig:false,
+      env:{HOME:home,XDG_STATE_HOME:join(home,"old-state"),...(selection === "home override" ? {SPEX_HOME:dataDir} : {})}});
+    t.after(async () => {await service.stop();rmSync(home,{recursive:true,force:true});});
+    const client = new Client(service.port()); t.after(() => client.close()); await client.open();
+    await client.expectOk("project.register",{path:projectPath});
+    const sessions = await client.expectOk("session.list",{});
+    if (selection === "default") {
+      // storage-18: the ordinary default imports into your own group's
+      // sessions/, a clone no folder pairs, so it lists nowhere and is
+      // reported instead (storage-12).
+      const ownKey = `${OWN}/${OWN}-spex`;
+      assert.ok(existsSync(join(clonePath(dataDir, ownKey), "sessions", `${sessionId}.json`)), "imported into your own group's sessions");
+      assert.equal(sessions.length,0,"a session of a clone no folder pairs is not listed");
+      const repair = (await client.expectOk("storage.diagnostics",{})).find((entry) => entry.repair?.kind === "repository" && entry.repair.repository === ownKey);
+      assert.equal(repair?.repair?.sessions, 1, "your own group's clone is reported once it holds the session");
+      assert.equal(existsSync(source),false,"old active manifest retires after the new bundle is valid");
+      // Retained in the destination store's receipts (storage-18).
+      const migrations = join(clonePath(dataDir, ownKey),"local","migrations");
+      const inputs = readdirSync(migrations,{recursive:true}).filter((path) => String(path).endsWith(join("inputs","0")));
+      assert.ok(inputs.some((path) => readFileSync(join(migrations,String(path)),"utf8") === original),"original bytes are retained locally");
+    } else {
+      assert.equal(sessions.length,0); assert.equal(readFileSync(source,"utf8"),original);
+    }
+  });
+}
+
+for (const action of ["restore", "discard", "restore after recorded work"] as const) {
+  test(`core-service-84: desktop ${action} recovers CLI storage without current config`, async (t) => {
+    const dir = scratchDir("spex-cross-host-recovery-");
+    const configPath = join(dir, "config.yaml");
+    const projectPath = join(dir, "project");
+    const dataDir = join(dir, "state");
+    mkdirSync(projectPath);
+    execFileSync("git", ["init", "-q", projectPath]);
+    // The CLI writes into the session store of the spex repository the
+    // project pairs with (storage-6).
+    const { sessionsDir } = pairedHome(dataDir, projectPath);
+    writeFileSync(configPath, VALID_CONFIG);
+    const plan = await loadLaunchPlan({userConfigPath: configPath, modules: builtinLaunchModules(configPath)});
+    const config = executionConfigFromPlan(plan);
+    const {imports, stats} = fakeAdapterImports({fallback: {result: "recovered answer"}});
+    const shared = createSessionStore({sessionsDir});
+    const cli = await openSessionHost({store: shared, mode: "new", cwd: projectPath, config, adapterImports: imports});
+    t.after(() => cli.dispose());
+    const sessionId = cli.sessionId;
+    // Uncertainty under an active CLI lease is not interrupted work.
+    await cli.lease.beginTurn({input: "saved CLI input", attemptId: randomUUID(), attemptedExecutionProjection: config});
+    // A step's start saved before the writer stopped is recorded work:
+    // Playbook's predicate withholds Discard (DR-088).
+    const recorded = action === "restore after recorded work";
+    if (recorded) await cli.lease.recordProgress({snapshot: null, step: {id: randomUUID(), kind: "player",
+      stateId: "firstPhase", runtimeSessionId: randomUUID(), playbookId: Object.keys(config.catalog)[0]!}});
+    writeFileSync(configPath, "captain: [invalid current config]\n");
+    const service = await CoreService.start({token:"test", configPath, dataDir, adapterImports:imports, env:{}, watchConfig:true});
+    t.after(async () => { await service.stop(); rmSync(dir, {recursive:true,force:true}); });
+    const client = new Client(service.port());
+    t.after(() => client.close());
+    await client.open();
+    // Adding the paired folder again selects its pair (storage-6).
+    const project = await client.expectOk("project.register", {path:projectPath});
+    const session = (await client.expectOk("session.list", {})).find((item) => item.id === sessionId);
+    assert.equal(session?.projectId, project.id);
+    assert.equal(session?.externalWriter,"active");
+    assert.equal(session?.live,true);
+    assert.equal(session?.recovery,undefined);
+    const command = action === "discard" ? "session.discard" : "session.restore";
+    assert.equal((await client.command(command,{sessionId})).ok,false);
+    // Releasing only the lease must reveal recovery without a stream write.
+    await cli.dispose();
+    const revealed = await client.waitFor((message) => message.type === "session.state" && message.session.id === sessionId && message.session.recovery?.input === "saved CLI input" && !message.session.externalWriter);
+    assert.equal(revealed.type === "session.state" && revealed.session.recovery?.discardable, !recorded, "the summary carries Playbook's discard predicate");
+    assert.equal(revealed.type === "session.state" && revealed.session.continuationReason, "Restore the interrupted turn first", "the reason names the way on");
+    const blocked = await client.command("turn.submit", {sessionId, text:"replacement input"});
+    assert.equal(blocked.ok, false, "ordinary input cannot retry uncertainty");
+    assert.equal(stats.runs.length, 0);
+    // Both commands use the same exclusive lease as the CLI.
+    const holder = await shared.acquire(sessionId);
+    const busy = await client.command(command, {sessionId});
+    assert.equal(busy.ok, false);
+    assert.equal(stats.runs.length, 0);
+    await holder.release();
+    await client.expectOk("project.register",{path:projectPath});
+    if (recorded) {
+      // Discard is refused with Playbook's cause, and nothing is lost.
+      const refused = await client.command("session.discard", {sessionId});
+      assert.ok(!refused.ok && /restored and reported/.test(refused.error.message), JSON.stringify(refused));
+      assert.equal(validateSessionManifest(await shared.readManifest(sessionId)).state, "uncertain");
+    }
+    if (action !== "discard") {
+      await client.expectOk("subscribe", {channel:{kind:"session",sessionId}});
+      const restoreMessages = client.messages.length;
+      await client.expectOk("session.restore", {sessionId});
+      await client.waitFor((m) => m.type === "session.state" && m.session.id === sessionId && !m.session.turnActive && m.session.turns > 0 && !m.session.recovery);
+      const manifest = validateSessionManifest(await shared.readManifest(sessionId));
+      assert.equal(manifest.state, "settled");
+      // Restore reports and repeats nothing: no agent ran, and the
+      // Captain's reply stands in the stream (core-service-82).
+      assert.equal(stats.runs.length, 0, "Restore calls no agent");
+      assert.ok(client.records("session").some(({record}) => record.type === "captain_reply"), "the restore reports through the Captain");
+      assert.ok(!JSON.stringify(manifest).includes("fake-resume-"));
+      // Settlement released the runtime (core-service-91); the same CLI
+      // facade can reopen the desktop settlement at once.
+      await client.waitFor((m) => client.messages.indexOf(m) >= restoreMessages
+        && m.type === "session.state" && m.session.id === sessionId
+        && !m.session.turnActive && m.session.turns > 0 && !m.session.recovery && m.session.live === false);
+      const reopened = await openSessionHost({store:shared,sessionId,mode:"continue",cwd:projectPath,config,adapterImports:imports});
+      await reopened.handleBossTurn("continued in CLI");
+      assert.equal((await reopened.read())?.state, "settled");
+      await reopened.dispose();
+    } else {
+      assert.deepEqual(await client.expectOk("session.discard", {sessionId}), {removed:false});
+      assert.equal(stats.runs.length, 0, "Discard invokes no agents");
+      const restored = validateSessionManifest(await shared.readManifest(sessionId));
+      assert.equal(restored.state, "settled", "restore the initialized turn-zero checkpoint");
+      assert.equal(restored.snapshot.sequences.turn, 0);
+      assert.ok(existsSync(join(sessionsDir, `${sessionId}.replay.json`)));
+      assert.equal((await client.expectOk("session.list", {}))[0]?.recovery, undefined);
+    }
+  });
+}
+
+/** Start the stopped writer (core-service-84): a CLI host that dies
+ * mid-step, its step's start saved and its coder's commit made — or,
+ * continuing a session, dies in the Captain's decision call. */
+async function stopWriterMidStep(sessionsDir: string, projectPath: string, configPath: string, input: string, continued?: string): Promise<string> {
+  const child = spawn(process.execPath, [join(dirname(new URL(import.meta.url).pathname), "testing", "stopped-writer.js"), sessionsDir, projectPath, configPath, input, ...(continued ? [continued] : [])], { stdio: ["ignore", "pipe", "inherit"] });
+  const sessionId = await new Promise<string>((resolveReady, reject) => {
+    let out = "";
+    child.stdout.on("data", (chunk) => {
+      out += String(chunk);
+      const ready = /READY (\S+)/.exec(out);
+      if (ready) resolveReady(ready[1]!);
+    });
+    child.once("exit", (code) => reject(new Error(`the stopped writer exited early (${code}): ${out}`)));
+  });
+  const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+  child.kill("SIGKILL");
+  await exited;
+  return sessionId;
+}
+
+test("core-service-84: a writer stopped mid-step restores to its saved step and publishes the run's controls", { timeout: 120_000 }, async (t) => {
+  const dir = scratchDir("spex-stopped-writer-");
+  const configPath = join(dir, "config.yaml");
+  const projectPath = join(dir, "project");
+  const dataDir = join(dir, "state");
+  mkdirSync(projectPath);
+  execFileSync("git", ["init", "-q", projectPath]);
+  seedRepository(projectPath);
+  writeFileSync(configPath, VALID_CONFIG);
+  // The CLI writes into the session store of the spex repository the
+  // project pairs with (storage-6).
+  const { sessionsDir } = pairedHome(dataDir, projectPath);
+  const sessionId = await stopWriterMidStep(sessionsDir, projectPath, configPath, "Add a line to work.txt");
+  const { imports, stats } = fakeAdapterImports(parkingScript());
+  const service = await CoreService.start({ token: "test", configPath, dataDir, adapterImports: imports, adapterRuntime: () => ({ usable: true }), env: {}, home: join(dir, "home"), watchConfig: false });
+  t.after(async () => { await service.stop(); rmSync(dir, { recursive: true, force: true }); });
+  const client = new Client(service.port());
+  t.after(() => client.close());
+  await client.open();
+  await client.expectOk("project.register", { path: projectPath });
+
+  // The stopped step is recorded work: the summary says so, names the
+  // way on, and withholds Discard (core-service-32).
+  const interrupted = (await client.expectOk("session.list", {})).find((entry) => entry.id === sessionId);
+  assert.deepEqual(interrupted?.recovery, { state: "uncertain", input: "Add a line to work.txt", discardable: false });
+  assert.equal(interrupted?.continuationReason, "Restore the interrupted turn first");
+  const blocked = await client.command("turn.submit", { sessionId, text: "Something else" });
+  assert.ok(!blocked.ok && blocked.error.message === "Restore the interrupted turn first", JSON.stringify(blocked));
+  const refused = await client.command("session.discard", { sessionId });
+  assert.ok(!refused.ok && /restored and reported/.test(refused.error.message), JSON.stringify(refused));
+  assert.equal(validateSessionManifest(await createSessionStore({ sessionsDir }).readManifest(sessionId)).state, "uncertain");
+
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId } });
+  await client.expectOk("session.restore", { sessionId });
+  // A repeated request lands on the restore in flight, or on a session
+  // with nothing left to restore; either way it starts no second turn.
+  const repeated = await client.command("session.restore", { sessionId });
+  assert.ok(!repeated.ok, JSON.stringify(repeated));
+  const restored = await client.waitFor((m) => m.type === "session.state" && m.session.id === sessionId &&
+    !m.session.recovery && !m.session.live && !m.session.turnActive, 60_000);
+  assert.ok(restored.type === "session.state");
+  assert.equal(client.records("session").filter(({ record }) => record.type === "turn_started").length, 1, "one report, and no second turn");
+  // The saved step comes back and is reported; nothing runs again
+  // (core-service-82).
+  assert.equal(stats.runs.length, 0, "Restore calls no agent");
+  assert.ok(client.records("session").some(({ record }) => record.type === "captain_reply"), "the restore reports through the Captain");
+  const position = client.records("session").find(({ record }) =>
+    (record as { topic?: unknown }).topic === "spex.session.restored");
+  const runs = (position?.record as { payload?: { runs?: { playbookId: string; state: { stateId?: string }; cause?: { code: string } }[] } } | undefined)?.payload?.runs;
+  assert.deepEqual(runs?.map((run) => [run.playbookId, run.state.stateId, run.cause?.code]), [["code", "failed", "runtime-defect"]],
+    "the restored position is in the stream, the run at its failure state");
+  // Where the run stands, its controls: captured at the restore's
+  // settlement exactly as at any other (core-service-91).
+  assert.equal(restored.session.continuable, true, restored.session.continuationReason ?? "no reason given");
+  assert.equal(restored.session.parked?.reason, "failure");
+  assert.deepEqual(restored.session.parked?.actions.map((action) => [action.id, action.standing]),
+    [["reconcile:unresolved-effect", "no-op"], ["abandon:unresolved-effect", "ready"]]);
+  assert.equal(restored.session.parked?.ending?.id, "give-up");
+  // The run the restore brought back in its failure state summons as a
+  // failure, with the cause the runtime attached (core-service-49).
+  const ledger = await client.expectOk("ledger.get", {});
+  assert.deepEqual(ledger.attention.filter((entry) => entry.sessionId === sessionId)
+    .map((entry) => [entry.band, entry.kind, entry.parked, entry.cause?.code]), [["interrupted", "failure", true, "runtime-defect"]]);
+});
+
+test("core-service-84: a restore bringing back a run the Boss stopped himself raises no failure", { timeout: 180_000 }, async (t) => {
+  const dir = scratchDir("spex-restored-stop-");
+  const configPath = join(dir, "config.yaml");
+  const projectPath = join(dir, "project");
+  const dataDir = join(dir, "state");
+  mkdirSync(projectPath);
+  execFileSync("git", ["init", "-q", projectPath]);
+  seedRepository(projectPath);
+  writeFileSync(configPath, VALID_CONFIG);
+  const { imports } = fakeAdapterImports(parkingScript({ held: true }));
+  const service = await CoreService.start({ token: "test", configPath, dataDir, adapterImports: imports, adapterRuntime: () => ({ usable: true }), env: {}, home: join(dir, "home"), watchConfig: false });
+  t.after(async () => { await service.stop(); });
+  const client = new Client(service.port());
+  t.after(() => client.close());
+  await client.open();
+  const project = await client.expectOk("project.register", { path: projectPath });
+  // The CLI writes into the session store of the project's clone (storage-6).
+  const sessionsDir = projectSessions(dataDir, project.id);
+  const intent = await client.expectOk("intent.queue", { projectId: project.id, text: "Add a line to work.txt" });
+  const session = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId: session.id } });
+  await client.expectOk("turn.submit", { sessionId: session.id, text: intent.text, intentId: intent.id });
+  const deadline = Date.now() + 60_000;
+  while (!readFileSync(join(projectPath, "work.txt"), "utf8").includes("phase 1")) {
+    if (Date.now() > deadline) throw new Error("the coder never committed");
+    await sleep(20);
+  }
+  // The Boss stops the step himself: the run parks in its failure
+  // state, and his own stop summons no one.
+  await client.expectOk("turn.abort", { sessionId: session.id });
+  await settledSession(client, session.id, 1);
+  assert.deepEqual((await client.expectOk("ledger.get", {})).attention.filter((entry) => entry.sessionId === session.id), []);
+
+  // His next message is lost to a CLI writer that dies in the Captain's
+  // call, and Restore brings back the position before it: the run
+  // still parked where he stopped it.
+  await stopWriterMidStep(sessionsDir, projectPath, configPath, "Keep going", session.id);
+  await service["syncForeignSessions"]();
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === session.id && m.session.recovery?.input === "Keep going", 30_000);
+  const seen = client.messages.length;
+  await client.expectOk("session.restore", { sessionId: session.id });
+  const restored = await client.waitFor((m) => client.messages.indexOf(m) >= seen && m.type === "session.state" &&
+    m.session.id === session.id && !m.session.recovery && !m.session.live && !m.session.turnActive, 60_000);
+  assert.ok(restored.type === "session.state");
+  const runs = client.records("session").flatMap(({ record }) =>
+    (record as { topic?: unknown }).topic === "spex.session.restored"
+      ? (record as unknown as { payload: { runs: { playbookId: string; state: { stateId?: string }; cause?: { code: string } }[] } }).payload.runs
+      : []);
+  assert.deepEqual(runs.map((run) => [run.playbookId, run.state.stateId, run.cause?.code]), [["code", "failed", "aborted"]]);
+  // The restore moved no run into failure, so none summons; the park
+  // and its controls stand as his stop left them (core-service-82).
+  const ledger = await client.expectOk("ledger.get", {});
+  assert.deepEqual(ledger.attention.filter((entry) => entry.sessionId === session.id), []);
+  assert.equal(ledger.intents.find((entry) => entry.intent.id === intent.id)?.next?.standing, "failure-park");
+  assert.equal(restored.session.parked?.reason, "failure");
+});
+
+test("core-service-84: a restore whose core stopped before recording the position is completed once when a core next reads it", { timeout: 180_000 }, async () => {
+  const dir = scratchDir("spex-restore-crash-");
+  const configPath = join(dir, "config.yaml");
+  const projectPath = join(dir, "project");
+  const dataDir = join(dir, "state");
+  mkdirSync(projectPath);
+  execFileSync("git", ["init", "-q", projectPath]);
+  seedRepository(projectPath);
+  writeFileSync(configPath, VALID_CONFIG);
+  // The CLI writes into the session store of the spex repository the
+  // project pairs with (storage-6).
+  const { sessionsDir } = pairedHome(dataDir, projectPath);
+  const sessionId = await stopWriterMidStep(sessionsDir, projectPath, configPath, "Add a line to work.txt");
+  const { imports, stats } = fakeAdapterImports(parkingScript());
+
+  // A core marks the restore and reports it, then stops before it
+  // records where the runs stand: the stream holds the marker and the
+  // settled report, and no position.
+  const controller = await openSessionHost({
+    store: createSessionStore({ sessionsDir }), sessionId, mode: "recover", cwd: projectPath,
+    loadModule: (specifier: string) => import(specifier), adapterImports: imports,
+  });
+  const saved = await controller.read();
+  assert.equal(saved?.state, "uncertain");
+  await controller.lease.append(restoringRecord(saved!.uncertain!.input, Date.now()));
+  await controller.recover();
+  assert.equal((await controller.read())?.state, "settled");
+  await controller.dispose();
+
+  const start = () => CoreService.start({ token: "test", configPath, dataDir, adapterImports: imports, adapterRuntime: () => ({ usable: true }), env: {}, home: join(dir, "home"), watchConfig: false });
+  const positions = (records: { record: TmuxPlayRecord }[]) => records.flatMap(({ record }) =>
+    (record as { topic?: unknown }).topic === "spex.session.restored"
+      ? [record as unknown as { turnId: number; payload: { runs: { playbookId: string; state: { stateId?: string }; cause?: { code: string } }[] } }]
+      : []);
+  let service = await start();
+  try {
+    const client = new Client(service.port());
+    await client.open();
+    await client.expectOk("project.register", { path: projectPath });
+    const history = (await client.expectOk("history.get", { sessionId })).records;
+    const report = history.filter(({ record }) => record.type === "turn_started").at(-1)?.record as { turn: { id: number } } | undefined;
+    // The core reading the session completed the restore from the
+    // settled checkpoint: one position, naming the report's turn
+    // (core-service-82) ...
+    const recorded = positions(history);
+    assert.equal(recorded.length, 1);
+    assert.equal(recorded[0]?.turnId, report?.turn.id);
+    assert.deepEqual(recorded[0]?.payload.runs.map((run) => [run.playbookId, run.state.stateId, run.cause?.code]), [["code", "failed", "runtime-defect"]]);
+    // ... so the report reads as the stop it accounts for, and the run it
+    // brought back failed summons with the checkpoint's cause.
+    const ledger = await client.expectOk("ledger.get", {});
+    assert.deepEqual(ledger.attention.filter((entry) => entry.sessionId === sessionId)
+      .map((entry) => [entry.band, entry.kind, entry.parked, entry.cause?.code]), [["interrupted", "failure", true, "runtime-defect"]]);
+    const listed = (await client.expectOk("session.list", {})).find((entry) => entry.id === sessionId);
+    assert.equal(listed?.recovery, undefined);
+    assert.equal(listed?.continuable, true, listed?.continuationReason ?? "no reason given");
+    client.close();
+  } finally { await service.stop(); }
+
+  // Completing is idempotent: a later start appends nothing more.
+  service = await start();
+  try {
+    const client = new Client(service.port());
+    await client.open();
+    await client.expectOk("project.register", { path: projectPath });
+    assert.equal(positions((await client.expectOk("history.get", { sessionId })).records).length, 1);
+    client.close();
+  } finally { await service.stop(); }
+  assert.equal(stats.runs.length, 0, "completing a restore calls no agent");
+});
+
+test("core-service-84: Restore refuses a session with nothing interrupted and a relocated checkpoint, starting no turn", { timeout: 60_000 }, async (t) => {
+  const harness = await startHarness();
+  const client = new Client(harness.service.port());
+  t.after(async () => { client.close(); await harness.service.stop(); rmSync(harness.dir, { recursive: true, force: true }); });
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  const session = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("session.dispose", { sessionId: session.id });
+  const recordsBefore = (await client.expectOk("history.get", { sessionId: session.id })).records.length;
+
+  // A stale Restore — another client or the CLI got there first — is
+  // refused before anything opens, so it writes nothing.
+  const settled = await client.command("session.restore", { sessionId: session.id });
+  assert.ok(!settled.ok && settled.error.code === "invalid_request", JSON.stringify(settled));
+  assert.match(settled.error.message, /no interrupted turn to restore/);
+  assert.equal((await client.expectOk("history.get", { sessionId: session.id })).records.length, recordsBefore);
+  const unchanged = (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+  assert.equal(unchanged?.failed, false);
+  assert.equal(unchanged?.continuable, true);
+
+  // An interrupted turn whose repository has since moved: Playbook
+  // refuses to reconcile a relocated checkpoint, and says why.
+  const shared = createSessionStore({ sessionsDir: projectSessions(harness.dataDir) });
+  const lease = await shared.acquire(session.id);
+  try {
+    const prior = await lease.read();
+    assert.ok(prior);
+    await lease.beginTurn({ input: "Interrupted here", attemptId: randomUUID(), attemptedExecutionProjection: prior.lastAppliedExecutionProjection });
+  } finally { await lease.release(); }
+  const relocated = join(harness.dir, "relocated-project");
+  mkdirSync(relocated);
+  execFileSync("git", ["init", "-q", relocated]);
+  await client.expectOk("project.rebind", { projectId: project.id, path: relocated, aliases: [harness.projectDir] });
+  await harness.service["syncForeignSessions"]();
+  const moved = (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+  assert.equal(moved?.recovery?.input, "Interrupted here");
+  const refused = await client.command("session.restore", { sessionId: session.id });
+  assert.ok(!refused.ok && refused.error.code === "invalid_request", JSON.stringify(refused));
+  assert.match(refused.error.message, /relocation is unsupported/);
+  const after = (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+  assert.equal(after?.recovery?.input, "Interrupted here", "the interrupted turn still stands");
+  assert.equal(after?.turns, moved?.turns, "no turn started");
+  assert.equal(after?.live, false);
+  assert.equal(harness.stats.runs.length, 0);
+});
+
+// Review regressions exercise the public protocol with independent files.
+test("core-service-86: damaged sessions refuse only their own execution and remain deletable", async (t) => {
+  const harness = await startHarness(VALID_CONFIG, {realShell:true});
+  const client = new Client(harness.service.port()); await client.open();
+  t.after(async () => {client.close(); await harness.service.stop(); rmSync(harness.dir,{recursive:true,force:true});});
+  const project = await client.expectOk("project.register", {path:harness.projectDir});
+  const damaged = await client.expectOk("session.create", {projectId:project.id});
+  await client.expectOk("session.dispose", {sessionId:damaged.id});
+  const manifestFile = join(projectSessions(harness.dataDir),`${damaged.id}.json`);
+  const manifest = (await readSessionManifest(manifestFile));
+  manifest.replay.sha256 = "0".repeat(64); await writeSessionManifest(manifestFile, manifest);
+  await harness.service["syncForeignSessions"]();
+  const reports = await client.expectOk("storage.diagnostics", {});
+  assert.ok(reports.some((report) => report.blocking && report.file.endsWith(`${damaged.id}.json`)));
+  for (const type of ["turn.submit","session.restore","session.discard"] as const) {
+    const reply = type === "turn.submit" ? await client.command(type,{sessionId:damaged.id,text:"resume"}) : await client.command(type,{sessionId:damaged.id});
+    assert.ok(!reply.ok && reply.error.code === "invalid_request", JSON.stringify(reply));
+    assert.ok(!reply.ok && reply.error.message.includes(`${damaged.id}.json`));
+  }
+  await client.expectOk("config.edit", {op:{kind:"captain.set",patch:{instruction:"Independent edit"}}});
+  await client.expectOk("intent.queue", {projectId:project.id,text:"Healthy queue"});
+  const healthy = await client.expectOk("session.create", {projectId:project.id});
+  await client.expectOk("session.delete", {sessionId:damaged.id});
+  assert.equal(existsSync(manifestFile),false);
+  assert.equal((await client.expectOk("session.list", {})).find((session) => session.id === healthy.id)?.live,true);
+});
+
+// One file per intent (storage-4): a file that will not read is listed
+// nowhere and reported without blocking, an intent file a second clone
+// holds too is read once, and two open intents holding one source both
+// stand — the damage stays with that file (storage-12).
+for (const defect of ["malformed JSON", "mismatched id", "duplicate intent", "duplicate open source"] as const) {
+  test(`core-service-86: ${defect} intent file damage is isolated at startup`, async (t) => {
+    const harness = await startHarness(VALID_CONFIG, {realShell:true});
+    let service = harness.service; let client = new Client(service.port()); await client.open();
+    t.after(async () => {client.close(); await service.stop(); rmSync(harness.dir,{recursive:true,force:true});});
+    const bad = await client.expectOk("project.register", {path:harness.projectDir});
+    const goodPath = join(harness.dir, "good"); mkdirSync(goodPath); execFileSync("git", ["init", "-q", goodPath]);
+    const good = await client.expectOk("project.register", {path:goodPath});
+    const first = await client.expectOk("intent.queue", {projectId:bad.id,text:"A",source:{kind:"issue",ref:"1"}});
+    const second = await client.expectOk("intent.queue", {projectId:bad.id,text:"B"});
+    const healthy = await client.expectOk("intent.queue", {projectId:good.id,text:"Healthy"});
+    client.close(); await service.stop();
+    const intentsDir = join(clonePath(harness.dataDir, bad.id), "intents");
+    const id = defect === "duplicate intent" ? healthy.id : randomUUID();
+    const file = join(intentsDir, `${id}.json`);
+    if (defect === "malformed JSON") writeFileSync(file, "broken JSON\n");
+    if (defect === "mismatched id") writeFileSync(file, JSON.stringify({format:1,id:randomUUID(),text:"Named for another",createdAt:1}));
+    if (defect === "duplicate intent") writeFileSync(file, readFileSync(join(clonePath(harness.dataDir, good.id), "intents", `${healthy.id}.json`)));
+    if (defect === "duplicate open source") writeFileSync(file, JSON.stringify({format:1,id,text:"Duplicate",createdAt:1,source:{kind:"issue",ref:"1"}}));
+    const before = readFileSync(file);
+    service = await CoreService.start({token:"test",dataDir:harness.dataDir,configPath:join(harness.dir,"playbook.config.yaml"),env:{},home:join(harness.dir,"home"),watchConfig:false,adapterImports:fakeAdapterImports({}).imports});
+    client = new Client(service.port()); await client.open();
+    const reports = await client.expectOk("storage.diagnostics",{});
+    const listed = (await client.expectOk("ledger.get",{})).intents.map((entry) => entry.intent);
+    const count = (intentId: string) => listed.filter((intent) => intent.id === intentId).length;
+    for (const intact of [first, second, healthy]) assert.equal(count(intact.id), 1, `${intact.text} is listed once`);
+    if (defect === "duplicate open source") {
+      // Nothing is dropped: both stand, and the source admits no third.
+      assert.equal(count(id), 1);
+      const again = await client.command("intent.queue",{projectId:bad.id,text:"Again",source:{kind:"issue",ref:"1"}});
+      assert.ok(!again.ok && again.error.code === "conflict", JSON.stringify(again));
+    } else {
+      assert.ok(reports.some((report) => report.file === file && !report.blocking), JSON.stringify(reports));
+      if (defect === "duplicate intent") assert.equal(listed.find((intent) => intent.id === healthy.id)?.projectId, good.id);
+      else assert.equal(count(id), 0, "a file that will not read is listed nowhere");
+    }
+    // Every other intent of the project, and the project itself, stay writable.
+    await client.expectOk("intent.queue",{projectId:bad.id,text:"Still queueable"});
+    await client.expectOk("intent.edit",{intentId:second.id,text:"Still editable"});
+    await client.expectOk("intent.edit",{intentId:healthy.id,text:"Still editable"});
+    await client.expectOk("config.edit",{op:{kind:"captain.set",patch:{instruction:"Still configurable"}}});
+    await client.expectOk("session.create",{projectId:good.id});
+    assert.deepEqual(readFileSync(file),before,"the damaged file's bytes are preserved");
+  });
+}
+
+for (const file of ["home.yaml", "local/prefs.json"]) {
+  test(`core-service-86: invalid ${file} leaves independent configuration available`, async (t) => {
+    const harness=await startHarness(); let service=harness.service; let client=new Client(service.port()); await client.open();
+    t.after(async()=>{client.close(); await service.stop(); rmSync(harness.dir,{recursive:true,force:true});});
+    const project=await client.expectOk("project.register",{path:harness.projectDir});
+    const session=await client.expectOk("session.create",{projectId:project.id});
+    // A marker may name only an ended turn (core-service-48), so the
+    // session runs one: the refusal below must be the damaged file's,
+    // not the guard's.
+    await client.expectOk("subscribe",{channel:{kind:"session",sessionId:session.id}});
+    await client.expectOk("turn.submit",{sessionId:session.id,text:"hello"});
+    const ended=await client.waitFor((m)=>m.type==="record"&&m.sessionId===session.id&&m.record.type==="turn_finished");
+    const turnId=ended.type==="record"?(ended.record.turnId ?? -1):-1;
+    assert.ok(turnId>=0);
+    await client.expectOk("session.dispose",{sessionId:session.id});
+    client.close(); await service.stop();
+    const path=join(harness.dataDir,file); writeFileSync(path,"{bad JSON}");
+    service=await CoreService.start({token:"test",dataDir:harness.dataDir,configPath:join(harness.dir,"playbook.config.yaml"),env:{},home:join(harness.dir,"home"),watchConfig:false});
+    client=new Client(service.port()); await client.open();
+    assert.ok((await client.expectOk("storage.diagnostics",{})).some((report)=>report.blocking&&report.file.endsWith(file)));
+    await client.expectOk("config.edit",{op:{kind:"captain.set",patch:{instruction:"Independent config"}}});
+    const refused=file==="local/prefs.json" ? await client.command("session.viewed",{sessionId:session.id,turnId}) : await client.command("project.register",{path:harness.projectDir});
+    assert.ok(!refused.ok&&refused.error.code==="invalid_request",JSON.stringify(refused));
+    if (file !== "local/prefs.json") {
+      const destination=join(harness.dir,"must-not-be-created");
+      const creation=await client.command("project.create",{path:destination});
+      assert.ok(!creation.ok&&creation.error.code==="invalid_request",JSON.stringify(creation));
+      assert.equal(existsSync(destination),false,"registry refusal precedes scaffolding or Git writes");
+    }
+    assert.equal(readFileSync(path,"utf8"),"{bad JSON}");
+  });
+}
+
+/** Pause after a real lease read to reproduce a scan begun before local admission. */
+test("core-service-32: a pending foreign scan cannot overwrite locally acquired ownership", async (t) => {
+  const harness=await startHarness(VALID_CONFIG,{realShell:true});
+  const client=new Client(harness.service.port()); await client.open();
+  t.after(async()=>{client.close(); await harness.service.stop(); rmSync(harness.dir,{recursive:true,force:true});});
+  const project=await client.expectOk("project.register",{path:harness.projectDir});
+  const session=await client.expectOk("session.create",{projectId:project.id});
+  await client.expectOk("session.dispose",{sessionId:session.id});
+  // The session's store is its project's clone's (storage-6).
+  const store=harness.service["store"]; const repository=store.repository(project.id)!; const shared=repository.store;
+  let release!:()=>void; const paused=new Promise<void>((resolve)=>{release=resolve;});
+  let observed!:()=>void; const entered=new Promise<void>((resolve)=>{observed=resolve;});
+  let intercept=true;
+  repository.store={...shared,readLeaseState:async(id)=>{
+    const result=await shared.readLeaseState(id);
+    if (intercept&&id===session.id) {intercept=false; observed(); await paused; return "active";}
+    return result;
+  }};
+  const scan=store.refreshSession(session.id,false); await entered;
+  try {
+    await client.expectOk("turn.submit",{sessionId:session.id,text:"Local continuation"});
+    release(); await scan;
+    const listed=(await client.expectOk("session.list",{})).find((item)=>item.id===session.id)!;
+    assert.equal(listed.live,true); assert.equal(listed.externalWriter,undefined);
+    assert.equal(store.describeSession(session.id)?.externalWriter,undefined);
+    await client.waitFor((message)=>message.type==="session.state"&&message.session.id===session.id&&message.session.turns===1&&message.session.turnActive===false);
+    assert.ok(client.messages.filter((message)=>message.type==="session.state"&&message.session.id===session.id).every((message)=>message.type!=="session.state"||message.session.externalWriter===undefined));
+  } finally {release(); await scan;}
+});
+
+/** The replay terminal record does not grant permission to end the transaction. */
+test("core-service-32/39: shutdown waits for a paused durable settlement after runtime completion", async (t) => {
+  const harness=await startHarness(VALID_CONFIG,{realShell:true});
+  const client=new Client(harness.service.port()); await client.open();
+  let stopped=false;
+  let release!:()=>void;
+  t.after(async()=>{release?.(); client.close(); if(!stopped) await harness.service.stop(); rmSync(harness.dir,{recursive:true,force:true});});
+  // The session's store is its project's clone's (storage-6).
+  const project=await client.expectOk("project.register",{path:harness.projectDir});
+  const store=harness.service["store"]; const original=store.sessionStore.bind(store); const shared=original(project.id);
+  const paused=new Promise<void>((resolve)=>{release=resolve;});
+  let settling!:()=>void; const entered=new Promise<void>((resolve)=>{settling=resolve;});
+  store.sessionStore=(key?:string)=>key!==project.id?original(key):({...shared,acquire:async(id)=>{
+    const lease=await shared.acquire(id);
+    return {...lease,settle:async(...args:Parameters<typeof lease.settle>)=>{settling(); await paused; return lease.settle(...args);}};
+  }});
+  const session=await client.expectOk("session.create",{projectId:project.id});
+  await client.expectOk("subscribe",{channel:{kind:"session",sessionId:session.id}});
+  await client.expectOk("turn.submit",{sessionId:session.id,text:"Settle exactly once"});
+  await entered;
+  const manifestFile=join(projectSessions(harness.dataDir),`${session.id}.json`);
+  assert.equal((await readSessionManifest(manifestFile)).state,"uncertain");
+  await client.waitFor((message)=>message.type==="record"&&message.record.type==="turn_finished");
+  const listed=(await client.expectOk("session.list",{})).find((item)=>item.id===session.id)!;
+  assert.equal(listed.turnActive,true,"durable settlement is still pending");
+  const busy=await client.command("turn.submit",{sessionId:session.id,text:"Too early"});
+  assert.ok(!busy.ok&&busy.error.code==="busy");
+  let finished=false; const stop=harness.service.stop().then(()=>{finished=true;stopped=true;});
+  try {
+    await new Promise<void>((resolve)=>setImmediate(resolve));
+    assert.equal(finished,false,"shutdown joins the pending transaction");
+    release(); await stop;
+    const checked=await shared.validate(session.id);
+    assert.equal(checked.manifest.state,"settled"); assert.equal(checked.integrityValid,true);
+    assert.equal((checked.manifest as {snapshot?:{sequences?:{turn:number}}}).snapshot?.sequences?.turn,1);
+  } finally {release(); await stop;}
+});
+
+
+test("core-service-81: saved Captain, player context and graphs survive removal of the playbook module", async (t) => {
+  // The session runs the code playbook the project's environment
+  // installs (environments-9); a later core whose modules will not
+  // load stands for that module's removal.
+  const harness=await startHarness(VALID_CONFIG,{realShell:true});
+  let service=harness.service; let client=new Client(service.port()); await client.open();
+  t.after(async()=>{client.close(); await service.stop(); rmSync(harness.dir,{recursive:true,force:true});});
+  const project=await client.expectOk("project.register",{path:harness.projectDir});
+  const session=await client.expectOk("session.create",{projectId:project.id});
+  await client.expectOk("turn.submit",{sessionId:session.id,text:"Retained history"});
+  await client.waitFor((message)=>message.type==="session.state"&&message.session.id===session.id&&message.session.turns===1&&message.session.turnActive===false&&message.session.live===false);
+  const before=await client.expectOk("history.get",{sessionId:session.id});
+  const context=before.records.find((entry)=>(entry.record as {type?:string}).type==="session_context")!.record as unknown as {configuration:{captain:{adapter:string};players:{id:string}[]};graphs:{playbookId:string;graph:unknown}[]};
+  assert.equal(context.configuration.captain.adapter,"claude");
+  assert.equal(context.configuration.players[0].id,"dev.coder");
+  assert.ok(context.graphs.find((entry)=>entry.playbookId==="code")?.graph,"graph stored with context");
+  client.close(); await service.stop();
+  let imports=0;
+  service=await CoreService.start({token:"test",dataDir:harness.dataDir,configPath:join(harness.dir,"playbook.config.yaml"),env:{},home:join(harness.dir,"home"),watchConfig:false,loadModule:async()=>{imports++; throw new Error("playbook module removed");}});
+  client=new Client(service.port()); await client.open();
+  assert.equal((await client.expectOk("config.get",{})).status,"invalid");
+  const importsAtStartup=imports;
+  assert.deepEqual(await client.expectOk("history.get",{sessionId:session.id}),before);
+  const listed=(await client.expectOk("session.list",{})).find((item)=>item.id===session.id)!;
+  assert.deepEqual(listed.players,session.players); assert.deepEqual(listed.initialVisible,session.initialVisible);
+  assert.equal(listed.live,false); assert.equal(listed.turnActive,false);
+  assert.equal(imports,importsAtStartup,"reading saved history and graphs imports no module");
+});
+
+test("core-service-86: unreadable legacy sidecars and forge cache preserve unrelated startup", async (t) => {
+  const harness=await startHarness(VALID_CONFIG,{realShell:true});
+  let service=harness.service; let client=new Client(service.port()); await client.open();
+  t.after(async()=>{client.close(); await service.stop(); rmSync(harness.dir,{recursive:true,force:true});});
+  const project=await client.expectOk("project.register",{path:harness.projectDir});
+  const prior=await client.expectOk("session.create",{projectId:project.id});
+  await client.expectOk("session.dispose",{sessionId:prior.id});
+  client.close(); await service.stop();
+  const sidecar=join(projectSessions(harness.dataDir),`${randomUUID()}.spex.json`);
+  const malformed=join(projectSessions(harness.dataDir),`${randomUUID()}.spex.json`);
+  const malformedBytes=JSON.stringify({id:"../outside-store",projectId:project.id,players:[],initialVisible:[]});
+  const cache=join(harness.dataDir,"local","forge-cache.json");
+  writeFileSync(sidecar,"{broken sidecar",{mode:0o600}); writeFileSync(malformed,malformedBytes,{mode:0o600}); writeFileSync(cache,"{broken cache");
+  service=await CoreService.start({token:"test",dataDir:harness.dataDir,configPath:join(harness.dir,"playbook.config.yaml"),env:{},home:join(harness.dir,"home"),watchConfig:false,adapterImports:fakeAdapterImports({}).imports});
+  client=new Client(service.port()); await client.open();
+  const diagnostics=await client.expectOk("storage.diagnostics",{});
+  assert.ok(diagnostics.some((entry)=>entry.file===sidecar&&entry.reason.length>0));
+  assert.ok(diagnostics.some((entry)=>entry.file===malformed&&entry.reason.length>0));
+  assert.ok(diagnostics.some((entry)=>entry.file===cache&&!entry.blocking));
+  assert.ok((await client.expectOk("session.list",{})).some((session)=>session.id===prior.id));
+  await client.expectOk("config.edit",{op:{kind:"captain.set",patch:{instruction:"Still available"}}});
+  const created=await client.expectOk("session.create",{projectId:project.id});
+  assert.equal(created.live,true);
+  assert.equal(readFileSync(sidecar,"utf8"),"{broken sidecar");
+  assert.equal(readFileSync(malformed,"utf8"),malformedBytes);
+  assert.equal(readFileSync(cache,"utf8"),"{broken cache");
+});
+
+test("storage-15: repeated default-home startup does not grow leases for a refused sidecar", async (t) => {
+  const root=scratchDir("spex-migration-refusal-");
+  const home=join(root,"home");const dataDir=join(home,".spex");
+  // A config file directly under the home's config/ is the former layout
+  // (storage-9), so this one sits outside the home.
+  const configPath=join(root,"playbook.config.yaml");writeFileSync(configPath,VALID_CONFIG);
+  const projectPath=join(root,"project");mkdirSync(projectPath);execFileSync("git",["init","-q",projectPath]);
+  const options={token:"test",configPath,dataDir,home,own:OWN,env:{},watchConfig:false};
+  let service=await CoreService.start(options);let client=new Client(service.port());await client.open();
+  t.after(async()=>{client.close();await service.stop();rmSync(root,{recursive:true,force:true});});
+  const project=await client.expectOk("project.register",{path:projectPath});
+  // The sidecar sits in the session store of the project's clone (storage-6).
+  const sessionsDir=projectSessions(dataDir,project.id);
+  client.close();await service.stop();
+  const id=randomUUID();const sidecar=join(sessionsDir,`${id}.spex.json`);
+  const valid={v:1,id,projectId:project.id,createdAt:1,endedAt:2,live:false,players:[],initialVisible:[]};
+  const refused=JSON.stringify({...valid,v:99});writeFileSync(sidecar,refused,{mode:0o600});
+  const guards=()=>readdirSync(sessionsDir).filter((name)=>name.startsWith(`.${id}.lock`)).sort();
+  for(let restart=0;restart<3;restart++){
+    service=await CoreService.start(options);client=new Client(service.port());await client.open();
+    assert.ok((await client.expectOk("storage.diagnostics",{})).some((entry)=>entry.file===sidecar&&entry.reason.includes("invalid legacy desktop")));
+    assert.equal(readFileSync(sidecar,"utf8"),refused);assert.deepEqual(guards(),[]);
+    client.close();await service.stop();
+  }
+  writeFileSync(sidecar,JSON.stringify(valid));
+  service=await CoreService.start(options);client=new Client(service.port());await client.open();
+  assert.equal(existsSync(sidecar),false);
+  assert.equal((await readSessionManifest(join(sessionsDir,`${id}.json`))).state,"history-only");
+  assert.ok((await client.expectOk("session.list",{})).some((session)=>session.id===id));
+  const migratedGuards=guards();assert.equal(migratedGuards.length,1);
+  client.close();await service.stop();
+  service=await CoreService.start(options);client=new Client(service.port());await client.open();
+  assert.deepEqual(guards(),migratedGuards,"successful migration is not retried on the next startup");
+});
+
+test("core-service-101: a session's own tuning reaches its runtime, its config file, and nothing else", async (t) => {
+  const dir = scratchDir("spex-tuning-");
+  const configPath = join(dir, "playbook.config.yaml");
+  // A binding that pins its own effort, so the session's tuning can be
+  // seen beating it at the site the provider call is built from.
+  const config = VALID_CONFIG.replace(
+    "    roles:\n      coder: dev.coder\n",
+    "    roles:\n      coder:\n        player: dev.coder\n        effort: low\n",
+  ).replace(
+    // The player's own subagent model (DR-093) and fast mode, which the
+    // binding inherits; and a second player leaving its subagent model
+    // unset, which delegates on its own model (DR-095).
+    "    model: claude-test\nplaybooks:",
+    "    model: claude-test\n    subagentModel: claude-sub-config\n    fastMode: true\n  dev.reviewer:\n    adapter: claude\n    model: claude-test\nplaybooks:",
+  ).replace("      reviewer: dev.coder\n", "      reviewer: dev.reviewer\n");
+  writeFileSync(configPath, config);
+  const projectDir = join(dir, "project");
+  mkdirSync(projectDir);
+  execFileSync("git", ["init", "-q", projectDir]);
+  const { imports } = fakeAdapterImports({ fallback: { result: "not json on purpose" } });
+  const service = await CoreService.start({
+    token: "test", configPath, dataDir: join(dir, "state"),
+    adapterImports: imports, env: {}, home: join(dir, "home"), watchConfig: false,
+  });
+  t.after(async () => { await service.stop(); rmSync(dir, {recursive:true,force:true}); });
+  const client = new Client(service.port());
+  t.after(() => client.close());
+  await client.open();
+  const project = await client.expectOk("project.register", { path: projectDir });
+  const tuned = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId: tuned.id } });
+  await client.expectOk("turn.submit", { sessionId: tuned.id, text: "hello" });
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === tuned.id && m.session.live === false);
+
+  const configBefore = readFileSync(configPath);
+
+  // The Captain and the player are tuned for this session alone.
+  const afterCaptain = await client.expectOk("session.agent.set", { sessionId: tuned.id, agentId: "captain", model: "claude-captain-tuned", subagentModel: "claude-sub-captain" });
+  assert.deepEqual(afterCaptain.agentSettings?.captain, { model: "claude-captain-tuned", subagentModel: "claude-sub-captain" }, "the reply carries the session's own agent settings");
+  await client.expectOk("session.agent.set", { sessionId: tuned.id, agentId: "dev.coder", model: "claude-coder-tuned", effort: "high", subagentModel: "claude-sub-tuned", subagentEffort: "medium" });
+  // The second player is tuned in its subagent effort alone.
+  await client.expectOk("session.agent.set", { sessionId: tuned.id, agentId: "dev.reviewer", subagentEffort: "high" });
+
+  // The projection the next message opens on carries it at all three
+  // sites: the Captain, the player's block, and the role binding the
+  // provider call is actually built from (core-service-92).
+  await client.expectOk("turn.submit", { sessionId: tuned.id, text: "hello again" });
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === tuned.id && m.session.turns === 2 && m.session.live === false);
+  const manifest = join(projectSessions(join(dir, "state"), project.id), `${tuned.id}.json`);
+  const applied = ((await readSessionManifest(manifest)) as {
+    lastAppliedExecutionProjection: {
+      captain: { model: { value?: string }; subagentModel?: string };
+      players: { id: string; model: { value?: string }; effort: { value?: string }; subagentModel?: string; subagentEffort?: string }[];
+      catalog: Record<string, { roles: Record<string, { model: { value?: string }; effort: { value?: string }; subagentModel?: string; subagentEffort?: string }> }>;
+    };
+  }).lastAppliedExecutionProjection;
+  assert.equal(applied.captain.model.value, "claude-captain-tuned", "the Captain ran the session's own model");
+  assert.equal(applied.players[0]?.model.value, "claude-coder-tuned", "the player's block carries it");
+  assert.equal(applied.catalog.code?.roles.coder?.model.value, "claude-coder-tuned", "and so does the binding the call is built from");
+  assert.equal(applied.catalog.code?.roles.coder?.effort.value, "high", "the session's effort beats the binding's own pin");
+  // The subagent model reaches the same three sites (DR-093).
+  assert.equal(applied.captain.subagentModel, "claude-sub-captain", "the Captain's subagents run the session's own choice");
+  assert.equal(applied.players[0]?.subagentModel, "claude-sub-tuned", "the player's block carries its subagent model");
+  assert.equal(applied.catalog.code?.roles.coder?.subagentModel, "claude-sub-tuned", "and so does its binding"); 
+  // And so does the subagent effort (DR-095).
+  assert.equal(applied.players[0]?.subagentEffort, "medium", "the player's block carries its subagent effort");
+  assert.equal(applied.catalog.code?.roles.coder?.subagentEffort, "medium", "and so does its binding");
+  // An effort tuned on a player whose subagent model is unset runs on
+  // that player's own model, at its block and at the binding naming it
+  // (core-service-16).
+  const reviewer = applied.players.find((player) => player.id === "dev.reviewer");
+  assert.deepEqual(
+    { model: reviewer?.subagentModel, effort: reviewer?.subagentEffort },
+    { model: "inherit", effort: "high" },
+    "the unset player's block delegates on its own model at the tuned effort",
+  );
+  assert.deepEqual(
+    { model: applied.catalog.review?.roles.reviewer?.subagentModel, effort: applied.catalog.review?.roles.reviewer?.subagentEffort },
+    { model: "inherit", effort: "high" },
+    "and so does the binding naming it",
+  );
+
+  // Another session of the same project and the same player opens on
+  // the config's values, and the config file itself never moved.
+  const plain = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("turn.submit", { sessionId: plain.id, text: "hello" });
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === plain.id && m.session.live === false);
+  const other = ((await readSessionManifest(join(projectSessions(join(dir, "state"), project.id), `${plain.id}.json`))) as {
+    lastAppliedExecutionProjection: {
+      captain: { model: { value?: string }; subagentModel?: string };
+      players: { id: string; subagentModel?: string; subagentEffort?: string }[];
+      catalog: Record<string, { roles: Record<string, { model: { value?: string }; effort: { value?: string }; fastMode?: boolean; subagentModel?: string }> }>;
+    };
+  }).lastAppliedExecutionProjection;
+  assert.equal(other.captain.model.value, "claude-test", "an untuned session keeps the config's Captain");
+  // An unset subagent model delegates on the agent's own model by
+  // default, with no effort beside it (core-service-16).
+  assert.equal(other.captain.subagentModel, "inherit", "and its own model for its subagents where the config sets none");
+  assert.equal(other.players[0]?.subagentEffort, undefined, "and no subagent effort where the config sets none");
+  const untunedReviewer = other.players.find((player) => player.id === "dev.reviewer");
+  assert.deepEqual(
+    { model: untunedReviewer?.subagentModel, effort: untunedReviewer?.subagentEffort },
+    { model: "inherit", effort: undefined },
+    "the unset player delegates on its own model at efforts of its choosing",
+  );
+  assert.equal(other.catalog.review?.roles.reviewer?.subagentModel, "inherit", "and so does the binding naming it");
+  assert.equal(other.players[0]?.subagentModel, "claude-sub-config", "the config's subagent model at the player");
+  assert.equal(other.catalog.code?.roles.coder?.subagentModel, "claude-sub-config", "and at the binding inheriting it");
+  // Playbook builds the call from the binding alone, so a binding setting
+  // no fast mode carries its player's, as the launcher resolves it
+  // (core-service-16).
+  assert.equal(other.catalog.code?.roles.coder?.fastMode, true, "the player's fast mode at the binding inheriting it");
+  assert.equal(other.catalog.code?.roles.coder?.model.value, "claude-test", "and the config's player");
+  assert.equal(other.catalog.code?.roles.coder?.effort.value, "low", "binding pins still stand where nothing tuned them");
+  assert.deepEqual(readFileSync(configPath), configBefore, "the shared config file is byte-identical");
+
+  // A value the adapter cannot enforce is refused with nothing written.
+  const refused = await client.command("session.agent.set", { sessionId: tuned.id, agentId: "dev.coder", effort: "not-an-effort" });
+  assert.ok(!refused.ok && refused.error.code === "invalid_config", `refused: ${JSON.stringify(refused)}`);
+  const unchanged = (await client.expectOk("session.list", {})).find((s: SessionInfo) => s.id === tuned.id);
+  assert.equal(unchanged?.agentSettings?.["dev.coder"]?.effort, "high", "the refusal left the session's tuning as it was");
+
+  // `false` is stored as the provider's default, distinct from clearing.
+  // Its effort goes with it: with no subagent model there is none to set.
+  const providerDefault = await client.expectOk("session.agent.set", { sessionId: tuned.id, agentId: "dev.coder", subagentModel: false, subagentEffort: null });
+  assert.equal(providerDefault.agentSettings?.["dev.coder"]?.subagentModel, false);
+
+  // An agent the session does not hold is refused as a request.
+  const unknown = await client.command("session.agent.set", { sessionId: tuned.id, agentId: "dev.nobody", model: "x" });
+  assert.ok(!unknown.ok && unknown.error.code === "invalid_request", `unknown agent refused: ${JSON.stringify(unknown)}`);
+
+  // Clearing returns the session to the config's values, and deleting
+  // it leaves no tuning behind (core-service-70).
+  // A subagent effort beside a subagent model switched off, or naming
+  // the orchestration effort, is refused with the tuning unchanged
+  // (DR-095).
+  for (const [change, words] of [
+    [{ subagentEffort: "low" }, /subagentEffort for adapter "claude" requires subagentModel/],
+    [{ subagentModel: "claude-sub-tuned", subagentEffort: "ultracode" }, /subagentEffort for adapter "claude" must be one of: minimal, low, medium, high, xhigh, max/],
+  ] as const) {
+    const refusedEffort = await client.command("session.agent.set", { sessionId: tuned.id, agentId: "dev.coder", ...change });
+    assert.ok(!refusedEffort.ok && refusedEffort.error.code === "invalid_config", `refused: ${JSON.stringify(refusedEffort)}`);
+    assert.match(refusedEffort.error.message, words);
+  }
+  const keptEffort = (await client.expectOk("session.list", {})).find((s: SessionInfo) => s.id === tuned.id);
+  assert.deepEqual(
+    { model: keptEffort?.agentSettings?.["dev.coder"]?.subagentModel, effort: keptEffort?.agentSettings?.["dev.coder"]?.subagentEffort },
+    { model: false, effort: undefined },
+    "the refusals left the session's tuning as it was",
+  );
+
+  const cleared = await client.expectOk("session.agent.set", { sessionId: tuned.id, agentId: "dev.coder", model: null, effort: null, fastMode: null, subagentModel: null, subagentEffort: null });
+  assert.equal(cleared.agentSettings?.["dev.coder"], undefined, "the agent's tuning is gone");
+  await client.expectOk("session.agent.set", { sessionId: tuned.id, agentId: "dev.reviewer", subagentEffort: null });
+  // An effort tuned on an agent whose subagent model is unset runs on
+  // the agent's own model (core-service-16).
+  await client.expectOk("session.agent.set", { sessionId: tuned.id, agentId: "captain", subagentModel: null, subagentEffort: "low" });
+  await client.expectOk("turn.submit", { sessionId: tuned.id, text: "at low" });
+  await client.waitFor((m) => m.type === "session.state" && m.session.id === tuned.id && m.session.turns === 3 && m.session.live === false);
+  const own = ((await readSessionManifest(manifest)) as {
+    lastAppliedExecutionProjection: { captain: { subagentModel?: string; subagentEffort?: string } };
+  }).lastAppliedExecutionProjection;
+  assert.deepEqual(
+    { model: own.captain.subagentModel, effort: own.captain.subagentEffort },
+    { model: "inherit", effort: "low" },
+  );
+  await client.expectOk("session.agent.set", { sessionId: tuned.id, agentId: "captain", model: null, subagentModel: null, subagentEffort: null });
+  const bare = (await client.expectOk("session.list", {})).find((s: SessionInfo) => s.id === tuned.id);
+  assert.equal(bare?.agentSettings, undefined, "a session tuning nothing carries none");
+
+  // A structural change is named before the tuning it strands: the
+  // player's adapter moved to one serving no subagent model, so
+  // continuing the session tuned with one is refused as the adapter's
+  // drift, offering a new session (core-service-92).
+  await client.expectOk("session.agent.set", { sessionId: tuned.id, agentId: "dev.coder", subagentModel: "claude-sub-tuned" });
+  const onCodexConfig = config.replace(
+    "  dev.coder:\n    adapter: claude\n    model: claude-test\n    subagentModel: claude-sub-config\n    fastMode: true\n",
+    "  dev.coder:\n    adapter: codex\n    model: claude-test\n",
+  );
+  assert.notEqual(onCodexConfig, config, "the player's adapter moved");
+  writeFileSync(configPath, onCodexConfig);
+  await service.reloadConfig();
+  const drift = await client.command("turn.submit", { sessionId: tuned.id, text: "on codex" });
+  assert.ok(!drift.ok && drift.error.code === "invalid_config", `refused as drift: ${JSON.stringify(drift)}`);
+  assert.match(drift.error.message, /dev\.coder's adapter changed/, "names the adapter change");
+  assert.match(drift.error.message, /new session/, "offers a new session");
+  assert.doesNotMatch(drift.error.message, /subagentModel/, "not the tuning the change stranded");
+
+  // A subagent model on a player whose adapter cligent serves none for is
+  // refused in cligent's words, with nothing written (DR-093).
+  const reviewerOnCodex = config.replace(
+    "  dev.reviewer:\n    adapter: claude\n    model: claude-test\n",
+    "  dev.reviewer:\n    adapter: codex\n",
+  );
+  assert.notEqual(reviewerOnCodex, config, "the second player moved to codex");
+  writeFileSync(configPath, reviewerOnCodex);
+  await service.reloadConfig();
+  const mixed = await client.expectOk("session.create", { projectId: project.id });
+  const onCodex = await client.command("session.agent.set", { sessionId: mixed.id, agentId: "dev.reviewer", subagentModel: "gpt-6" });
+  assert.ok(!onCodex.ok && onCodex.error.code === "invalid_config", `refused: ${JSON.stringify(onCodex)}`);
+  assert.match(onCodex.error.message, /subagentModel is not supported for adapter "codex"/);
+  const untouched = (await client.expectOk("session.list", {})).find((s: SessionInfo) => s.id === mixed.id);
+  assert.equal(untouched?.agentSettings, undefined, "the refusal wrote nothing");
+
+  // A configured Off survives composition as itself, so a subagent
+  // effort a session tunes beside it — at the Captain's own `false`, or
+  // at a binding whose `false` the tuned player's effort reaches — is
+  // refused in cligent's words, never switching delegation back on, with
+  // nothing written (DR-095).
+  const offConfig = config
+    .replace("captain:\n  adapter: claude\n  model: claude-test\n", "captain:\n  adapter: claude\n  model: claude-test\n  subagentModel: false\n")
+    .replace("      reviewer: dev.reviewer\n", "      reviewer:\n        player: dev.reviewer\n        subagentModel: false\n");
+  assert.equal(offConfig.match(/subagentModel: false/g)?.length, 2, "the Captain and the binding are off");
+  writeFileSync(configPath, offConfig);
+  await service.reloadConfig();
+  // The session opened above has run no message, so it opens on this
+  // configuration, every player of it its own.
+  for (const [agentId, words] of [
+    ["captain", /^captain\.subagentEffort for adapter "claude" requires subagentModel/],
+    ["dev.reviewer", /^playbooks\.review\.roles\.reviewer\.subagentEffort for adapter "claude" requires subagentModel/],
+  ] as const) {
+    const refusedOff = await client.command("session.agent.set", { sessionId: mixed.id, agentId, subagentEffort: "low" });
+    assert.ok(!refusedOff.ok && refusedOff.error.code === "invalid_config", `refused: ${JSON.stringify(refusedOff)}`);
+    assert.match(refusedOff.error.message, words);
+  }
+  const stillOff = (await client.expectOk("session.list", {})).find((s: SessionInfo) => s.id === mixed.id);
+  assert.equal(stillOff?.agentSettings, undefined, "the Off refusals wrote nothing");
+});
+
+// ---------------------------------------------------------------------------
+// core-service-110: the home's one interface language (DR-078)
+// ---------------------------------------------------------------------------
+
+test("core-service-110: the home's language is one stored choice every client reads and follows", async (t) => {
+  const harness = await startHarness();
+  const first = new Client(harness.service.port());
+  const second = new Client(harness.service.port());
+  t.after(async () => {
+    first.close();
+    second.close();
+    await harness.service.stop();
+    rmSync(harness.dir, { recursive: true, force: true });
+  });
+  await first.open();
+  await second.open();
+
+  const prefsFile = join(harness.dataDir, "local", "prefs.json");
+  const storedLanguage = (): unknown =>
+    (JSON.parse(readFileSync(prefsFile, "utf8")) as { prefs: Record<string, unknown> }).prefs.language;
+  const broadcasts = (client: Client): (Language | null)[] =>
+    client.messages
+      .filter((m): m is Extract<ServerMessage, { type: "language.state" }> => m.type === "language.state")
+      .map((m) => m.language);
+
+  // A fresh home stores no choice: every client resolves its own.
+  assert.deepEqual(await first.expectOk("language.get", {}), { language: null });
+  assert.equal(harness.service.language(), null, "the embedding shell reads the same choice in process");
+
+  // One client's choice reaches both.
+  assert.deepEqual(await first.expectOk("language.set", { language: "zh" }), { language: "zh" });
+  await first.waitFor((m) => m.type === "language.state" && m.language === "zh");
+  await second.waitFor((m) => m.type === "language.state" && m.language === "zh");
+  assert.deepEqual(await first.expectOk("language.get", {}), { language: "zh" });
+  assert.deepEqual(await second.expectOk("language.get", {}), { language: "zh" });
+  assert.equal(storedLanguage(), "zh", "the preferences file holds the choice");
+  assert.equal(harness.service.language(), "zh");
+
+  // A code no catalog holds is a validation error, and the stored
+  // choice stands: nothing is written and nothing is broadcast.
+  const refused = await second.command("language.set", { language: "fr" as Language });
+  assert.ok(!refused.ok && refused.error.code === "invalid_message", `refused: ${JSON.stringify(refused)}`);
+  assert.deepEqual(await first.expectOk("language.get", {}), { language: "zh" });
+  assert.equal(storedLanguage(), "zh", "the refusal left the stored choice as it was");
+  assert.deepEqual(broadcasts(first), ["zh"], "the refusal told no client anything");
+  assert.deepEqual(broadcasts(second), ["zh"]);
+
+  // None returns the home to each client's own system language.
+  assert.deepEqual(await second.expectOk("language.set", { language: null }), { language: null });
+  await first.waitFor((m) => m.type === "language.state" && m.language === null);
+  await second.waitFor((m) => m.type === "language.state" && m.language === null);
+  assert.deepEqual(await first.expectOk("language.get", {}), { language: null });
+  assert.equal(storedLanguage(), undefined, "the cleared choice is no key at all");
+  assert.equal(harness.service.language(), null);
+});
+
+// ---------------------------------------------------------------------------
+// core-service-112: the core's own prose speaks the home's language (DR-079)
+// ---------------------------------------------------------------------------
+
+test("core-service-112: the core's own prose re-derives in the home's language", async (t) => {
+  // The catalog's own phrases (src/locales/zh/messages.po): the test
+  // reads what a Chinese reader reads, not what the source states.
+  const REQUIREMENT_EN =
+    "sign in by running claude in a terminal, or set ANTHROPIC_API_KEY";
+  const REQUIREMENT_ZH = "在终端运行 claude 登录，或设置 ANTHROPIC_API_KEY";
+  const CONFIG_ERROR_EN = "playbooks must enable at least one playbook";
+  const CONFIG_ERROR_ZH = "playbooks 必须至少启用一个规程";
+  const BROKEN_CONFIG = "playbooks: {}\n";
+
+  const dir = scratchDir("spex-core-prose-");
+  const configPath = join(dir, "playbook.config.yaml");
+  writeFileSync(configPath, VALID_CONFIG);
+  const { imports } = fakeAdapterImports({});
+  const service = await CoreService.start({
+    token: "test",
+    configPath,
+    dataDir: join(dir, "state"),
+    adapterImports: imports,
+    // The runtime half is usable and the credential half is not, so the
+    // claude adapter's one requirement is the phrase the core itself
+    // composes — never a runtime's own words.
+    adapterRuntime: () => ({ usable: true }),
+    env: {},
+    home: join(dir, "home"),
+    watchConfig: false,
+    // Tests speak English (DR-079): with no choice stored the core
+    // resolves these, never the host's own locale.
+    systemLanguages: ["en"],
+  });
+  t.after(async () => {
+    await service.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const client = new Client(service.port());
+  t.after(() => client.close());
+  await client.open();
+
+  const requirement = (message: ServerMessage): string | undefined =>
+    message.type === "readiness.state"
+      ? message.entries.find((entry: ReadinessEntry) => entry.adapter === "claude")
+          ?.requirement
+      : undefined;
+  const configErrors = (message: ServerMessage): string[] =>
+    message.type === "config.state" && message.state.status === "invalid"
+      ? message.state.errors
+      : [];
+  const refusal = async (): Promise<string> => {
+    const reply = await client.command("project.register", {
+      path: join(dir, "nowhere"),
+    });
+    assert.ok(!reply.ok, "registering a path that is no directory is refused");
+    return reply.error.message;
+  };
+
+  // English, as the system languages the host passed resolve.
+  const before = await client.expectOk("readiness.get", {});
+  assert.equal(
+    before.find((entry: ReadinessEntry) => entry.adapter === "claude")?.requirement,
+    REQUIREMENT_EN,
+    "the readiness requirement reads the source's English",
+  );
+  assert.equal(await refusal(), `${join(dir, "nowhere")} is not a directory`);
+
+  // The choice alone re-derives the states the core caches: the client
+  // asks for nothing and reads the requirement in Chinese.
+  await client.expectOk("language.set", { language: "zh" });
+  await client.waitFor((m) => requirement(m) === REQUIREMENT_ZH);
+  await client.waitFor((m) => m.type === "config.state" && m.state.status === "valid");
+  assert.equal(await refusal(), `${join(dir, "nowhere")} 不是目录`);
+
+  // A config error the core words is the reader's too. An invalid
+  // config empties readiness by the core's own rule, so the two states
+  // are proven one after the other rather than both at once.
+  writeFileSync(configPath, BROKEN_CONFIG);
+  await service.reloadConfig();
+  const broken = await client.waitFor((m) => configErrors(m).length > 0);
+  assert.deepEqual(configErrors(broken), [CONFIG_ERROR_ZH]);
+
+  // None returns the home to the system's language, and the error the
+  // core still holds re-derives into English with nothing asked for.
+  await client.expectOk("language.set", { language: null });
+  const restored = await client.waitFor((m) => configErrors(m).includes(CONFIG_ERROR_EN));
+  assert.deepEqual(configErrors(restored), [CONFIG_ERROR_EN]);
+  assert.equal(await refusal(), `${join(dir, "nowhere")} is not a directory`);
+
+  // And so does the readiness requirement, once a valid config carries
+  // one again.
+  writeFileSync(configPath, VALID_CONFIG);
+  await service.reloadConfig();
+  await client.waitFor((m) => requirement(m) === REQUIREMENT_EN);
+});
+
+test("core-service-112: a start speaks the stored language before its store loads", async (t) => {
+  // The catalog's own phrase (src/locales/zh/messages.po) for a forge
+  // cache the store cannot read at load; the cause after it is relayed.
+  const CACHE_EN = "Unreadable cache; refresh to rebuild: ";
+  const CACHE_ZH = "缓存无法读取；刷新可重建：";
+  const dir = scratchDir("spex-core-load-language-");
+  const configPath = join(dir, "playbook.config.yaml");
+  writeFileSync(configPath, VALID_CONFIG);
+  const dataDir = join(dir, "state");
+  // storage-5: the preferences and the forge cache live under `local/`.
+  mkdirSync(join(dataDir, "local"), { recursive: true });
+  writeFileSync(join(dataDir, "local", "prefs.json"), JSON.stringify({ format: 1, prefs: { language: "zh" } }));
+  writeFileSync(join(dataDir, "local", "forge-cache.json"), "{broken");
+  const { imports } = fakeAdapterImports({});
+  const service = await CoreService.start({
+    token: "test",
+    configPath,
+    dataDir,
+    adapterImports: imports,
+    adapterRuntime: () => ({ usable: true }),
+    env: {},
+    home: join(dir, "home"),
+    watchConfig: false,
+    systemLanguages: ["en"],
+  });
+  t.after(async () => {
+    await service.stop();
+    // The language is the process's: later tests speak English again.
+    speak("en");
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const client = new Client(service.port());
+  t.after(() => client.close());
+  await client.open();
+
+  assert.equal(service.language(), "zh");
+  // The diagnostic the store raised at load already reads Chinese: the
+  // start spoke the stored choice before the store composed it.
+  const cache = (await client.expectOk("storage.diagnostics", {})).find((entry) => entry.file.endsWith("forge-cache.json"));
+  assert.ok(cache, "the unreadable cache is reported");
+  assert.equal(cache.blocking, false);
+  assert.ok(cache.reason.startsWith(CACHE_ZH), cache.reason);
+  assert.ok(!cache.reason.includes(CACHE_EN), cache.reason);
+});
+
+
+// Each row is a public permission contract case, compared with the installed
+// Cligent loader rather than a substitute or a copied expected error string.
+const WRITABLE_PATH_CASES = [
+  { paths: ["./.git/", "generated\\cache/./", "space folder"], accepted: true },
+  { paths: [], accepted: true },
+  { paths: [""], accepted: false },
+  { paths: ["."], accepted: false },
+  { paths: ["./"], accepted: false },
+  { paths: ["/tmp/cache"], accepted: false },
+  { paths: ["C:\\cache"], accepted: false },
+  { paths: ["\\\\host\\cache"], accepted: false },
+  { paths: ["../cache"], accepted: false },
+  { paths: ["safe/../cache"], accepted: false },
+  { paths: ["safe//cache"], accepted: false },
+  { paths: ["safe/*.txt"], accepted: false },
+  { paths: ["safe/[cache]"], accepted: false },
+  { paths: ["~/.git"], accepted: false },
+  { paths: ["safe/$cache"], accepted: false },
+  { paths: ["safe;cache"], accepted: false },
+  { paths: ["safe/line\nfeed"], accepted: false },
+  { paths: ["safe/\u007f"], accepted: false },
+];
+
+test("writable paths: Settings and file loading agree with real Cligent before any agent runs", async (t) => {
+  for (const scope of ["captain", "player"] as const) {
+    const harness = await startHarness();
+    const client = new Client(harness.service.port());
+    t.after(async () => { client.close(); await harness.service.stop(); });
+    await client.open();
+    const configPath = join(harness.dir, "playbook.config.yaml");
+    const tmuxPath = join(harness.dir, "tmux.yaml");
+    const location = scope === "captain" ? "captain" : "players.dev.coder";
+    for (const row of WRITABLE_PATH_CASES) {
+      const permissions = { mode: "auto" as const, writablePaths: row.paths };
+      const tmuxAgent = { adapter: "claude", permissions };
+      writeFileSync(tmuxPath, stringifyYaml({
+        captain: { from: "@sublang/playbook/playbook-captain", ...(scope === "captain" ? tmuxAgent : { adapter: "claude" }) },
+        players: [{ id: "dev.coder", ...(scope === "player" ? tmuxAgent : { adapter: "claude" }) }],
+      }));
+      let nativePaths: string[] | undefined;
+      let nativeError: Error | undefined;
+      try {
+        const native = await loadTmuxPlayConfig({ configPath: tmuxPath });
+        nativePaths = scope === "captain" ? native.config.captain.permissions?.writablePaths : native.config.players[0]?.permissions?.writablePaths;
+      } catch (error) { nativeError = error as Error; }
+      assert.equal(nativeError === undefined, row.accepted, JSON.stringify(row));
+
+      const before = readFileSync(configPath, "utf8");
+      const op = scope === "captain"
+        ? { kind: "captain.set" as const, patch: { permissions } }
+        : { kind: "player.set" as const, playerId: "dev.coder", patch: { permissions } };
+      const reply = await client.command("config.edit", { op });
+      assert.equal(reply.ok, row.accepted, `${location} ${JSON.stringify(row.paths)}`);
+      if (reply.ok) {
+        assert.equal(reply.result.status, "valid");
+        if (reply.result.status !== "valid") throw new Error("unreachable");
+        const summary = scope === "captain" ? reply.result.summary.captain : reply.result.summary.players.find(p => p.id === "dev.coder")?.agent;
+        assert.deepEqual(summary?.permissions?.writablePaths, nativePaths);
+        const raw = parseYaml(readFileSync(configPath, "utf8"));
+        assert.deepEqual((scope === "captain" ? raw.captain : raw.players["dev.coder"]).permissions.writablePaths, row.paths, "canonical projection never rewrites the persisted spelling");
+        const reloaded = await client.expectOk("config.get", {});
+        assert.deepEqual(reloaded, reply.result, "read and save share the same normalized result");
+      } else {
+        assert.equal(reply.error.code, "invalid_config");
+        assert.ok(reply.error.message.includes(`${location}.permissions.writablePaths[0]`), reply.error.message);
+        assert.equal(readFileSync(configPath, "utf8"), before, "rejected Settings write preserves bytes");
+        const nativeReason = nativeError!.message.replace(/^.*?writablePaths\[0\] /, "");
+        assert.ok(reply.error.message.endsWith(nativeReason), `same runtime rule: ${reply.error.message}`);
+      }
+      assert.equal(harness.stats.runs.length, 0, "path validation performs no inference");
+    }
+    client.close();
+    await harness.service.stop();
+  }
+
+  for (const scope of ["captain", "player"] as const) {
+    for (const row of WRITABLE_PATH_CASES.filter(row => !row.accepted)) {
+      const config = parseYaml(VALID_CONFIG);
+      const agent = scope === "captain" ? config.captain : config.players["dev.coder"];
+      agent.permissions = { mode: "auto", writablePaths: row.paths };
+      const harness = await startHarness(stringifyYaml(config));
+      const client = new Client(harness.service.port());
+      try {
+        await client.open();
+        const state = await client.expectOk("config.get", {});
+        assert.equal(state.status, "invalid", JSON.stringify(row.paths));
+        const project = await client.expectOk("project.register", { path: harness.projectDir });
+        const refused = await client.command("session.create", { projectId: project.id });
+        assert.ok(!refused.ok && refused.error.code === "invalid_config");
+        assert.equal(harness.stats.runs.length, 0);
+      } finally { client.close(); await harness.service.stop(); }
+    }
+  }
+});
+
+test("writable paths: canonical accepted grants reach real runtime call settings without rewriting YAML", async (t) => {
+  const config = parseYaml(VALID_CONFIG);
+  const paths = ["./.git/", "generated\\cache/./"];
+  config.captain.permissions = { mode: "auto", writablePaths: paths };
+  config.players["dev.coder"].permissions = { mode: "auto", writablePaths: paths };
+  const source = stringifyYaml(config);
+  const harness = await startHarness(source);
+  const client = new Client(harness.service.port());
+  t.after(async () => { client.close(); await harness.service.stop(); });
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  const session = await client.expectOk("session.create", { projectId: project.id });
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId: session.id } });
+  await client.expectOk("turn.submit", { sessionId: session.id, text: "canonical permission fixture" });
+  await client.waitFor(message => message.type === "record" && message.record.type === "turn_finished");
+  const calls = harness.stats.runs.filter(run => run.prompt === "canonical permission fixture" || run.prompt === "route: canonical permission fixture");
+  assert.equal(calls.length, 2, "real Captain and player call boundary");
+  for (const run of calls) assert.deepEqual(run.permissions, { mode: "auto", writablePaths: [".git", "generated/cache"] });
+  assert.equal(readFileSync(join(harness.dir, "playbook.config.yaml"), "utf8"), source);
+});
+
+test("writable paths: Chinese Settings refusal names the field and preserves prior bytes", async (t) => {
+  const harness = await startHarness(VALID_CONFIG, { systemLanguages: ["zh-CN"] });
+  const client = new Client(harness.service.port());
+  t.after(async () => { client.close(); await harness.service.stop(); speak("en"); });
+  await client.open();
+  const configPath = join(harness.dir, "playbook.config.yaml");
+  const before = readFileSync(configPath, "utf8");
+  const refused = await client.command("config.edit", { op: {
+    kind: "player.set", playerId: "dev.coder",
+    patch: { permissions: { mode: "auto", writablePaths: ["/tmp/cache"] } },
+  } });
+  assert.ok(!refused.ok && refused.error.code === "invalid_config");
+  if (refused.ok) throw new Error("unreachable");
+  assert.equal(refused.error.message, "players.dev.coder.permissions.writablePaths[0] 必须为工作区内的相对路径");
+  assert.equal(readFileSync(configPath, "utf8"), before);
+  assert.equal(harness.stats.runs.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// core-service-2: a project's composed configuration, read and announced
+// ---------------------------------------------------------------------------
+
+/** Your own group's config enabling `code` alone. */
+const OWN_CODE_ONLY = VALID_CONFIG.replace(/ {2}review:\n(?: {4,}.*\n)*/, "");
+
+/** The commands a config state offers, sorted. */
+function offered(state: import("./protocol.js").ConfigState | undefined): string[] {
+  return state?.status === "valid" ? state.summary.playbooks.map((playbook) => `/${playbook.command}`).sort() : [];
+}
+
+test("core-service-2: config.get with a project answers its composition, and the broadcast carries every project's", async (t) => {
+  const harness = await startHarness(OWN_CODE_ONLY);
+  const client = new Client(harness.service.port());
+  t.after(async () => { client.close(); await harness.service.stop(); rmSync(harness.dir, { recursive: true, force: true }); });
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+
+  // No file of its own: the project runs with yours.
+  const before = await client.expectOk("config.get", { projectId: project.id });
+  assert.equal(before.status, "valid", JSON.stringify(before));
+  assert.deepEqual(offered(before), ["/code"]);
+
+  // Enabling a playbook in the project's file: the project's composition
+  // offers it, yours does not, and the broadcast says both.
+  const seen = client.messages.length;
+  await client.expectOk("config.edit", {
+    repository: project.id,
+    op: { kind: "playbook.add", playbookId: "review", roles: { coder: "dev.coder", reviewer: "dev.coder" } },
+  });
+  assert.deepEqual(offered(await client.expectOk("config.get", { projectId: project.id })), ["/code", "/review"]);
+  assert.deepEqual(offered(await client.expectOk("config.get", {})), ["/code"]);
+  const announced = await client.waitFor((message) => client.messages.indexOf(message) >= seen &&
+    message.type === "config.state" && message.projects?.[project.id] !== undefined);
+  assert.ok(announced.type === "config.state");
+  assert.deepEqual(offered(announced.state), ["/code"]);
+  assert.deepEqual(offered(announced.projects?.[project.id]), ["/code", "/review"]);
+  const composed = announced.projects?.[project.id];
+  assert.ok(composed?.status === "valid");
+  assert.equal(composed.summary.captain.adapter, "claude", "your own group's captain");
+
+  // A project's file naming a player yours lacks: that project reads
+  // invalid naming it, yours stays valid.
+  const projectConfig = join(clonePath(harness.dataDir, project.id), "config", "playbook.config.yaml");
+  writeFileSync(projectConfig, "playbooks:\n  review:\n    roles:\n      coder: dev.coder\n      reviewer: dev.auditor\n");
+  await harness.service.reloadConfig();
+  const refused = await client.expectOk("config.get", { projectId: project.id });
+  assert.equal(refused.status, "invalid", JSON.stringify(refused));
+  if (refused.status === "invalid") assert.match(refused.errors.join("\n"), /dev\.auditor/);
+  assert.equal((await client.expectOk("config.get", {})).status, "valid");
+
+  // A project the home does not hold is named not found.
+  const unknown = await client.command("config.get", { projectId: `${OWN}/nowhere-spex` });
+  assert.ok(!unknown.ok && unknown.error.code === "not_found");
+});
+
+test("core-service-2: a project's config file changed on disk reloads without a restart", async (t) => {
+  const harness = await startHarness(OWN_CODE_ONLY, { watchConfig: true });
+  const client = new Client(harness.service.port());
+  t.after(async () => { client.close(); await harness.service.stop(); rmSync(harness.dir, { recursive: true, force: true }); });
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  const configDir = join(clonePath(harness.dataDir, project.id), "config");
+  const projectConfig = join(configDir, "playbook.config.yaml");
+  assert.equal(existsSync(projectConfig), false, "a new project's clone holds no config of its own");
+  const announcedAfter = (seen: number, check: (state: import("./protocol.js").ConfigState) => boolean) =>
+    client.waitFor((message) => client.messages.indexOf(message) >= seen && message.type === "config.state" &&
+      message.projects?.[project.id] !== undefined && check(message.projects[project.id]!), 10_000);
+
+  // The file arrives as a teammate's would, its folder with it.
+  let seen = client.messages.length;
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(projectConfig, "playbooks:\n  review:\n    roles:\n      coder: dev.coder\n      reviewer: dev.coder\n");
+  await announcedAfter(seen, (state) => offered(state).includes("/review"));
+
+  // A player your own roster lacks is reported as the file changes
+  // (settings-46), with no restart.
+  seen = client.messages.length;
+  writeFileSync(projectConfig, "playbooks:\n  review:\n    roles:\n      coder: dev.coder\n      reviewer: dev.auditor\n");
+  const missing = await client.waitFor((message) => client.messages.indexOf(message) >= seen && message.type === "config.state" &&
+    message.state.status === "valid" && (message.state.missingPlayers ?? []).some((entry) => entry.player === "dev.auditor"), 10_000);
+  assert.ok(missing.type === "config.state" && missing.state.status === "valid");
+  assert.deepEqual(missing.state.missingPlayers, [{ player: "dev.auditor", repository: project.id, roles: [{ playbook: "review", role: "reviewer" }] }]);
+
+  // Disabled there again, the project offers yours alone.
+  seen = client.messages.length;
+  writeFileSync(projectConfig, "playbooks: {}\n");
+  await announcedAfter(seen, (state) => state.status === "valid" && !offered(state).includes("/review"));
+});
+
+// ---------------------------------------------------------------------------
+// storage-29: a session's open makes its clone's sessions/, never the clone
+// ---------------------------------------------------------------------------
+
+test("storage-29: session.create makes a paired clone's missing sessions/ privately and never a clone gone before or during its open", { timeout: 60_000 }, async (t) => {
+  const harness = await startHarness();
+  const client = new Client(harness.service.port());
+  // The open's last preparation, the Captain's factory, held once on
+  // `hold()` until released.
+  type Factory = (...args: unknown[]) => Promise<unknown>;
+  const sessions = (harness.service as unknown as { sessions: { options: { captainFactory: Factory } } }).sessions;
+  const factory = sessions.options.captainFactory;
+  let release = (): void => {};
+  let reached: Promise<void> = Promise.resolve();
+  const hold = (): void => {
+    let arrived = (): void => {};
+    reached = new Promise((resolveReached) => { arrived = resolveReached; });
+    const held = new Promise<void>((resolveHeld) => { release = resolveHeld; });
+    let holding = true;
+    sessions.options.captainFactory = async (...args) => {
+      if (holding) { holding = false; arrived(); await held; }
+      return factory(...args);
+    };
+  };
+  t.after(async () => { release(); client.close(); await harness.service.stop(); });
+  await client.open();
+  const workspace = join(harness.dataDir, "workspace");
+  const homeFile = join(harness.dataDir, "home.yaml");
+  const cloneOf = (key: string): string => join(workspace, ...key.split("/"));
+  const folder = (name: string): string => {
+    const path = join(harness.dir, name);
+    mkdirSync(path);
+    execFileSync("git", ["init", "-q", path]);
+    return path;
+  };
+  const opens = async (key: string): Promise<void> => {
+    const sessionsDir = join(cloneOf(key), "sessions");
+    assert.equal(existsSync(sessionsDir), false, `${key} has no sessions/ before the open`);
+    const created = await client.command("session.create", { projectId: key });
+    assert.ok(created.ok, `${key}: ${JSON.stringify(created)}`);
+    assert.equal(statSync(sessionsDir).mode & 0o777, 0o700, `${key}'s sessions/ is private`);
+  };
+
+  // A clone another process put under workspace/, paired by an editor.
+  mkdirSync(cloneOf("acme/tool-spex"), { recursive: true });
+  writeFileSync(join(cloneOf("acme/tool-spex"), "project.json"), JSON.stringify({ format: 1, name: "Tool", remote: null }));
+  const home =parseYaml(readFileSync(homeFile, "utf8")) as { folders: { path: string; repository: string }[] };
+  home.folders.push({ path: folder("tool"), repository: "acme/tool-spex" });
+  writeFileSync(homeFile, stringifyYaml(home));
+  await opens("acme/tool-spex");
+
+  // A clone with no sessions/, bound to a working folder.
+  mkdirSync(cloneOf(`${OWN}/kept-spex`), { recursive: true });
+  writeFileSync(join(cloneOf(`${OWN}/kept-spex`), "project.json"), JSON.stringify({ format: 1, name: "Kept", remote: null }));
+  await client.expectOk("project.rebind", { projectId: `${OWN}/kept-spex`, path: folder("kept") });
+  await opens(`${OWN}/kept-spex`);
+
+  // A registered project whose sessions/ was removed.
+  const registered = await client.expectOk("project.register", { path: harness.projectDir });
+  rmSync(join(cloneOf(registered.id), "sessions"), { recursive: true, force: true });
+  await opens(registered.id);
+
+  // A clone removed before the open: refused, and not made again.
+  const gone = await client.expectOk("project.register", { path: folder("gone") });
+  rmSync(cloneOf(gone.id), { recursive: true, force: true });
+  const refused = await client.command("session.create", { projectId: gone.id });
+  assert.ok(!refused.ok && refused.error.code === "not_found", JSON.stringify(refused));
+  assert.equal(existsSync(cloneOf(gone.id)), false);
+
+  // A clone removed while the open prepares: refused at the open, and
+  // neither it nor its sessions/ made.
+  const late = await client.expectOk("project.register", { path: folder("late") });
+  rmSync(join(cloneOf(late.id), "sessions"), { recursive: true, force: true });
+  hold();
+  const pending = client.command("session.create", { projectId: late.id });
+  await reached;
+  rmSync(cloneOf(late.id), { recursive: true, force: true });
+  release();
+  const lateRefused = await pending;
+  assert.ok(!lateRefused.ok && lateRefused.error.code === "not_found", JSON.stringify(lateRefused));
+  assert.equal(existsSync(cloneOf(late.id)), false);
+});
+
+test("core-service-60: a bounded external replay append is announced without rewriting its session root", async (t) => {
+  const dir = scratchDir("spex-bounded-foreign-");
+  const projectDir = join(dir, "project"); mkdirSync(projectDir);
+  execFileSync("git", ["init", "-q", projectDir]);
+  const { sessionsDir } = pairedHome(join(dir, "state"), projectDir);
+  const configPath = join(dir, "playbook.config.yaml"); writeFileSync(configPath, VALID_CONFIG);
+  const service = await CoreService.start({ token: "test", configPath, dataDir: join(dir, "state"), env: {}, home: join(dir, "home"), watchConfig: true });
+  const client = new Client(service.port()); await client.open();
+  t.after(async () => { client.close(); await service.stop(); rmSync(dir, { recursive: true, force: true }); });
+  await client.expectOk("project.register", { path: projectDir });
+  const shared = createSessionStore({ sessionsDir });
+  const plan = await loadLaunchPlan({ userConfigPath: configPath, modules: builtinLaunchModules(configPath) });
+  const external = await openSessionHost({ store: shared, mode: "new", cwd: projectDir,
+    config: executionConfigFromPlan(plan), adapterImports: fakeAdapterImports({ fallback: { result: "unused" } }).imports });
+  t.after(() => external.dispose());
+  const id = external.sessionId;
+  const discovered = await client.waitFor((m) => m.type === "session.state" && m.session.id === id);
+  assert.ok(discovered.type === "session.state");
+  assert.equal(discovered.session.externalWriter, "active");
+  await client.expectOk("subscribe", { channel: { kind: "session", sessionId: id } });
+  const root = join(sessionsDir, `${id}.json`);
+  const before = readFileSync(root);
+  assert.equal(JSON.parse(before.toString()).schemaVersion, 8);
+  assert.equal(existsSync(join(sessionsDir, `${id}.records.jsonl`)), false);
+  const start = { type: "turn_started", turnId: 1, timestamp: 1000, turn: { id: 1, prompt: "Published through a replay descriptor" } };
+  const finish = { type: "turn_finished", turnId: 1, timestamp: 1001 };
+  await external.lease.append(start);
+  await external.lease.append(finish);
+  assert.ok((await shared.readHistory(id)).entries.some((entry) => (entry.record as { type?: string }).type === "turn_finished"));
+  await client.waitFor((m) => m.type === "record" && m.sessionId === id && m.record.type === "turn_finished");
+  assert.deepEqual(readFileSync(root), before, "the descriptor alone announces newly readable records");
+  assert.equal(client.records("session").filter((entry) => entry.sessionId === id && entry.record.type === "turn_started").length, 1);
+  const listed = (await client.expectOk("session.list", {})).find((entry) => entry.id === id);
+  assert.equal(listed?.title, start.turn.prompt);
+  assert.equal(listed?.turns, 1);
+  await external.dispose();
+  const physical = JSON.parse(readFileSync(root, "utf8"));
+  rmSync(join(sessionsDir, `${id}.chunks`, physical.root.sha256));
+  await service["syncForeignSessions"]();
+  const damaged = (await client.expectOk("session.list", {})).find((entry) => entry.id === id);
+  assert.ok(damaged, "a readable root still associates damaged recovery with its session");
+  assert.equal(damaged.continuable, undefined);
+  const diagnostics = await client.expectOk("storage.diagnostics", {});
+  assert.ok(diagnostics.some((entry) => entry.file.endsWith(`${id}.json`) && entry.blocking));
+  await client.expectOk("session.delete", { sessionId: id });
+  assert.equal(existsSync(root), false, "damaged recovery stays deletable through the shared lifecycle");
+});
+
+test("core-service-124: what one home captured runs on it alone, and a second home pairing the folder at the same path reads it as the other's", { timeout: 60_000 }, async (t) => {
+  const harness = await startHarness();
+  const client = new Client(harness.service.port());
+  t.after(async () => { client.close(); await harness.service.stop(); });
+  await client.open();
+  const project = await client.expectOk("project.register", { path: harness.projectDir });
+  // The second home is this one with another device: the same folder at
+  // the same path, the same records, as a sync leaves them (storage-2).
+  const homeFile = join(harness.dataDir, "home.yaml");
+  const onDevice = (device: string): void => {
+    const home = parseYaml(readFileSync(homeFile, "utf8")) as Record<string, unknown>;
+    writeFileSync(homeFile, stringifyYaml({ ...home, device }));
+  };
+  const first = (parseYaml(readFileSync(homeFile, "utf8")) as { device: string }).device;
+  const second = randomUUID();
+  const label = hostname();
+  const phrase = `Runs on ${label}`;
+  const refusedAs = (reply: Awaited<ReturnType<Client["command"]>>, code: string, what: string): void => {
+    assert.ok(!reply.ok, `${what} is refused`);
+    assert.equal(reply.error.code, code, what);
+    assert.equal(reply.error.message, phrase, what);
+    assert.deepEqual(reply.error.details, { runsOn: label }, what);
+  };
+
+  // The first home captures an intent and runs it in a session whose
+  // runtime record stands before its first turn, hidden and naming no
+  // turn (core-service-4, core-service-42, storage-43).
+  const worked = await client.expectOk("intent.queue", { projectId: project.id, text: "Ship the parser" });
+  assert.deepEqual(worked.runtime, { device: first, label });
+  const session = await client.expectOk("session.create", { projectId: project.id });
+  const shared = createSessionStore({ sessionsDir: projectSessions(harness.dataDir, project.id) });
+  const assignment = (await shared.readHistory(session.id)).entries
+    .filter(({ record }) => (record as { topic?: unknown }).topic === "spex.session.runtime");
+  assert.equal(assignment.length, 1);
+  assert.deepEqual((assignment[0].record as { payload?: unknown }).payload, { device: first, label });
+  assert.equal((assignment[0].record as { turnId?: unknown }).turnId, null);
+  assert.equal((assignment[0].record as { visibility?: unknown }).visibility, "hidden");
+  await client.expectOk("turn.submit", { sessionId: session.id, text: worked.text, intentId: worked.id });
+  await settledSession(client, session.id, 1);
+  const entries = (await shared.readHistory(session.id)).entries;
+  const firstTurn = entries.find(({ record }) => record.type === "turn_started");
+  assert.ok(firstTurn && assignment[0].seq < firstTurn.seq, "assigned before its first turn");
+  assert.equal(entries.filter(({ record }) => (record as { topic?: unknown }).topic === "spex.session.runtime").length, 1, "never rewritten");
+  assert.equal((await client.expectOk("history.get", { sessionId: session.id })).records
+    .some(({ record }) => (record as { topic?: unknown }).topic === "spex.session.runtime"), false, "no session channel carries it");
+  // Queued once that turn settled, so nothing advances into it.
+  const waiting = await client.expectOk("intent.queue", { projectId: project.id, text: "Document the parser" });
+  let ledger = await client.expectOk("ledger.get", {});
+  assert.deepEqual(ledger.attention.map((entry) => [entry.kind, entry.intentId]), [["finish", worked.id]]);
+  assert.ok(ledger.intents.find((entry) => entry.intent.id === waiting.id)?.next, "next on the home that captured it");
+
+  // The second home reads the session as the first's: `runsOn`, not
+  // continuable, the phrase as its reason, no recovery (core-service-32),
+  // never its lane (core-service-93).
+  onDevice(second);
+  const listed = (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+  assert.equal(listed?.runsOn, label);
+  assert.equal(listed?.continuable, undefined);
+  assert.equal(listed?.continuationReason, phrase);
+  assert.equal(listed?.recovery, undefined);
+  assert.deepEqual(harness.service["sessions"].listLanes().filter((lane) => lane.projectId === project.id), []);
+  // Continuation, a control, Restore and Discard are refused with the
+  // phrase and the label, writing nothing (core-service-73,
+  // core-service-82, core-service-83).
+  const streamFile = join(projectSessions(harness.dataDir, project.id), `${session.id}.records.jsonl`);
+  const streamBefore = await readSessionReplay(streamFile);
+  refusedAs(await client.command("turn.submit", { sessionId: session.id, text: "Keep going" }), "invalid_request", "turn.submit");
+  refusedAs(await client.command("session.control", { sessionId: session.id, kind: "recovery" }), "invalid_request", "session.control");
+  refusedAs(await client.command("session.restore", { sessionId: session.id }), "invalid_request", "session.restore");
+  refusedAs(await client.command("session.discard", { sessionId: session.id }), "invalid_request", "session.discard");
+  assert.deepEqual(await readSessionReplay(streamFile), streamBefore);
+  // The first's work summons nothing here (core-service-49), and its
+  // intents keep their place with its label, never next
+  // (core-service-107).
+  ledger = await client.expectOk("ledger.get", {});
+  assert.deepEqual(ledger.attention, []);
+  assert.equal(ledger.badge, 0);
+  const row = (id: string) => ledger.intents.find((entry) => entry.intent.id === id);
+  assert.deepEqual([row(worked.id)?.state, row(worked.id)?.runsOn], ["finished", label]);
+  assert.deepEqual([row(waiting.id)?.state, row(waiting.id)?.runsOn, row(waiting.id)?.next], ["queued", label, undefined]);
+  // The second starts a session of its own beside it, and a turn naming
+  // the first's intent, its edit and its close are refused `conflict`
+  // (core-service-43, core-service-46, core-service-47).
+  const own = await client.expectOk("session.create", { projectId: project.id });
+  const intentFile = (id: string) => join(clonePath(harness.dataDir, project.id), "intents", `${id}.json`);
+  const intentsBefore = [readFileSync(intentFile(worked.id)), readFileSync(intentFile(waiting.id))];
+  refusedAs(await client.command("turn.submit", { sessionId: own.id, text: waiting.text, intentId: waiting.id }), "conflict", "a turn naming it");
+  refusedAs(await client.command("intent.edit", { intentId: waiting.id, text: "Document the parser for users" }), "conflict", "intent.edit");
+  refusedAs(await client.command("intent.close", { intentId: worked.id, as: "done" }), "conflict", "intent.close done");
+  refusedAs(await client.command("intent.close", { intentId: waiting.id, as: "dropped" }), "conflict", "intent.close dropped");
+  assert.deepEqual([readFileSync(intentFile(worked.id)), readFileSync(intentFile(waiting.id))], intentsBefore);
+  assert.equal(harness.stats.runs.filter((run) => run.prompt?.includes(waiting.text)).length, 0);
+  await client.expectOk("session.dispose", { sessionId: own.id });
+  await client.expectOk("session.delete", { sessionId: own.id });
+
+  // Back on the first, the session continues and the verdicts are its.
+  onDevice(first);
+  const again = (await client.expectOk("session.list", {})).find((entry) => entry.id === session.id);
+  assert.equal(again?.runsOn, undefined);
+  assert.equal(again?.continuable, true, again?.continuationReason ?? "no reason given");
+  await client.expectOk("intent.close", { intentId: waiting.id, as: "dropped" });
+  await client.expectOk("turn.submit", { sessionId: session.id, text: "Keep going" });
+  await settledSession(client, session.id, 2);
+  await client.expectOk("intent.close", { intentId: worked.id, as: "done" });
+
+  // The second removes the closed intent from History and deletes the
+  // session, as any home may (core-service-46, core-service-124).
+  onDevice(second);
+  await client.expectOk("intent.remove", { intentId: worked.id });
+  await client.expectOk("session.delete", { sessionId: session.id });
+  assert.equal((await client.expectOk("session.list", {})).some((entry) => entry.id === session.id), false);
+});

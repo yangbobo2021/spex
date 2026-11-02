@@ -1,0 +1,319 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// PROJ coverage: fixture-repo git state, work-tree validation,
+// create flow, and the gh adapter with a stubbed runner
+// (PROJ-16..19 territory plus unit checks).
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+
+import {
+  GitHubForgeAdapter,
+  academyCorpusDir,
+  createProjectRepo,
+  defaultRunCommand,
+  isWorkTreeRoot,
+  parseGitHubRepo,
+  repoStatus,
+  seedExampleProject,
+  type RunCommand,
+} from "./forge.js";
+import { scratchDir } from "./testing/scratch.js";
+
+function git(args: string[], cwd: string): void {
+  execFileSync("git", args, { cwd });
+}
+
+function fixtureRepo(): string {
+  const dir = scratchDir("spex-forge-");
+  git(["init", "-q", "-b", "main", "."], dir);
+  git(["config", "user.email", "t@example.com"], dir);
+  git(["config", "user.name", "t"], dir);
+  git(["config", "commit.gpgsign", "false"], dir);
+  writeFileSync(join(dir, "a.txt"), "hello\n");
+  git(["add", "a.txt"], dir);
+  git(["commit", "-q", "-m", "init"], dir);
+  return dir;
+}
+
+test("isWorkTreeRoot accepts only the repo root", async () => {
+  const repo = fixtureRepo();
+  assert.equal(await isWorkTreeRoot(repo), true);
+  const sub = join(repo, "sub");
+  mkdirSync(sub);
+  assert.equal(await isWorkTreeRoot(sub), false);
+  const plain = scratchDir("spex-plain-");
+  assert.equal(await isWorkTreeRoot(plain), false);
+});
+
+test("repoStatus reports branch and dirty state from local git", async () => {
+  const repo = fixtureRepo();
+  const clean = await repoStatus(repo);
+  assert.equal(clean.branch, "main");
+  assert.equal(clean.dirty, false);
+  assert.equal(clean.originUrl, undefined);
+  writeFileSync(join(repo, "b.txt"), "dirty\n");
+  const dirty = await repoStatus(repo);
+  assert.equal(dirty.dirty, true);
+  git(["remote", "add", "origin", "git@github.com:sublang-ai/spex.git"], repo);
+  const withOrigin = await repoStatus(repo);
+  assert.equal(withOrigin.originUrl, "git@github.com:sublang-ai/spex.git");
+});
+
+test("repoStatus names the real branch on a fresh repo with no commits", async () => {
+  const dir = scratchDir("spex-forge-fresh-");
+  git(["init", "-q", "-b", "main", "."], dir);
+  const status = await repoStatus(dir);
+  assert.equal(status.branch, "main");
+  assert.equal(status.dirty, false);
+});
+
+test("createProjectRepo initializes a commit-ready repo", async () => {
+  const dir = join(scratchDir("spex-create-"), "newproj");
+  const run: RunCommand = async (command, args, cwd, env) => {
+    const result = await defaultRunCommand(command, args, cwd, env);
+    if (command === "git" && args[0] === "init" && result.code === 0) {
+      git(["config", "user.name", "Spex Test"], dir);
+      git(["config", "user.email", "spex@example.test"], dir);
+      git(["config", "commit.gpgsign", "false"], dir);
+    }
+    return result;
+  };
+  await createProjectRepo({ path: dir, run });
+  assert.equal(await isWorkTreeRoot(dir), true);
+  git(["rev-parse", "--verify", "HEAD"], dir);
+});
+
+test("createProjectRepo surfaces scaffold failures", async () => {
+  const dir = join(scratchDir("spex-create-"), "p2");
+  const run: RunCommand = async (command, args, cwd) => {
+    if (command === "git") {
+      const { execFile } = await import("node:child_process");
+      return new Promise((resolvePromise) => {
+        execFile(command, args, { cwd }, (error, stdout, stderr) =>
+          resolvePromise({
+            code: error ? 1 : 0,
+            stdout: String(stdout),
+            stderr: String(stderr),
+          }),
+        );
+      });
+    }
+    return { code: 1, stdout: "", stderr: "scaffold exploded" };
+  };
+  await assert.rejects(
+    createProjectRepo({ path: dir, scaffold: true, run }),
+    /scaffold failed running npx --yes @sublang\/spex scaffold \(the app's own scaffold CLI was not supplied, so the registry's ran\): scaffold exploded/,
+  );
+});
+
+test("createProjectRepo stages every supported agent-instruction target", async () => {
+  const dir = scratchDir("spex-agent-targets-");
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const run: RunCommand = async (command, args) => {
+    calls.push({ command, args });
+    if (command === "spex") {
+      for (const file of ["CLAUDE.md", "AGENTS.md", "GEMINI.md"]) {
+        writeFileSync(join(dir, file), "managed\n");
+      }
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  await createProjectRepo({
+    path: dir,
+    scaffold: true,
+    scaffoldCommand: ["spex"],
+    run,
+  });
+
+  assert.deepEqual(
+    calls
+      .filter(({ command, args }) => command === "git" && args[0] === "add")
+      .map(({ args }) => args[2]),
+    ["specs", "CLAUDE.md", "AGENTS.md", "GEMINI.md", "LICENSE"],
+  );
+});
+
+test("createProjectRepo never stages a pre-existing agent file", async () => {
+  const dir = scratchDir("spex-agent-existing-");
+  writeFileSync(join(dir, "GEMINI.md"), "user content\n");
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const run: RunCommand = async (command, args) => {
+    calls.push({ command, args });
+    if (command === "spex") {
+      writeFileSync(join(dir, "CLAUDE.md"), "managed\n");
+      writeFileSync(join(dir, "AGENTS.md"), "managed\n");
+      writeFileSync(join(dir, "GEMINI.md"), "user content\nmanaged\n");
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  await createProjectRepo({
+    path: dir,
+    scaffold: true,
+    scaffoldCommand: ["spex"],
+    run,
+  });
+
+  const staged = calls
+    .filter(({ command, args }) => command === "git" && args[0] === "add")
+    .map(({ args }) => args[2]);
+  assert.ok(staged.includes("CLAUDE.md"));
+  assert.ok(staged.includes("AGENTS.md"));
+  assert.ok(!staged.includes("GEMINI.md"));
+});
+
+test("parseGitHubRepo handles https and ssh remotes", () => {
+  assert.equal(
+    parseGitHubRepo("https://github.com/sublang-ai/spex.git"),
+    "sublang-ai/spex",
+  );
+  assert.equal(
+    parseGitHubRepo("git@github.com:sublang-ai/spex.git"),
+    "sublang-ai/spex",
+  );
+  assert.equal(parseGitHubRepo("https://gitlab.com/x/y.git"), undefined);
+});
+
+function stubRun(
+  behavior: (command: string, args: string[]) => { code: number; stdout: string; stderr: string },
+): RunCommand {
+  return async (command, args) => behavior(command, args);
+}
+
+test("gh adapter: missing tool, unauthenticated, and authenticated states", async () => {
+  const origin = "https://github.com/sublang-ai/spex.git";
+
+  const missing = new GitHubForgeAdapter(
+    stubRun(() => ({ code: 127, stdout: "", stderr: "gh: command not found" })),
+  );
+  const missingState = await missing.state("/tmp/x", origin);
+  assert.equal(missingState.authenticated, null);
+  assert.match(missingState.guidance ?? "", /not installed/);
+
+  const unauth = new GitHubForgeAdapter(
+    stubRun((command, args) =>
+      args[0] === "auth"
+        ? { code: 1, stdout: "", stderr: "not logged in" }
+        : { code: 0, stdout: "[]", stderr: "" },
+    ),
+  );
+  const unauthState = await unauth.state("/tmp/x", origin);
+  assert.equal(unauthState.authenticated, false);
+  assert.match(unauthState.guidance ?? "", /gh auth login/);
+
+  const authed = new GitHubForgeAdapter(
+    stubRun((command, args) => {
+      if (args[0] === "auth") return { code: 0, stdout: "ok", stderr: "" };
+      if (args[0] === "issue") {
+        return {
+          code: 0,
+          stdout: JSON.stringify([
+            {
+              number: 7,
+              title: "Fix flaky test",
+              url: "https://github.com/sublang-ai/spex/issues/7",
+              author: { login: "alice" },
+            },
+          ]),
+          stderr: "",
+        };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify([
+          {
+            number: 12,
+            title: "Add dashboard",
+            url: "https://github.com/sublang-ai/spex/pull/12",
+          },
+        ]),
+        stderr: "",
+      };
+    }),
+  );
+  const authedState = await authed.state("/tmp/x", origin);
+  assert.equal(authedState.authenticated, true);
+  assert.equal(authedState.repo, "sublang-ai/spex");
+  assert.deepEqual(authedState.issues[0], {
+    number: 7,
+    title: "Fix flaky test",
+    url: "https://github.com/sublang-ai/spex/issues/7",
+    author: "alice",
+  });
+  assert.equal(authedState.prs[0].number, 12);
+});
+
+test("no GitHub origin degrades to guidance naming which condition (projects-7)", async () => {
+  const ran: string[] = [];
+  const adapter = new GitHubForgeAdapter(async (command, args) => {
+    ran.push([command, ...args].join(" "));
+    return { code: 0, stdout: "", stderr: "" };
+  });
+
+  // No origin remote at all.
+  const none = await adapter.state("/tmp/x", undefined);
+  assert.equal(none.authenticated, null);
+  assert.equal(
+    none.guidance,
+    "No GitHub remote — run git remote add origin … to see issues and PRs",
+  );
+
+  // An origin elsewhere is named by its host alone, in every remote
+  // form, and never by a credential its URL carries.
+  for (const origin of [
+    "https://gitlab.com/spex-internal/demo-app.git",
+    "https://oauth2:glpat-secret@gitlab.com/spex-internal/demo-app.git",
+    "git@gitlab.com:spex-internal/demo-app.git",
+    "ssh://git@gitlab.com:2222/spex-internal/demo-app.git",
+  ]) {
+    const elsewhere = await adapter.state("/tmp/x", origin);
+    assert.equal(elsewhere.authenticated, null, origin);
+    assert.deepEqual([elsewhere.issues, elsewhere.prs], [[], []], origin);
+    assert.equal(
+      elsewhere.guidance,
+      "Issues and PRs come from GitHub · Code: gitlab.com",
+      origin,
+    );
+  }
+  // Neither condition asks gh anything.
+  assert.deepEqual(ran, []);
+});
+
+test("seedExampleProject materializes the corpus into an empty dir", async () => {
+  const dir = scratchDir("spex-seed-");
+  const corpus = join(dir, "corpus");
+  mkdirSync(join(corpus, "specs"), { recursive: true });
+  writeFileSync(join(corpus, "README.md"), "# Example\n");
+  writeFileSync(join(corpus, "specs", "map.md"), "# Map\n");
+
+  const target = join(dir, "project");
+  await seedExampleProject({ path: target, corpusDir: corpus });
+  assert.ok(existsSync(join(target, "README.md")));
+  assert.ok(existsSync(join(target, "specs", "map.md")));
+  assert.ok(existsSync(join(target, ".git")));
+  const log = execFileSync("git", ["-C", target, "log", "--oneline"], {
+    encoding: "utf8",
+  });
+  assert.match(log, /seed the Academy example/);
+
+  // Non-empty targets are refused before any write.
+  await assert.rejects(
+    seedExampleProject({ path: target, corpusDir: corpus }),
+    /not empty/,
+  );
+});
+
+test("the staged Academy corpus is present and seedable", async () => {
+  const corpus = academyCorpusDir();
+  assert.ok(existsSync(join(corpus, "specs", "map.md")));
+  assert.ok(existsSync(join(corpus, "guidelines.md")));
+  const target = join(scratchDir("spex-seed-"), "academy");
+  await seedExampleProject({ path: target });
+  assert.ok(existsSync(join(target, "specs", "meta.md")));
+});

@@ -3,130 +3,1739 @@
 
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to the Spex app — the desktop and server shells over
+one core and one interface — are documented in this file. The scaffold
+CLI keeps its own changelog under `packages/cli`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+App releases use `app-v*` tags and include native desktop downloads and
+source; run source with `npm ci` and `npm start` (desktop) or
+`npm run start:server` (server).
 
 ## [Unreleased]
 
 ### Changed
 
-- Tighten the `LIC-5` note in the scaffold's `dev/licensing.md`
-  template: each preserved upstream SPDX line satisfies its
-  respective `LIC-1`/`LIC-2` requirement, and any missing required
-  line is supplied from upstream, not the project license.
-
-## [0.2.3] - 2026-05-10
+- Desktop and server builds adopt registry-published Cligent 0.36.2 and Playbook 18.1.1 with checksum-locked shared runtimes; app tags no longer consume local vendor archives.
 
 ### Added
 
-- New `LIC-5` item in the scaffold's `specs/dev/licensing.md`
-  template: when a file's first comment block already carries
-  upstream SPDX headers (e.g., a scaffold template copied from
-  another project), those lines are preserved unmodified, even
-  when the project root is licensed differently. `LIC-1`/`LIC-2`
-  are satisfied by the preserved upstream headers.
+- Fork verification build rebased onto upstream `82961686`, preserving
+  native Windows execution and tag-built macOS arm64 / Windows x64
+  installers together with the upstream package-install and Playbooks UI.
+  DR-180 names the Windows Git-source long-path decision independently
+  from upstream DR-173. See [the rebase record](docs/releases/0.9.0-beta.22-fork-rebase.md).
+
+
+- Independent package registries ([DR-168](specs/decisions/168-independent-package-registry.md)).
+  Library offers a registry setting and separate registry sign-in; the
+  public registry lists available Spaces beside the custom Space URL.
+  Package namespaces are chosen from every organization the registry
+  account may publish to, independently of the project's Space. Registry
+  and Space sign-out do not affect each other, including at one origin.
+  A server seat needs its own registry sign-in for private packages.
+  Existing manifests and lock sources remain preserved until explicitly
+  changed.
+- App tags build a macOS Apple Silicon DMG and a Windows x64 per-user
+  installer on native runners. Both builds must succeed before the
+  release publishes both downloads and SHA-256 checksums; source
+  instructions remain available. Builds are unsigned and the macOS app
+  is not notarized ([DR-176](specs/decisions/176-native-desktop-tag-packages.md)).
+
+- Applets in the IDE ([DR-161](specs/decisions/161-an-applet-is-a-page-the-ide-serves.md)).
+  A spec package's applet is a static web page entered at
+  `applets/<id>/index.html`; a folder without that entry is refused.
+  Once the project's environment or your own group's installs one, the
+  project's workspace shows a tab named by the applet's id after
+  Overview, and the page opens in an embedded frame under a line naming
+  its spec package and version, with Reload. The page reads its own
+  files and, read-only, the project's working folder — a file at
+  `~/<path>`, a folder's listing at `~/<folder>/` — from the core's own
+  endpoint under a secret path, never the home where the working folder
+  holds it. Its requests, forms and the frame's own navigation stay at
+  that endpoint, the served page's policy and the desktop shell refusing
+  the rest; it reaches neither the IDE nor its token, keeps no storage,
+  and its tab leaves with its package. A project open on a team server
+  shows no applet tab for now.
+
+- The command line and app share one package-manager library
+  ([DR-165](specs/decisions/165-one-package-manager-hosted-by-the-cli-and-the-app.md)).
+  `spex add`, `remove`, `install`, `update`, `list`, `search` and `publish`
+  work in an environment's folder without a running app or an IDE project
+  registration. `login`, `logout` and `whoami` use separate registry and
+  Space grants; publishing's dry run names the destination and files.
+- `spex new <org>/<pkg>` makes a package from existing skill folders or a
+  spec file at `spex-packages/<org>/<pkg>/`, with its manifest, README and
+  the project's license, records its path request and installs it. The
+  app's authoring sessions use the same package-folder layout.
+
+- Players read by name ([DR-155](specs/decisions/155-players-named-delegated-and-recovered.md)).
+  A player reads as the last segment of its id — `dev.reviewer` as
+  reviewer — with a letter mark in one neutral colour beside the
+  Captain's "C", in its lane, Settings and the Playbooks surface, its
+  full id in the tooltip; two players ending alike read as their ids.
+  The Captain's thread says "Handed to reviewer · codex · gpt-6-sol"
+  the first time a player is called and whenever its adapter or model
+  changes, from the records of that call, so a reopened session reads
+  the same; activating the line brings the lane into view.
+- A failure names the agent it belongs to and offers the way back by
+  cause: "Adjust reviewer" opens that agent's own settings for the
+  conversation from its chip, and "Change reviewer in Settings" opens
+  its row in Settings for new sessions; a cause outside Spex keeps its
+  words of what to do there.
+
+- Groups and sharing from Spex ([DR-114](specs/decisions/114-groups-and-sharing-from-spex.md)).
+  Signed in, "New group" heads the list where the instance says you may
+  create one, and a group's heading carries "New subgroup" where you
+  may; the editor asks a name and a path that follows the name as the
+  instance derives it, left for you when a name derives none, as a
+  Chinese one does. A members panel, on a group's heading or a
+  repository's row, lists each member with the instance's role and
+  "via <group>" where the membership is inherited, offers Share by login
+  with the instance's own roles, and Remove on members held directly,
+  each only where the instance says you may act. A group you create
+  lists at once, before the instance's next listing carries it.
+- A second device can join your account's records without choices when
+  its own-group clone is proven to be an unchanged generated bootstrap,
+  also after a restart. Settings or environment edits made before sign-in,
+  preexisting or migrated state and missing proof use ordinary comparison,
+  with the choices that differing shared units require.
+- Each selected spec reaches the agents as a generated skill ([DR-115](specs/decisions/115-a-spec-reaches-the-agents.md)).
+  The lock holds one export per selected spec, named `<org>-<pkg>`, or
+  `<pkg>` past 64 characters, or its alias; the exporter writes the
+  spec file byte for byte as `<pkg>.md` beside a SKILL.md naming the
+  spec package's org, name, version and description, a project's into
+  its working folder's agent folders and your own group's into the
+  agents' home folders, and both leave with the lock. A lock resolved
+  before this exports no spec until it is resolved again.
+- New playbook asks for "Org" and "License" beside the id, so a
+  playbook's first Publish no longer fails on a manifest naming your
+  login as its org and no license: the license starts from the working
+  folder's LICENSE where it reads as Apache-2.0 or MIT, both fields are
+  edited freely, an org outside the manifest's name rule is refused in
+  place naming the rule, and "New playbook" waits while either is
+  empty. After an authoring session's enabling, the card keeps "Commit
+  spex-packages/<org>/<id> with your code" until the surface is left.
+- Undo a misplacement in Spex ([DR-120](specs/decisions/120-the-instance-is-the-space.md)).
+  Where the instance says you may, a group's heading carries Rename,
+  which opens its name and path in place, and, while nothing stands in
+  the group, Delete, asked with Keep focused; a project's row carries
+  "Move to another group", whose picker offers your own group and every
+  group of the instance. The row lists under its new group at once and
+  its clone moves on its next sync. Each act is yours at the instance,
+  and a refusal stands in place with the instance's words. The protocol
+  gains `space.group.rename`, `space.group.delete` and
+  `space.repository.move`; a group's `can` gains `rename` and `delete`,
+  a spex repository's `transfer`.
+
+- The root lease names the machine ([DR-108](specs/decisions/108-the-root-lease-names-the-machine.md)).
+  The core and the storage Git tool record Playbook's machine identity
+  in the home's `.lease/owner.json` instead of the host name the network
+  renames, so a renamed Mac still reclaims its own dead lease; an owner
+  from another machine is still never broken, and a legacy record left
+  by an older writer is reclaimed only under the old same-host rule.
+  Playbook 17.6.0 is the first release publishing that identity.
+  Every retirement — a dead owner's or a normal release — moves the
+  lease to `.lease.retired/<token>/` and keeps it, so a delayed
+  reclaimer can no longer delete a successor's lease; only `ESRCH`
+  proves an owner dead; a mutating storage command reclaims a dead local
+  owner instead of refusing every existing lease; and `Ctrl+C` in
+  `npm start` stops the core and releases the home. **Upgrade
+  together:** stop every Playbook CLI and Spex shell sharing the home
+  before the first new writer runs, after the home snapshot; an older
+  binary reads the new lease as a foreign host's and refuses it.
+
+- Share a project's records through Spex Space ([DR-103](specs/decisions/103-the-home-and-its-groups.md)).
+  Sign in on **Space** to an instance — `spex.sublang.ai` by default, or the
+  address `SPEX_HOST_URL` names when a home is created — through your browser,
+  opened by the desktop or linked by the server shell with no code to
+  type, and Spex lists your
+  groups and the spex repositories you can read in each, creates your
+  own group's at the instance, and creates a project's in the group you pick.
+  The instance's members of a spex repository see its records, with the
+  instance's role names; Spex keeps no member list or access rule of its own. A step that needs rights you lack
+  waits for a member who has them, a rename or transfer at the instance is
+  followed, and a spex repository the instance stops listing turns
+  unreachable with nothing on the device deleted. Git receives the
+  instance's credential through Spex's own credential helper on the app's
+  runtime, never through a remote URL, and the device's token is kept
+  in `local/credentials.yaml`, readable by you alone. An app that starts
+  signed in reads the instance once something first shows your groups, so
+  they and Pick a group's choices need no Refresh, and when the instance
+  signs this device out, Space says so and offers to sign in again as
+  the same account ([DR-106](specs/decisions/106-groups-after-a-restart-and-a-host-sign-out.md)).
+- Playbooks come in spec packages ([DR-104](specs/decisions/104-spec-package-format-and-client-environments.md)).
+  Each project and your own group has an environment: `spex.yaml` requests
+  spec packages from its selected registry, a Git repository or a local
+  folder, and `spex.lock` pins the versions, languages and
+  files resolved, so every member and device installs the same. Installs
+  go through one content-addressed store under the home, replace an
+  environment's files at once, and export skills into each agent's
+  folder in the working folder and, for your own group, your home. The
+  app ships the built-in spec package `sublang/playbooks`, seeded at the
+  first start so the built-in playbooks run offline. **Playbooks** shows
+  each environment's spec packages and the playbooks they export,
+  enabling one by choosing a player for each role; a playbook you author
+  is a spec package in the working folder, compiled there, enabled by
+  path and published to the registry.
+- Publish a directly requested local spec package from its Playbooks row,
+  including spec-only and ordinary-skill packages, without authoring or
+  compiling a playbook ([DR-151](specs/decisions/151-publish-local-spec-packages.md)).
+- Add from registry offers **Add by name** for a known public or private
+  `org/name` and an explicit exact, caret or tilde version requirement
+  ([DR-152](specs/decisions/152-install-a-known-package.md)). Private packages
+  stay out of search and require access; the environment shows whether
+  installation completed.
+
+- Live tool approval controls for supported agents show the conversation or
+  authoring draft, actor, operation, and complete requested action. Approve once
+  or Deny works while a turn is running; pending requests survive client
+  reconnects but expire on cancellation, completion, or core restart. Historical
+  permission records never become actionable, and native policy and external
+  app-access grants remain separate
+  ([DR-098](specs/decisions/098-live-tool-approvals.md)).
+- Attach files by picking, pasting, or dropping them into a new conversation,
+  follow-up, queued intent, or playbook authoring draft. File-only messages,
+  interrupted-upload retry, intent editing and Undo preserve exact content.
+  Accepted sessions own verified copies, and figures and deferred tool details
+  remain readable after reopening and whole-bundle Space selection
+  ([DR-097](specs/decisions/097-media-and-browser-tools-across-hosts.md)).
+- Browser setup and explicit agent controls prepare an isolated headless browser
+  on the execution host, with progress, cancellation and actionable failures.
+  Setup proves launch and screenshot without enabling access or invoking a
+  provider. Conversation overrides apply to the next turn and can return to
+  Settings; authoring follows its selected agent's saved choice.
+- `/inspect` provides a tool-using inspection workflow that leaves the repository
+  unchanged. Native working-agent figures appear with their originating actor,
+  turn and call beside the conversation; control calls remain tool-free.
+  Desktop and remote server clients share the same upload and rendering path.
+- The interface speaks your language ([DR-078](specs/decisions/078-the-interface-speaks-the-readers-language.md)).
+  Settings offers System, English and 简体中文, one choice per Spex home
+  that reaches every page of it on both shells and the desktop's own
+  notifications; with no choice stored, each client follows its own
+  system, reading Simplified Chinese as Chinese and everything else as
+  English. Moments, clock times, numbers, sorted names, ages and
+  durations all follow the chosen language. Each language is one
+  gettext catalog beside the source that a human reads and edits in
+  place, and a build refuses a language whose translation is
+  incomplete, so no page mixes two.
+- The core's own messages speak the chosen language too ([DR-079](specs/decisions/079-the-core-speaks-the-homes-language.md)):
+  refusals, configuration errors, readiness requirements, storage
+  diagnostics, Space guidance and unit labels, compile lines and draft
+  diagnostics. Changing the language re-reads them in place, keeping an
+  unsaved draft, a form under edit and the composer's text. A record
+  already written keeps its language, and what a finished operation
+  composed — a Space stop, a diagnostic raised at load — keeps its
+  language until that operation runs again ([DR-083](specs/decisions/083-a-finished-operations-words-keep-their-language.md)).
+  Text relayed from an agent, a tool or Git stays as it came. A served
+  page whose browser prefers Chinese, on a host whose system does not,
+  reads the core's messages in English until you choose 简体中文.
+- A failure says what, why, and what now. The failed status line becomes
+  a three-line card — the workflow and step that failed, the cause in a
+  plain phrase with its evidence, and what to do next — from the
+  structured cause Playbook attaches to a parked failure ([DR-075](specs/decisions/075-a-failure-says-what-and-what-now.md)).
+  One catalogue phrases every Playbook failure code, with a Boss step
+  where one exists, and a test fails when a code has no phrase. The
+  Dashboard's interrupted rows and the tab tooltip use the same phrase.
+- The parked-run notice draws one control per action the run advertises,
+  labelled with the action's own words, and disables one the runtime says
+  would do nothing, with its reason; the single Retry that sent the first
+  advertised action is gone. Drop stands as before. A session whose
+  controls were never captured offers Drop alone.
+- Beta app releases ([DR-087](specs/decisions/087-beta-app-releases.md)).
+  An `app-vX.Y.Z-beta.N` tag, with both shells' manifests at
+  `X.Y.Z-beta.N`, ships the app as a GitHub pre-release once CI, the
+  smoke and the live smoke pass — without the hours-long regression.
+  Its notes are this file's `[Unreleased]` section as it stands at the
+  tag; the changelog gains no section for a beta, so its notes fold
+  into the regular release that follows.
+- Tests in tiers ([DR-086](specs/decisions/086-tests-in-tiers.md)). The
+  smoke installs the release from a fresh clone with `npm ci` on an
+  empty npm cache and launches both shells as a user does: the server
+  shell walked over its printed token URL and stopped with SIGTERM, the
+  desktop rendered by `npm start`. Every app tag runs
+  `npm run smoke -- --live`, whose last stage runs the live desktop
+  smoke inside that fresh install on the machine's signed-in agents
+  ([DR-089](specs/decisions/089-every-fresh-user-scenario-walked-for-real.md)).
+  Before a regular release, a regression walks the fresh-user
+  scenarios with real agents: the app's own example pasted, compiled,
+  registered and run; a playbook authored in chat compiled, registered
+  and run; and a project created from the palette with its specs
+  scaffolded, developed through a `/decide` and a `/code` queued behind
+  it, the queue handing off; in every run, a player's question is
+  answered through the Captain. A compiler refusing the app's own
+  example on its first compile blocks the tag. CI runs the browser
+  journeys on macOS as well as Linux, the queue's handoff among them,
+  and runs the example as the real `slc` compiled it once that fixture
+  is captured.
+- An agent's settings for one conversation ([DR-067](specs/decisions/067-tuning-for-one-conversation.md),
+  [DR-068](specs/decisions/068-an-agents-settings-where-the-agent-is.md)).
+  The chip in the Captain pane's header, and in each player pane's
+  header, opens that agent's own model, effort and fast mode for this
+  conversation only; Settings and `playbook.config.yaml` never change.
+  Each field offers the configured value by name — "Provider default"
+  where Settings sets none — the provider's default, or a pinned value,
+  and one control returns the agent to its configured values. A choice applies from your next message — a running turn keeps
+  what it started with — and outranks a role binding's pin, the editor
+  naming the roles it also sets. The chip reads the new setting at once.
+  The choice stays on this device and is removed with the session; the
+  `playbook` CLI and other devices run the configured values.
+- A player's subagent model ([DR-093](specs/decisions/093-a-players-subagent-model.md)).
+  On Claude, an agent's subagents run on a model you choose, and the
+  agent is told to hand them well-defined, fine-grained work while it
+  keeps the deep thinking, reasoning and design itself. The field sits
+  wherever the model does — the Captain's and each player's editor in
+  Settings, a role's binding editor in Playbooks, and an agent's
+  settings for one conversation — with the same choices: the inherited
+  value, the provider's default, or a model from the runtime's list.
+  It is offered where the adapter takes one, or where a choice already
+  stands so it can be cleared, and applies from your next message. The
+  chip still reads adapter, model and effort: its editor shows the
+  subagent model, and a conversation's own choice marks the chip
+  changed. The compile does not carry it.
+- A subagent's effort, and the agent's own model by default ([DR-095](specs/decisions/095-a-subagents-effort-and-the-agents-own-model.md)).
+  The subagent-model field now offers "Same as agent" first — the
+  configured omission, every subagent on the agent's own model — then
+  the runtime's models, in place of the provider's default; a configured
+  `false` reads "Off" while it stands, so it can always be cleared.
+  Beside it, a fifth tuning field, the subagent effort, offers "Agent
+  chooses" first — each delegated task's effort left to the agent —
+  then the adapter's efforts without `ultracode`. Pinned or chosen, it
+  governs the delegate subagents Cligent registers and the
+  `general-purpose` subagent it replaces — at the pinned effort, or at
+  `medium` where the agent chooses and names no subagent type — so
+  those no longer inherit an agent's `ultracode`; Claude's built-in
+  `Explore` and `Plan` subagents keep the agent's own effort. It has
+  the same three homes and tiers as the subagent model. In the
+  Captain's and each player's editor, a role's binding editor and an
+  agent's settings for one conversation, the model and its effort now
+  share a row, and the subagent model and its effort the next; the
+  pairs stack at the 320-pixel floor. The chip is unchanged.
+  Delegation is now the default, in Spex's sessions and draft
+  conversations as in the `playbook` CLI: every Claude agent whose
+  subagent model is unset runs its subagents on its own model and is
+  told to delegate, so existing configurations change behavior. "Off"
+  (`subagentModel: false`) is the way back, and a subagent effort set
+  beside an Off — in the agent's block, a role's binding or one
+  conversation's settings — is refused rather than switching delegation
+  back on.
+- Each agent's pane header reads its completed active time this session,
+  as `active · 3m 12s` ([DR-070](specs/decisions/070-agent-active-time.md),
+  [DR-071](specs/decisions/071-active-time-follows-held-calls.md)): the
+  sum of that agent's finished calls from prompt to finish, whatever
+  their outcome, a call whose clock stepped backward counting zero
+  ([DR-072](specs/decisions/072-backward-call-time-is-zero.md)).
+  Parallel calls each count in full, so the figures can add up to more
+  than the session's wall-clock time, and no total is shown. A figure
+  appears once a call finishes, reads the same after a restart, and is
+  the first header detail to yield in a narrow pane. The player header's
+  token count is gone; each call's usage stays on its result line.
+- Space repairs a project in place ([DR-063](specs/decisions/063-space-setup-and-repair.md),
+  [DR-065](specs/decisions/065-repairs-the-reader-answers.md)). Where
+  synced sessions ran in a folder that is not a project on this device,
+  the issues list holds one repair per project, named by the project and
+  resolving all its sessions, rather than a row per diagnostic. The app
+  checks the folders the repair names, and the same name in the folder
+  holding most of your projects, and proposes one only when exactly one
+  is an unclaimed Git repository; it never searches the disk. **Add
+  project** takes it and keeps the synced project's identity, so its
+  sessions, queue and history attach; **Choose folder…** names another;
+  **Don't add** records, on this device alone, that the project does not
+  belong here — the row stays, with its controls, and stops counting.
+  Adding keeps you on Space. Before, the only remedy was the project
+  palette, which registered a duplicate project and synced it to every
+  other device.
+- Each project's group on the Dashboard folds to its header from its
+  Collapse control and stays folded across launches. A folded group
+  keeps its most severe attention mark; the project's Overview always
+  shows every band.
+- The Playbooks surface says when the app ships newer built-in
+  playbooks than an environment runs. An app update still changes no
+  environment by itself — the lock keeps the built-in release it
+  selected — but where the app ships a newer `sublang/playbooks` that
+  the environment's request admits, the environment reads "Built-in
+  playbooks 17.8.0 shipped with this app; this environment runs
+  17.7.0" with one **Update**, which resolves it again. `environment.get`
+  and `environment.state` carry it as the optional
+  `builtinUpdate: { shipped, locked }`; the protocol version is unchanged.
+- The core lists the team servers each signed-in instance offers you,
+  opens a seat on one once you accept its contract — the ticket asked of
+  the instance and presented at the server over TLS — keeps the seat in
+  `local/seats.yaml`, owner-only, and closes it ([DR-133](specs/decisions/133-one-desktop-over-several-cores.md)).
+  Protocol 28 adds `server.list`, `server.open`, `server.close` and the
+  `server.state` event. While a seat is open the core's own endpoint
+  relays to it at `/seats/<place>`, admitted as `/` is, presenting the
+  bearer to the server itself; it reconnects to each seat every second,
+  reads a seat speaking another protocol as mismatched, removes a seat
+  whose lease ended, and adds each seat's badge to the dock's count.
+  The place selector switches Settings, Playbooks, Space and environments
+  between this computer and an open seat, keeping their state separate.
+  Projects appear under their place; attention and approvals span the
+  connected places, and a disconnected place leaves the others usable.
+  A seat with no projects offers its groups; remote project and environment
+  forms offer no folder picker or path on this computer.
+- Administrators can install the Linux team-server hub, helper and systemd
+  units from a source checkout ([DR-132](specs/decisions/132-team-servers.md)).
+  An independent sweep stops seats whose recorded leases expired, even
+  while the hub is down, retaining their files
+  ([DR-148](specs/decisions/148-a-lapsed-seat-is-stopped-by-a-sweep.md)).
 
 ### Changed
 
-- Trim the bundled `iterations/000-spdx-headers.md` IR: cite
-  `dev/licensing.md` as the normative source instead of duplicating
-  its scope/exclusions, and reframe the format-documentation task
-  as adding a `## Format` section to `dev/licensing.md` with the
-  project's actual license and copyright.
+- Package environments are complete in their root folder: `spex.yaml`,
+  `spex.lock` and the ignored `.spex/` installation. A project's root is
+  its working folder; your own group's is its records clone. The CLI and
+  app read the same files at each use, and the app prepares installed
+  playbooks for its engine. The CLI's attached `auth`, `project`
+  and `package` commands, `--server`, `SPEX_SERVER_URL` and endpoint
+  discovery are removed in CLI 5.0.0; `spex new` replaces
+  `spex package init` ([DR-165](specs/decisions/165-one-package-manager-hosted-by-the-cli-and-the-app.md)).
+- An environment command sent with `wait: true` replies once its own
+  operation settles: a publish with its actual destination, name,
+  version and page, a refusal with its error. A client that disconnects
+  ends the delivery alone; the core neither replays nor cancels the
+  work. Every other reply is unchanged.
+- A project's complete environment lives in its working folder:
+  `spex.yaml`, `spex.lock` and the ignored `.spex/` installation. The IDE
+  and standalone CLI use those same files. Existing environments move
+  out of project-record clones at startup or pairing while preserving
+  working-folder files, registry selection and locked sources. Interrupted
+  moves resume from a recorded plan without losing package pins; a changed
+  file stays untouched and its environment's package operations wait for
+  recovery. `space` binds collaboration
+  independently of `registry`; old manifests without `registry` retain
+  their former package destination until explicitly migrated.
+- On Playbooks, **Add from registry**, **Add from folder** and **Add from
+  Git** stand directly beneath the environment's list of spec packages,
+  above the playbooks, instead of at the page's foot. The environment's
+  heading names the project — "Environment of demo" — or "Environment of
+  your own group", and no longer shows a `<name>-spex` key
+  ([DR-159](specs/decisions/159-projects-in-groups-opened-where-you-work.md)).
 
-## [0.2.2] - 2026-05-09
+- The compiler and app share Playbook 18.1.0 through slc 0.20.0's required
+  peer dependency. Both shells supply the engine, and dependency checks
+  reject duplicate or stale Playbook, Cligent and xstate installations
+  before build and release ([DR-167](specs/decisions/167-the-compiler-shares-the-apps-engine.md)).
 
-### Changed
+- A first-run config takes the agents Playbook seeds for this machine's
+  sign-ins ([DR-154](specs/decisions/154-the-seed-follows-playbooks-rule.md)):
+  with only Codex signed in, the Captain and every player run Codex; with
+  both Claude and Codex, `dev.reviewer` runs Codex and everything else
+  Claude; otherwise the starter is as before. Existing configs are not
+  changed.
+- A seeded config no one has changed follows the sign-ins it was chosen
+  from ([DR-156](specs/decisions/156-an-untouched-seed-follows-the-credentials.md)):
+  at each start, and on a team server when a member places or removes an
+  agent credential, it is rewritten as the seed for the sign-ins then. A
+  team server seeds from its shared sign-ins, so a Codex-only server starts
+  on Codex. The first change to the file, of any kind, ends this for good.
+- Require Playbook 18.1.0, the first release publishing its seed rule
+  ([DR-154](specs/decisions/154-the-seed-follows-playbooks-rule.md)).
+  The built-in playbooks stage as `sublang/playbooks` 18.1.0, unchanged
+  from 18.0.1.
 
-- `spex scaffold --update` no longer prints post-prompt path
-  summary sections. Per-file indicators are now the single
-  file-level action log.
-- `spex scaffold --update` now reports absent seed files as
-  `(created)` and combines same-run legacy migration plus seed
-  refresh status into one indicator line.
+- Adopt Playbook 18.0.1 and stage its corrected CODE workflow: standalone
+  documentation or status work without an unfinished IR task is new change
+  work, with review of the exact commit still required. Existing environments
+  keep their selected built-in version until **Update** resolves the newer
+  release. Finish saved CODE deliveries with their original Playbook version,
+  or start a new run after upgrading.
 
-## [0.2.1] - 2026-05-08
+- The collaboration destination is **Space**, and the public server product is
+  **Spex Space** at `spex.sublang.ai`. New homes use that address; existing
+  connections, groups and stored placements keep their identities.
 
-### Changed
+- First-run guidance now explains specs and playbooks in plain language,
+  invites a goal, and makes local project setup and task start clearer in
+  English and Chinese ([DR-143](specs/decisions/143-start-with-a-goal-and-explain-specs-plainly.md)).
+  Desktop project selection leads with the native folder picker.
 
-- `spex scaffold --update` now writes absent seed files
-  (`map.md`, `dev/git.md`, `dev/licensing.md`, `test/licensing.md`,
-  the sample iteration, `user/.gitkeep`) from the bundled template
-  and reports the path with `(updated)`. The previous
-  `(kept — missing)` indicator is removed. Remove a seed after
-  `--update` if you do not want it.
+- A session's player panes appear as the work calls each player
+  ([DR-146](specs/decisions/146-a-lane-appears-with-its-first-call.md)).
+  A new session shows the Captain alone at its reading width; a player's
+  pane appears with its first call, in that order, and stays for the rest
+  of the session, so idle panes no longer take the width and the
+  "Idle until the playbook calls" line is gone. Bringing a working pane
+  into view scrolls only the player panes, never the page or the Captain
+  column, and never takes focus.
+
+- New sessions and intents belong to the runtime that creates them
+  ([DR-134](specs/decisions/134-execution-ownership.md)). Another runtime
+  shows their history with `Runs on <label>` but cannot continue or recover
+  the session, start or change its open intent, or advance its queue into it.
+  The history notice retains that reason without a composer or recovery
+  controls, and foreign queued rows offer only their provenance action.
+  Foreign work does not occupy the local execution lane or attention queue.
+  Intent files now use format 2; upgrade every member's devices together
+  before syncing those records. Older records retain their existing rules.
+
+- Playbook 18 shared session persistence now uses bounded files and
+  deduplicated immutable chunks, with Sync selecting each complete session
+  family together
+  ([DR-144](specs/decisions/144-bounded-session-storage.md)). Legacy sessions
+  remain readable and require explicit Playbook migration before continuation.
+  Stop older Playbook CLIs and Spex shells sharing a home before any upgraded
+  writer starts.
+
+- The app requires Cligent 0.36.1 and slc 0.19.1, keeping the locked agent
+  SDKs ([DR-153](specs/decisions/153-playbook-18-0-1-cligent-0-36-1-slc-0-19-1-adoption.md)).
+  Captain decision, Judge and reporting calls, and every compiler call, turn
+  off, as far as each agent allows, the skills the agent finds by itself in
+  its project and user skill folders, so the skills and specs Spex exports
+  reach working players and authoring sessions but no longer steer routing,
+  adjudication or compilation; a Kimi Code Captain still reads them, and a
+  session whose Captain conversation began earlier keeps the listings already
+  in it. A Captain or compile whose agent offers the switch but cannot apply
+  it where it runs, such as Gemini CLI under its native sandbox, now fails
+  with an error. The folders Spex exports into now come from Cligent's
+  published table.
+
+- A home can sign in to several instances, with each instance's account,
+  groups listing and repository operations kept separate ([DR-127](specs/decisions/127-a-home-signed-in-to-several-instances.md)).
+  Existing homes and clones migrate to the instance-aware layout; a
+  refused credential signs out only its instance. A project's records can
+  be placed at several instances, with **Place at…**, **Attach** for a
+  placement another device named, and **Leave…**, which keeps its server copy.
+  Sync runs placement by placement, each with its own incoming changes,
+  choices and outcome ([DR-128](specs/decisions/128-a-spex-repository-placed-at-several-instances.md)).
+- Each environment searches, resolves and publishes at its selected
+  registry; Git sources use its selected Space's broker. Independent
+  installs use the lock's recorded registry or an explicitly trusted
+  equivalent, preserving the locked version and checksum; built-ins use
+  the local seed when its files match the lock. `environment.search`
+  requires `repository`.
+
+- The app previously adopted Cligent 0.34.1 and slc 0.18.1, keeping Playbook 17.10.1 and the locked agent SDKs ([DR-126](specs/decisions/126-cligent-0-34-1-slc-0-18-1-adoption.md)). On POSIX, Codex retains Unicode line and paragraph separators in valid JSON output; the compiler verifies JSON renderings of typed arrays and records without changing their input shapes.
+
+- The app previously adopted Playbook 17.8.0 and slc 0.16.1 ([DR-116](specs/decisions/116-playbook-17-8-0-slc-0-16-1-adoption.md)).
+  A judge's reply is fitted to the machine and a parked judge is a
+  failure the catalogue phrases, every commit of a step is taken, a
+  role is one word, and the relay marker is language-neutral.
+- An authoring session writes in the project's language: the language
+  a brought-in folder already declares, else the project's "Authoring
+  language:" marker in `specs/meta.md`, else the interface language.
+  The session records it, so later opens keep the same folder, and the
+  preamble names it and, for a language other than English, the words
+  slc recognizes literally: the `Roles:` and `Results:` headings, the
+  Captain clauses, role and result names and the quoted lead-in. The
+  one-shot compile decides it the same way.
+- Every authoring preamble says a role's prompt describes only that
+  role's own step and ends by naming the result the step reports; later
+  rounds, the hand-over between roles and the ending belong to the
+  behaviors' prose, so a compiled run no longer parks on a reply that
+  waited for a later round.
+- Space names the instance alone ([DR-120](specs/decisions/120-the-instance-is-the-space.md)).
+  Space names the collaboration instance alone: it lists your own group,
+  the instance's groups you belong to by their paths in it, and the spex
+  repositories another person shares from their own group, under that
+  person's login. Keys and
+  workspace folders follow the paths the instance answers, so a clone
+  filed under the old storage path moves once, on its next sync. No
+  link leads to the Git system behind the instance — no "Open at …" in
+  a members panel, no "New group at …" — and where you may not create a
+  group, the list's head reads "Groups are made by the people who run
+  <instance>". A group named like your login stands apart and takes no
+  folder of yours. A stopped sync never prints a Git URL of the storage:
+  the clone's own address reads as its path in the instance, any other
+  as the instance's name, and an HTTP error no message reads stops as
+  "<instance> answered with an error". Where membership decides, the
+  guidance names Share. The protocol drops `groups[].url`, `Member.url`
+  and `membersUrl`.
+- A failed workflow's notice folds its earlier steps behind one control ([DR-117](specs/decisions/117-the-earlier-steps-fold-behind-one-control.md)).
+  The retry and Drop stand in the notice's row as before; every "Resume
+  from: …" action waits behind "Resume from an earlier step…", which
+  opens their list in place with each label whole, so a run interrupted
+  under a long machine no longer reads as a wall of near-identical rows.
+
+- The core coordinates its writers as Git does ([DR-111](specs/decisions/111-the-core-coordinates-as-git-does.md)).
+  A command is no longer refused merely because a sync, check, join,
+  move, removal, compile, install or enabling runs. A write whose file
+  changed since it was read is refused "changed meanwhile; retry", and
+  you retry it; a session's lease still refuses removing its project,
+  and now also a sign-in's or the host's rename of its clone. A
+  repeated Sync or Check joins the one running, and a Sync asked during
+  a Check follows it. A playbook can compile while its authoring
+  conversation's turn runs, but a second compile or packaging job for
+  the same artifact folder is refused while the first runs, a canceled
+  one until its compiler has exited; a failed or canceled compile's
+  partial outputs show as the last run left them, not compiled. A sync
+  whose Apply would replace an authoring session's transcript while its
+  turn runs here stops naming the session; Retry finishes it once the
+  turn ends. A damaged `home.yaml` reads as no projects, and writes that
+  need it are refused, until it is repaired; this device keeps its id
+  meanwhile. Protocol
+  version 24: every command on an existing authoring session names the
+  session's recorded instance (an unreadable session's Delete its file
+  version instead), as do its records, source, compile progress, media
+  and approval owners.
+- Every record lives in a spex repository ([DR-103](specs/decisions/103-the-home-and-its-groups.md)).
+  Each project's sessions, intents and authoring sessions live in its own
+  clone, `workspace/<group>/<name>-spex/`, synced on its `spex` branch; your
+  settings and the sessions of no project live in your own group's,
+  `workspace/<you>/<you>-spex/`. `home.yaml` pairs each working folder with
+  its spex repository, and the home itself is no longer a Git repository.
+  A former home migrates once at startup, keeping its original bytes and its
+  old Git history under `local/`. Each intent is one file; Up next runs the
+  oldest queued intent first, so rows no longer move or link, and every
+  queued row's menu offers Start. Removing a project deletes its clone,
+  asking again while it holds records the host has not received, and never
+  touches the working folder. Space syncs each spex repository on its own,
+  and `scripts/storage-git.mjs` takes `--repository <key>`.
+- The app previously adopted Playbook 17.9.0, slc 0.16.1 and Cligent 0.33.5 ([DR-121](specs/decisions/121-playbook-17-9-0-cligent-0-33-5-adoption.md), [DR-116](specs/decisions/116-playbook-17-8-0-slc-0-16-1-adoption.md), [DR-111](specs/decisions/111-the-core-coordinates-as-git-does.md), [DR-108](specs/decisions/108-the-root-lease-names-the-machine.md), [DR-105](specs/decisions/105-playbook-17-5-0-adoption.md), [DR-088](specs/decisions/088-playbook-17-slc-0-12-cligent-0-27-adoption.md),
+  [DR-092](specs/decisions/092-playbook-17-1-slc-0-13-cligent-0-28-adoption.md),
+  [DR-093](specs/decisions/093-a-players-subagent-model.md),
+  [DR-094](specs/decisions/094-the-compiler-adopts-the-apps-cligent.md),
+  [DR-095](specs/decisions/095-a-subagents-effort-and-the-agents-own-model.md),
+  [DR-097](specs/decisions/097-media-and-browser-tools-across-hosts.md),
+  [DR-098](specs/decisions/098-live-tool-approvals.md),
+  [DR-102](specs/decisions/102-playbook-17-4-1-adoption.md)),
+  and locks the agent SDKs at the releases Cligent 0.33.1 tests: Claude
+  Agent SDK 0.3.284, Codex SDK 0.159.0 and OpenCode SDK 1.18.33. The
+  compiler shares the app's Cligent; slc 0.19.0 retains a compiler-only
+  nested Playbook 17.11.1, while the core and root acceptance tooling
+  use Playbook 18 ([DR-144](specs/decisions/144-bounded-session-storage.md)).
+  Cligent refuses an agent runtime older than the
+  oldest release that serves its provider's latest models, so an older
+  runtime on your `PATH`, such as an OpenCode CLI before 1.18.29, reads
+  not ready with the command that upgrades it.
+  **Upgrade every host that shares your Spex home together, and snapshot
+  the home first** ([DR-050](specs/decisions/050-shared-storage-cutover.md)):
+  once this build saves a session, an older host — a `playbook` CLI
+  sharing the home, or another device syncing it through Space — may
+  not open it. Playbook 16 or older opens none of this build's
+  sessions. Playbook 17.1 or earlier cannot open a session whose record
+  carries a subagent model, as every Claude agent's now does by
+  default, and Playbook 17.2 or earlier cannot open one whose record
+  carries a subagent effort. Stop older writers and update every host to
+  compatible Playbook 17.4-based releases before saving attachment-bearing
+  history; older writers do not preserve the new asset-bearing records.
+- From Playbook 17.5.0 ([DR-105](specs/decisions/105-playbook-17-5-0-adoption.md)), the launcher takes each playbook's module at launch, so a `playbook` CLI sharing the home continues a session Spex created from a configuration naming no `from`, with no launcher config rewritten, and a fresh CLI launch on Spex's configuration names each module with `--module <id>=<specifier>`.
+  A packaged `/code` or `/decide` run with `/review` disabled now stops at
+  its start with an explanation instead of committing work its review
+  cannot check, as the Library's hint beside those entries says. Session
+  asset directories stay readable when another store sharing the home
+  prepares them again or a file manager leaves `.DS_Store` files in them,
+  and such a session still deletes. A nested call receives only its
+  parent's attachments, so files the Captain did not select never reach a
+  child worker.
+- A session parked on a question inside a built-in state that Playbook 16
+  renamed — `/code` waiting in its former `runFirstPhase`, for example —
+  no longer resumes from your answer. Drop it, or send a new request.
+- Interrupted work offers **Restore** where it offered Retry. Restore
+  brings back the saved position and reports what was recorded; nothing
+  is repeated and the saved message is not run again. You then continue
+  with the run's own controls or a new message. Your message reads once,
+  and the call that was interrupted no longer shows as working. A turn
+  stopped after its work was saved — an abort included — now settles
+  there and simply continues, the run it left waiting showing its
+  controls; an abort during the Captain's own call leaves Up next
+  stopped, with Start.
+- A Restore's report finishes nothing: it raises no Finished entry and
+  starts no queued work, and an interrupted intent returns to Up next,
+  stopped, with its history kept. A run it brings back failed asks for
+  you on the Dashboard and says why on its card and notice; a run you had
+  stopped yourself stays your stop. A Restore the app was closed in the
+  middle of is completed the next time the app reads the session.
+- **Discard** appears only when nothing was recorded: no step, no
+  abandonment, and unchanged repository evidence. Otherwise Restore
+  stands alone.
+- The compile row shows slc's new **Prefix** phase between Optimize and
+  Machine.
+- The app's example settles the two limits slc 0.12 asked about.
+  Adapted from slc's demo, it counts the first agent's judgments per
+  loop, its last one in a loop being the conclusion, and ends after the
+  2nd loop's commit without another review.
+- A player's question reaches you only as the Captain's explanation of
+  it, which completes [DR-085](specs/decisions/085-boss-talks-through-captain.md).
+- While a turn runs, the composer's field and Send are disabled, your
+  draft kept and Abort beside them, the placeholder reading "Captain is
+  working…"; a message no longer queues behind the turn as **Send
+  next** ([DR-085](specs/decisions/085-boss-talks-through-captain.md)).
+  Between turns you may answer a waiting question or ask the Captain
+  about it: a message no longer counts as the answer, and the question
+  stands until the run reports it gone. Messages an earlier build
+  queued still show and send when a turn settles, but never answer a
+  waiting question.
+- The playbook-authoring agent is taught that each outcome has one
+  repository effect: an outcome that may commit or leave the repository
+  unchanged is two outcomes, as slc's link requires.
+- The shared launcher configuration now lives at
+  `config/playbook.config.yaml` under your Spex home, the home's
+  directory of hand-written configuration ([DR-080](specs/decisions/080-the-config-directory-is-named-config.md)).
+  A config still at the former `playbook/` location, or at the older
+  XDG path, moves there once when the core starts: the file keeps its
+  name, its permissions and the target of every relative locator
+  reaching outside its directory, and the emptied `playbook/` directory
+  inside the home goes with it. The Playbook CLI shares the same file
+  again from Playbook 15; an older CLI seeds a file of its own at the
+  former location.
+- The app requires Node.js 22.19 or later, the floor of the catalog
+  tooling ([DR-078](specs/decisions/078-the-interface-speaks-the-readers-language.md));
+  CI drops Node 20, which reached end of life in April 2026.
+- With Playbook 14.1 ([DR-076](specs/decisions/076-playbook-14-1-adoption.md)),
+  uncommitted work already in your tree is now the Coder's context rather
+  than an ambiguity: a governed call may carry it in its one commit, the
+  Coder is told which changes predate its task and to leave them alone
+  otherwise, and a settled commit that absorbed or altered any of them
+  says so in the Boss's reply. Every parked failure carries a structured
+  cause and every advertised action its standing, so the failure card and
+  the per-action controls now read the runtime's own words rather than a
+  list mirrored by hand. Dropping a run over unresolved repository
+  effects records a durable abandonment and reports a failed stop
+  truthfully.
+- A parked run survives ([DR-074](specs/decisions/074-a-parked-run-survives.md)):
+  a settled session releases its runtime even when unresolved repository
+  effects stand, so its project is no longer refused as still working; its
+  controls are captured at settlement and kept locally, so they stand after
+  a restart; and a session whose run was ended over unresolved effects is
+  continuable, as Playbook's own validation says. The core's own refusal
+  "reconcile unresolved effects before continuation" is gone.
+- Playbook compilation runs the compiler Spex ships ([DR-081](specs/decisions/081-the-app-supplies-the-compiler.md)):
+  both shells declare `@sublang/slc`, so its agent SDKs are the app's
+  own, and the desktop compiles on its bundled Electron Node — no
+  global `slc`, no `npx`, no system Node; the server shell still needs
+  Node 23.6 or later to compile. A compiler whose playbook engine the
+  app cannot run is refused with both engines named. The compile's
+  agent follows the draft's, or the Captain's, block — adapter, model,
+  effort and fast mode, what the block leaves unset running at the
+  adapter's default rather than an slc configuration file's ([DR-084](specs/decisions/084-the-block-is-the-whole-compiler-agent.md))
+  — unless the environment sets any `SLC_*` variable, in which case it
+  configures slc itself; an agent on an adapter the compiler cannot
+  drive is refused before it runs, and the compile log names the agent
+  and where it came from.
+- `npm run smoke` no longer re-runs the unit, integration and journey
+  suites — CI's run on the tagged commit is that evidence — and never
+  flips the developer tree's native module: its stages are the build,
+  the spec lint, the fresh install and the CLI user pass, and the
+  desktop renders inside the fresh clone, so `--desktop` is gone
+  ([DR-086](specs/decisions/086-tests-in-tiers.md)).
+- `npm run e2e:live` is now `npm run regression`.
+- `npm run smoke` refuses a working tree with uncommitted changes —
+  the release records under `docs/releases/` aside — unless
+  `--allow-dirty` is given, since its build, lint and CLI pass read the
+  working tree while the fresh install clones the last commit; the
+  fresh install launches the server shell as the README does, with only
+  `SPEX_HOME` set and an ephemeral port.
+- The project palette's Add and Create say what each does in their
+  tooltips: "Register this existing repository" and "Create a new
+  repository at this path".
+- The Up next row's Start collapses to an icon in a narrow pane, so the
+  row keeps its words on one line.
+- The project Overview names the GitHub state in its header only while
+  the Sources band is folded; an open band says it itself.
+- With no prose paragraph in a draft's source, the Register tab's
+  intent defaults to the source's title, so the app's own example
+  registers on its defaults.
+- Long inline explanations read as key phrases, the detail moving into
+  the control's tooltip ([DR-069](specs/decisions/069-key-phrases-not-sentences.md)):
+  the Specs tab's legacy-layout notice, the Space's setup,
+  unrelated-history and first-meeting cards, the terminal pane theme
+  and the config path in Settings, the agent editors' scope ("This
+  conversation only"), and the session start, which drops its tip.
+- Space sets up by naming its remote ([DR-063](specs/decisions/063-space-setup-and-repair.md)).
+  **Set up space** takes a required remote URL, makes the home a
+  repository, sets the remote and runs the first sync: an empty remote
+  is filled from this device, and a space already there is joined, any
+  differences asked. Initialize and the separate Join a space are gone,
+  and the app no longer makes a repository without a remote, which could
+  commit only once. Until a newly set remote has been checked, the Sync
+  tab offers Join by name, so joining another machine's space no longer
+  waits for an "Unrelated history" failure. A home that is already a
+  repository gets a remote added, never a second setup.
+- A Space sync that the host answers with "not found" no longer claims
+  the repository is absent ([DR-064](specs/decisions/064-honest-remote-failure.md)):
+  GitHub answers the same for a private repository this machine cannot
+  see. The stop reads "No repository this machine can see at ⟨URL⟩",
+  offers Retry, and names the remedies — check the URL, create the
+  repository, or give this machine access, in the remote's own terms:
+  `gh auth status` and `gh auth login` in a terminal for GitHub over
+  HTTPS, the SSH key an account must carry, a local folder you can read.
+  A host refusing with 401 or 403 reads as refused access rather than
+  as Git's own words.
+- Every Dashboard summons names what ends it and offers a way to end it
+  that works whatever the session's runtime is doing ([DR-066](specs/decisions/066-every-summons-has-a-door.md)).
+  An unread turn's row carries **Reviewed**, and an interrupted intent's
+  row **Drop**, behind a "Drop this work?" confirm; a question or
+  failure row names the reply, retry or drop that ends it, and opening
+  it lands on that control or the composer. A failure that parked no
+  run says "The last turn failed. Send a message to pick it up." above
+  the composer. The tab, the sidebar row, the project's mark, the
+  palette and the badge name each kind in the same words, the most
+  severe first.
+- Historical player permission records remain non-actionable and raise no
+  Dashboard summons ([DR-066](specs/decisions/066-every-summons-has-a-door.md)).
+  Actual pending native tool requests have their own live approval inbox
+  ([DR-098](specs/decisions/098-live-tool-approvals.md)).
+- Dropping interrupted work ends the run it left waiting ([DR-073](specs/decisions/073-letting-go-ends-the-parked-run.md)).
+  Drop on an intent whose run stands parked — on a failure or on a
+  question — ends that run first, spending no model call, and records
+  the verdict once it has; before, the verdict stood alone and your next
+  message reached the waiting player as its answer. A Drop that cannot
+  end the run — another device holds the session, a turn is running —
+  says why where you took it, and the intent stays open. The parked-run
+  notice now also stands for a run waiting on your reply, with Drop
+  beside the composer.
+- Up next is one committed queue ([DR-077](specs/decisions/077-up-next-is-a-committed-queue.md)).
+  Every row reads **Queued**; the first row not waiting on another
+  intent is next and says what it waits for — `after current work`,
+  `waiting — your reply`, `waiting — current work failed`,
+  `waiting — previous work failed` with its cause, or
+  `waiting — previous work stopped` — and carries Start only where going
+  on is yours to decide. A turn that settles cleanly hands the next
+  intent to the same conversation: an ordinary Captain reply and your
+  answer to a question now qualify, where before only a playbook's
+  typed success did. A failure, an abort, a run's ending, or a run still
+  waiting on you holds the queue. Delivery cards, the Captain home and
+  the all-clear name the same next with the same Start.
+- An empty playbook draft offers two acts where it offered three phrase
+  chips ([DR-082](specs/decisions/082-the-first-move-in-a-draft-is-an-act.md)).
+  **Use a SKILL.md…** picks a file where the app offers a file picker
+  and makes it the draft's source — or, when the draft already has one,
+  places it in the Source tab's paste mode for **Use as source** to
+  confirm — and otherwise opens that paste mode; the composer then holds
+  the ask to adapt it, one Enter from sending. **Try the example**
+  places the app's six-line example in the composer. Neither sends
+  anything, and the authoring agent now knows that a placed source may
+  be a SKILL.md to rewrite into a playbook.
+- The app reopens on the surface you left — after a restart, or a
+  reload of the page — rather than on Projects.
+- When a surface fails to render, the error screen offers **Try
+  again**, which keeps you where you were, beside **Reload the page**;
+  a reload was the only way on before.
+- The player grid fades at an edge while a pane lies beyond it, so a
+  lane scrolled out of view reads as more to scroll to rather than as a
+  pane cut off mid-glyph.
+- The Up next add field wraps and grows with its text, up to eight lines
+  before it scrolls; Shift+Enter adds a line and Enter queues the whole.
+- Sign-in guidance names the act: an agent not yet signed in reads "sign
+  in by running claude in a terminal, or set ANTHROPIC_API_KEY" (`codex`
+  alike), and an expired sign-in says to sign in again with that agent's
+  CLI, in a terminal.
+- Models are named as the runtime names them ([DR-091](specs/decisions/091-models-named-by-the-runtime.md)).
+  The model field is a list whose rows read each model's name with the
+  specific model behind it — Claude's `opus` reads "Opus ·
+  claude-opus-5-5" rather than "Opus · opus" — and, where the runtime
+  gives them, its own description and the model it runs when none is
+  set. The editor gives the field its full width, and an inherited
+  model — the provider's default included — is named the same way. In
+  a conversation, an agent's chip reads the model its runtime reported
+  for its latest call while the adapter and model setting that call
+  began under still stand, what is set kept in its tooltip; a change of
+  either shows at once, as before.
+  Cligent 0.28 supplies the descriptions, the default model and the
+  reported models, wherever the runtime reports them.
+- A new Spex home's starter configuration, a new player lane and a new
+  role assignment start on `claude-opus-5-5`, the latest Claude model,
+  where they started on `claude-opus-5`.
+- Protocol changes, in full in `packages/core/src/protocol.ts`:
+  `session.restore` replaces `session.retry`; `session.agent.set`,
+  `language.get`, `language.set` and `space.repair.decline` join, with
+  the `language.state` message; `session.control` may name the action
+  it runs by `actionId`; a session gains `parked`, `agentActiveMs`,
+  `agentReportedModels` and `agentSettings`, and its `recovery` gains
+  `discardable`; an agent block, a role binding and a session's agent
+  settings take a `subagentModel` and a `subagentEffort`, an agent
+  block's `subagentModel` admitting `false`, and `agent.options` and
+  readiness report `subagentModelSupported`, `agent.options` its
+  `subagentEffortValues` too; each model `agent.options` lists may
+  carry its `description`, and an available catalog its `defaultModel`; an open
+  intent gains its queue standing, `next`, and loses the `permission`
+  reason; durable ledger attention entries are questions, failures, finishes and
+  reviews only, a failure carrying `parked` and its `cause`; a draft's
+  failed compile names its `relay`; a storage diagnostic may carry a
+  structured repair, and the Space state its `issues` count, its
+  Settings unit named `config/playbook.config.yaml`; and an error reply
+  may carry `details`. Structured attachments accompany conversation,
+  intent and authoring submissions; `media.begin`, `media.chunk`,
+  `media.finish`, `media.cancel` and `media.read` transfer their bytes.
+  Agent settings admit `browser`; `agent.capabilities`, `browser.prepare`
+  and `browser.cancel` expose host readiness with `browser.progress`.
+  `approval.list` and `approval.respond` operate on live requests from
+  `approval.state`, independently of durable ledger attention.
+  Since then `space.signin.start`, `space.signin.cancel`,
+  `space.signout`, `space.refresh`, `space.pick`, `space.join`,
+  `space.members`, `space.share`, `space.unshare` and
+  `space.group.create` join, with `draft.defaults` and the
+  `environment.*` family, and `server.list`, `server.open` and
+  `server.close` with the `server.state` event for the seats a desktop
+  opens on team servers; `intent.move`, `intent.link` and `space.init`
+  leave; and a draft's `malformedDirectives` entries carry `text` and
+  `reason`. Registry account commands, directory discovery and
+  `environment.registry.set` join independently of Space commands, with
+  `registry.state` and a separate registry selection in environment
+  state. The protocol is 31.
+
+- The dependency lock previously took Playbook 17.8.1 — the Captain ends a relayed question with the question's own words and reports a step's ending with the facts the step gave — and cligent 0.33.4 — the Claude Code adapter withholds the structured-question tool it cannot serve, so no refused call shows in the Captain's pane. That adoption left the floors of DR-116 unchanged.
+- The app previously adopted Playbook 17.9.0 and Cligent 0.33.5 ([DR-121](specs/decisions/121-playbook-17-9-0-cligent-0-33-5-adoption.md)). Claude Code runs with its own commit and pull-request attribution off, so a player's commits carry only the trailers the project asks for, and every player prompt opens with `Role: <role> · Model: <model>`, so such a trailer can name both. Every role after a Boss answer hears the run's questions and answers, whatever the playbook retains; a question and a reply reach a player behind `? ⟶` and `Boss ⟶` lines, and the lines the Captain appends to a reply read as marks — `✓`, `✕ <code>`, `▸ <label>` — not English sentences. The closing reply names each commit's hash and branch, and a judge's reply the machine admits is no longer forced into a string where the runtime could not read the field's shape. **Upgrade together:** stop every Playbook CLI and Spex shell sharing the home before the first new writer runs; an earlier Playbook rejects the run snapshots and ledgers this one writes.
+- The app previously adopted Playbook 17.10.1, Cligent 0.34.0 and slc 0.18.0 ([DR-123](specs/decisions/123-playbook-17-10-1-cligent-0-34-0-slc-0-18-0-adoption.md)). A judge sees a field whose shape nobody recorded as `<value>`, not `<string>`, the published CODE GEARS carry no framework-owned Boss-question result, and a playbook compiled by slc 0.16.4 or later validates the options the Captain hands it; recompile a playbook slc 0.16.1 built whose options are required. Skills reach agents from the spec packages your environments install: a `skills` list in your configuration, which Playbook's own launcher now accepts, is refused with its entry named.
+- Skills and specs your environments install reach every agent Spex drives ([DR-124](specs/decisions/124-skills-reach-every-agent.md)): beside Claude Code's `.claude/skills`, each working folder's `.agents/skills` holds them for Codex, Gemini CLI, Kimi Code and OpenCode, kept out of Git like the other, and your own group's go to `~/.agents/skills` where one of those agents is installed. A playbook's generated skill stays in Claude Code's folders. A re-export leaves an unchanged skill as it stands and swaps a changed one in whole, and generated and aliased names are written as YAML strings.
+- A working folder paired with a project whose environment is already installed gets its skills, specs and playbooks at once, not at the next start, sync or environment command. The Playbooks surface lists what the last export left out under "Not exported": a skill kept out of an agent folder that already holds a folder of yours by that name, named with that folder, and a spec package whose files are not on this device; "Export again" exports once you have moved your folder or brought the files.
+- Your own group's environment requests a spec package by a path in its clone ([DR-125](specs/decisions/125-your-own-groups-path-sources-live-in-its-clone.md)): keep an unpublished skill, spec or playbook of your own in a folder of your own group's spex repository, request it by that path, and edit it in place; the sync carries the folder, as one unit, to every device, where it exports to your agents. A path under Spex's own folders, however it is cased, one the sync rules drop, one reached through a link, and a folder in or holding a Git repository of its own, or holding a link or a file the sync would drop or refuse to share, are refused before anything is written, and again at each resolution and install, so a file added later fails the next install on the device holding it, the last exports standing; a release holding a `uv.lock`, `Cargo.lock` or `*.tmp`, which the sync rules drop anywhere, cannot live there. Explore reads such a folder as a spec package. "Add from folder" on your own group's side asks for a folder inside its clone, and `environment.get` names that folder as `pathRoot`. A request your own group made by a path in a paired working folder reads as missing until its folder moves into the clone. A project's and another group's paths stay relative to the working folder.
+
+### Removed
+
+- The core no longer keeps `local/endpoint.json` in the home, and its
+  hello names the protocol version alone, without the attached CLI's
+  marker ([DR-165](specs/decisions/165-one-package-manager-hosted-by-the-cli-and-the-app.md)).
+  The `spex` CLI 5.0 needs no running app; the attached commands of CLI
+  4.1 and 4.2 no longer connect to this app.
 
 ### Fixed
 
-- `spex scaffold --update` no longer fails with
-  "framework files tracked in HEAD" when upgrading a repository
-  whose `specs/` tree predates the current framework set. Missing
-  framework files are now written from the bundled template,
-  including any missing parent directories.
+- Sync downloads incoming LFS content during authenticated, stoppable Check.
+  Apply and local merge selection write the validated filtered bytes and refuse
+  missing or corrupt cached content before changing files. Brokered Git
+  credentials are confined to the permitted origin, including LFS requests.
 
-## [0.2.0] - 2026-05-08
+- Space Refresh keeps completed work through repeated rate limits within
+  a fixed two-minute recovery deadline for each eligible read, and stays
+  busy until started requests settle. Full views leave member counts
+  unknown without enumerating members; selected checks and Members still
+  read them when needed.
+
+- A narrow player pane no longer spills its header and transcript past
+  its border: a long agent reading such as `claude-opus-5-5 @ xhigh` ends
+  in an ellipsis, its whole in the tooltip.
+
+- Publishing previews now show the destination registry before confirmation,
+  for both local packages and authored playbooks.
+- Preserve the actual Git failure and affected ref alongside bounded advice in Space errors.
+
+- Space status reads keep completed checks, incoming files and comparison
+  plans consistent. An older read cannot overwrite newer results, and
+  branch counts use the same captured commits as their comparison.
+
+- Expired team-server leases now invalidate their bearer and close relays
+  before stopping the seat, including renewal retries and retirement.
+
+- Reopening a removed Academy example preserves its committed and
+  uncommitted edits and Git history; unrelated nonempty folders still
+  refuse example seeding ([DR-140](specs/decisions/140-reopen-the-removed-academy-example.md)).
+
+- A background session read finishing after its project clone moves no
+  longer hides the valid session from Sync or restores its old project
+  or ownership state. Delayed observations are discarded without
+  changing the preserved session files.
+- Require Playbook 17.11.1 for classified entry when a finished workflow
+  starts again, preserving the Boss text and clearing prior run exchanges
+  only after a valid new entry ([DR-131](specs/decisions/131-playbook-17-11-1-adoption.md)).
+
+- Compiling or repackaging a playbook now accepts required runtime
+  options without defaults. Packaging preserves the entry's validator;
+  validation of configured options is unchanged.
+
+- A package installation stays successful after the new files are committed
+  even if obsolete files cannot be removed. The new package remains installed
+  and its exports proceed; failures before that commit still restore the old
+  files and preserve the original error.
+
+- A delayed session-list reply no longer replaces newer settled or removed
+  session announcements, leaving the composer blocked as if work were still
+  running. Replies from an older connection or read are discarded while
+  project tabs and unchanged view identity are preserved.
+
+- Sync refuses linked or non-directory destination parents before reading or
+  changing their files. A late refusal retains already-written records and
+  existing repair evidence, deferring unsafe refresh until the reported path
+  is restored and Retry completes the selection.
+
+- Storage validation checks parent and leaf kinds at the actual read
+  boundaries, including after awaited work, instead of following unsafe paths.
+  Diagnostics name the offending path to repair; optional missing files and
+  ordinary malformed-file diagnostics keep their existing behavior.
+
+- Stopping the core closes session admission immediately and waits for
+  already-admitted opens before disposing runtimes and storage. New and
+  resumed turns cannot cross the shutdown fence. Active turns are aborted
+  immediately; surviving agent processes receive SIGTERM when those turns
+  settle or after ten seconds, then SIGKILL five seconds later. Server
+  shutdown is bounded too; unconfirmed cleanup remains reported with its
+  ownership evidence.
+
+- A push rejected specifically for content size keeps saved commits and
+  existing access, and reports instance-only guidance with the reported
+  limit when unambiguous. Explicit access denials retain priority. This
+  correction does not raise the storage limit.
+
+- A path source in your own group's clone reports the unreadable path
+  and stops when a nonignored subtree cannot be inspected. Git-ignored
+  subtrees and genuinely missing folders retain their existing behavior.
+
+- Space keeps Refresh busy through account setup and the complete read,
+  then shows its outcome with a sanitized failure and Retry where needed.
+  After signing out and back in, a new refresh waits for the older work
+  and reads the current account; an older completion cannot clear it.
+
+- Package-source labels, tooltips and generated environment reports use
+  the instance's name for its repositories, keeping internal storage
+  addresses out of the interface while preserving installation inputs.
+
+- A project's config reading and edits now reject invalid custom playbook
+  options before starting a session, naming the playbook and its validator's
+  reason. Validation uses the paired folder for injected working directories
+  and preserves explicitly configured options and working directories.
+
+- Synchronizing one records repository no longer waits for unrelated
+  repository details. Each check reads the complete namespace catalog and
+  only its destination's details, retaining collision, access, account-change
+  and first-sharing notice safeguards.
+
+- Joining private code at the instance's reported Git origin now uses
+  the app's brokered credential helper, as records do. Code at another
+  origin continues to use the device's own credentials.
+  On a seat, Git pushes from an agent's working folder use the member's
+  saved token for that code host, without putting it in a remote or log.
+- Code addresses hosted by the instance no longer expose its backing
+  host in Space, project status or cached forge guidance. After a restart,
+  a remote reads neutrally until the instance's description arrives; its
+  actual transport URL stays stored for Git.
+- A session whose current folder or stored-member configuration prevents
+  continuation shows the reason beside its history and offers a new
+  session before a message is attempted. Listings follow configuration
+  and folder changes without opening a runtime or changing the session.
+- A creation keeps owing its default branch through a read-only check: a
+  spex repository the core created, found archived or below the pushing
+  role while still empty, keeps its recorded creation, so a later sync
+  pushes `main`, then `spex`, once it can be written again.
+- A session lists failed only while its failure stands: a later turn
+  that settles clean clears an earlier turn's failure, while a parked
+  failure stands until its run leaves that state.
+- "Show earlier entries", in a player pane or the authoring draft,
+  reveals entries above the reader without raising the Latest pill, and
+  a player's text or tool event no longer raises one in a Captain pane
+  whose own content did not change.
+- The seven built-in playbooks' intents read in the reader's language,
+  on the quick-start card, the slash menu and Playbooks, translated in
+  the Chinese catalog.
+- A host's rate limit is its own cause, no longer a network failure: a sync stops "⟨host⟩ asks to wait N seconds" (or "a moment") with "Retry waits, then runs the step."; a sync's calls and the host read wait out the time asked, 120 s at most, a Stop ending the wait, and any other act meanwhile is refused at once with the seconds that remain.
+- The authoring agent learns before its first compile that a prompt's
+  text stands where its instruction stands, in the source's order: text
+  two instructions need, such as a checklist, is written out at both,
+  not stated once and referred to — which slc refuses as "authored
+  prompt fragments are out of Source order".
+- An authoring session's row on the Playbooks surface is titled by its
+  source's first `#` heading, so a source with a license comment above
+  that heading no longer reads as the comment; a source with no heading
+  still reads as its first line.
+- New playbook's Org starts from an org you may publish to, not from the
+  first segment of the project's spex repository key, which for a
+  project under a nested group is no registry org: signed in, Spex asks
+  the selected registry for your orgs and suggests the one whose path holds
+  the project's group, else the first. Every eligible namespace remains
+  selectable, independently of the project's Space; with none listed,
+  signed out, or no answer within two seconds, the key's first segment
+  stands as before.
+  A one-shot compile names the same org.
+- An answer continues its intent ([DR-119](specs/decisions/119-an-answer-continues-its-intent.md)).
+  A Dashboard row for a conversation serving no intent no longer reads
+  the Boss's answer to a run's question — "Yes." for a `/release` — but
+  the turn that opened the work, with the answers folded under it; a
+  turn sent once no question stands still titles the rows after it. A
+  queued intent sent while a run waits on the Boss's question is refused
+  with "this conversation is waiting for your reply; answer it first",
+  so queued text never answers by accident and stays queued.
+- A project's Now band, for a conversation serving no intent, reads the turn that opened the work it is doing, as the Dashboard's rows do ([DR-119](specs/decisions/119-an-answer-continues-its-intent.md)), not the Boss's answer to the run's question; a session's summary carries that text as the optional `workTitle`.
+- The Dashboard's Running band titles a session with the turn that opened the work it is doing, the summary's `workTitle` the Now band reads, no longer its first Boss turn, so the two bands agree in a conversation that has done several pieces of work (dashboard-50).
+- A project's History band, empty while the project holds a finished conversation serving no intent, reads "Nothing done here yet · finished conversations are in the sidebar; work queued as an intent lands here", so work sent as chat turns no longer reads as nothing done (dashboard-8).
+- A finished session's last activity is the latest time its own records carry, no longer the time the runtime's release last rewrote its manifest, which could be an hour after its last turn or even before that turn started, so the sidebar's order and a project's current conversation follow when work was done (core-service-32).
+- A spex repository the core created whose first sync stopped before the default branch was found or pushed — the host not answering, the push refused, the core stopping — keeps the creation recorded, so a Retry owes the branch still and pushes it, no longer waiting forever for a README the host never writes (git-host-7).
+- An installed playbook folder gone by the time its engine links are provisioned — its clone moved by a sync meanwhile — takes no link and is not made again, so a sync's move leaves nothing of the old place behind (playbook-library-46).
+- The new-playbook form's Org and License keep what the person typed: a project default arriving after the typing, or read again on a reconnect, fills only a field the person has not edited since the project was chosen (playbook-library-51).
+- A run view status line that is only a machine's name reads as its words — `START_PROPOSE` as "start propose", `→ needsBossReply` as "→ needs boss reply" — with the name as written in its tooltip, so the room no longer reads the machine shouting (run-view-1).
+- A spex repository Spex creates on the host — by picking a group, say —
+  no longer stops its first sync at Check with "<host> holds no default
+  branch for it yet": the host answers a creation before the commit that
+  makes its default branch lands, so that first sync reads the new
+  repository again every 2 s, five times at most, before stopping, and a
+  later sync, a Retry among them, reads it again while the clone still
+  records the creation (git-host-7).
+- A spex repository Spex creates on the host for a person whose role
+  there is Developer no longer stops its first sync at Check for good:
+  GitLab's protected default branch refuses the README it would write,
+  leaving the repository empty, so once those re-reads still find it
+  empty, that first sync pushes `main` itself — one commit of the README
+  titled with the repository's name — and goes on to push `spex` beside
+  it. Where the host refuses that push too, the sync stops with the
+  host's words (git-host-7).
+- A spex repository Spex creates on the host keeps those re-reads and
+  that push of `main` across a restart of Spex: the creation is now
+  recorded in the clone's Git configuration (`spex.created`) instead of
+  in the running core alone, so quitting Spex — or a crash — before that
+  first sync is done with the default branch no longer leaves it stopped
+  for good with "<host> holds no default branch for it yet"; the next
+  sync finishes it (git-host-7).
+- A playbook's exported skill no longer takes over the players Spex
+  launches in the same working folder: its description says it starts
+  the playbook through Spex and is not for an agent already playing a
+  role in a playbook, and its last sentence sends such a player back to
+  the step it was given.
+- A spex block the authoring agent writes that Spex cannot read — a
+  register block whose unquoted intent holds `: `, say — no longer waits
+  for the Boss's next message: the agent is asked at once to write it
+  again, told the block and why it did not read, bounded as a failed
+  compile's relay is (three in a row stop it until the Boss speaks), and
+  the thread says so. The block's caption under the code reads why, not
+  only in a tooltip.
+- Create says why a project's first commit failed in the app's own words:
+  that Git could not make the first commit, naming commit signing with no
+  key configured, a signing program that failed, or a missing Git name and
+  email, with Git's own output kept beneath and the guidance to finish the
+  commit in a terminal, then Add.
+- Playbook authoring turns no longer fail Cligent's validation of an absolute
+  writable-path grant, including chat, compile-failure repair and registration
+  proposals ([DR-112](specs/decisions/112-authoring-permissions-use-the-package-working-directory.md)).
+- Register derives valid, distinct default new player lanes for Chinese and
+  digit-leading roles and colliding role names, preserving explicit sharing
+  choices and existing roster players.
+- Short Captain columns keep their headers and input controls from collapsing,
+  scrolling excess notices inside the column while the draft retains one row.
+
+- New conversation content reliably shows Latest for readers scrolled up,
+  regardless of scroll and resize event ordering.
+- Long drafts yield to the Captain column’s available height so Send stays
+  reachable above stacked player panes while the text scrolls inside its field.
+- Open agent editors stay within their pane when its player grid scrolls,
+  including scrolling caused by keyboard focus.
+
+- Dropping a busy intent hands its temporary outcome's focus to the composer
+  when input becomes ready, preserving any control the reader chose meanwhile.
+- Restore revalidates a cached external session holder against the shared lease
+  before refusing admission. Discard success and refusal publish released
+  ownership before another recovery, preserving the original refusal and
+  leaving foreign replay delivery intact.
+- Turn settlement keeps focus on a player lane control or open agent editor
+  the reader chose while work ran; ordinary ready input still receives focus.
+- Captain conversations keep following when live machine content mounts or
+  changes before a queued scroll event. Readers who scroll up stay detached
+  through later records and sidebar reflow until they choose Latest.
+- Browser setup failures keep Retry reachable beside a compact summary, with
+  the complete diagnostic in expandable details without terminal formatting.
+  Native acceptance stops on a reported setup failure or cancellation instead
+  of waiting out the full readiness deadline.
+- Late question, turn, and submission updates preserve the control the reader
+  selected instead of moving focus back to the conversation composer.
+- Settings and configuration loading reject invalid writable paths before a
+  session starts, naming the offending entry. Valid paths reach the runtime in
+  canonical form without rewriting their spelling in the shared YAML file.
+- Packaged CODE and DECIDE cards name their missing REVIEW prerequisite
+  before work starts, without invalidating the shared config or enabling players.
+- File registry compatibility errors describe the missing current host contract
+  and source-compilation remedy without claiming a freshly generated artifact
+  came from an older toolchain.
+- The Captain thread follows a final reply when that reply and turn settlement
+  arrive together; readers who scrolled up keep their position and get the
+  jump-to-latest control.
+
+- Conversation panes keep following when live cards or delayed media grow.
+  Queued automatic scroll events no longer detach the thread, while scrolling
+  upward still preserves the reader's position through later content changes.
+- First-use browser setup permits a fifteen-minute download and launch budget,
+  with progress and cancellation, instead of ending after three minutes on a
+  slow connection. Setup still requires a separate choice to enable Browser.
+- Historical failure cards keep the workflow and step recorded at that failure,
+  even after later workflows succeed. Current recovery guidance appears only
+  on cards for the current failure park.
+- Spec readers and editor previews hide HTML source comments, keeping SPDX
+  headers and translation hashes out of the reading flow. Code examples and
+  the editable source retain their exact content.
+- Creating a project now scaffolds specs in the creating page's language,
+  including a Chinese browser connected to an English host ([DR-100](specs/decisions/100-new-project-specs-follow-the-readers-language.md)).
+- Project creation requires a successful initial Git commit, including an
+  empty baseline without scaffolding. Staging or commit failures retain
+  files and report the refusal. Existing repositories are preserved and
+  directed to Add ([DR-099](specs/decisions/099-project-creation-preserves-existing-repositories.md)).
+- The Chinese catalogs' terms, after a native-speaker audit: setting a
+  space up reads 初始化 on every surface and in the core's refusals,
+  keeping 设置 for Settings; a model's provider reads 服务商 everywhere;
+  the library reads 规程库; a playbook's source reads 源文; the roles
+  a player answers read Player; and some thirty other phrases in the
+  interface, the core and the desktop notifications read as a native
+  speaker would say them.
+- `npm start` on a Mac whose PATH leads with a GNU `libtool` (Homebrew's
+  `libtool` formula): the native rebuild of `better-sqlite3` now links
+  with the Apple `libtool` that `xcrun` names instead of failing on
+  `-static`.
+- Compiling on a machine without the agent SDKs beside a global or `npx`
+  `slc` failed at the first agent call with a missing-package error;
+  the shipped compiler resolves the app's SDKs.
+- A running core no longer leaves a temporary directory behind, or grows
+  its memory, each time it shows a playbook's machine or opens a session.
+- An authored playbook's compile failed at the machine phase: no
+  `xstate` resolved from the library directory, so the compiler's type
+  check refused the generated machine. The playbook engine is now
+  linked into that directory before the compiler runs.
+- The Register tab could offer a new player whose id the roster already
+  held, and registering overwrote that player; it now selects the
+  existing lane as it stands and mints only a free id.
+- An agent's registration proposal spelled a role in another case than
+  the compiled one ("Coder" for `coder`) and never applied; proposals
+  now match roles case-insensitively.
+- A roster player bound to no role was missing from Settings and from a
+  draft's agent picker.
+- The Specs tab's empty state told you to run `npx @sublang/spex`, which
+  only prints usage; it now offers `npx @sublang/spex scaffold`.
+- A turn that finished where this app was not watching — on another
+  device, synced through Space, or in the `playbook` CLI — asked for
+  review on the Dashboard forever, since opening the session never
+  marked it viewed. A conversation on screen now marks its finished
+  turns viewed, on every device sharing the home ([DR-066](specs/decisions/066-every-summons-has-a-door.md)).
+- A failed session serving no intent stopped asking for you at your next
+  message even while its run stayed parked in its failure state; like an
+  intent's failure, it now asks until the run leaves that state.
+- A delivery card in a conversation this device cannot continue disabled
+  Confirm and Drop although the Dashboard took the same verdict; the
+  card now takes it.
+- A mouse wheel over the Dashboard's side margins now scrolls it; only
+  the centered column did.
+- Filtering the Dashboard to a project with nothing waiting showed the
+  all-clear while another project still needed you; it now reads
+  "Nothing in ⟨project⟩ needs attention."
+- Removing the project the Dashboard was filtered to left the Dashboard
+  blank; the filter falls back to All projects.
+- An agent whose SDK's native binary npm dropped — an optional platform
+  package such as `@anthropic-ai/claude-agent-sdk-darwin-arm64` — read
+  ready and failed at its first run. Readiness now reads it not ready,
+  naming the package and the repair: `npm ci` in the checkout, or
+  reinstall the app. Requires Cligent 0.27.1 or later.
+- A player's fast mode never reached the roles bound to it: a role that
+  set none of its own ran at the provider's default, while the
+  `playbook` CLI ran it at the player's. Such a role now takes its
+  player's fast mode, as the CLI does ([DR-032](specs/decisions/032-session-players.md),
+  core-service-16).
+- An item's Edit put the caret on the item's heading but scrolled the
+  editor by logical lines, so in a file whose long lines wrap the
+  heading landed below the visible box — `run-view.md` opened on
+  run-view-147 for run-view-4. The landing now measures the heading's
+  rendered position, wraps counted (spec-view-48).
+- A project's Sources summary read "just now" whenever a client first
+  saw the lists, however old the core's cache was, and a group kept on
+  screen never asked again — a freshly connected page showed a
+  35-minute-old issue list as current. The lists now carry their fetch
+  moment, the summary shows that age, and a group on screen asks again
+  once the lists pass the ten-minute window (dashboard-14,
+  dashboard-20).
+- A surface shortcut — ⌘1, ⌘3, ⌘4, ⌘5 or ⌘, (Ctrl on other hosts) —
+  left keyboard focus on the page body, and so did ⌘B. Focus now lands
+  inside the surface the shortcut opened, on its composer where it has
+  one, and ⌘B lands on the sidebar's own collapse control, so the next
+  Tab continues from where the reader went. An open project palette keeps
+  focus until it closes, then lands it in the chosen surface
+  (run-view-42, run-view-50, run-view-71).
+- At a phone's width the Settings keyboard-shortcut sheet scrolled
+  sideways with no keyboard stop, which axe reports as serious. The
+  sheet is now a named stop, "Keyboard shortcuts", so the keyboard
+  reaches what a pointer scrolls (run-view-50).
+- A project created from the palette told its coding agents to run
+  `spex lint`, a command the desktop install puts on no PATH, so a
+  coder's lint check failed with "command not found". The scaffolded
+  instruction now runs the linter through `npx @sublang/spex lint`.
+- A project created from the palette pinned no copyright holder of its
+  own: every scaffolded file carried SubLang's upstream SPDX line, so
+  an agent adding the project's first spec copied it. The scaffold now
+  writes `licensing-9` into the project's `specs/packages/licensing.md`
+  with the project's own header — the creator's `git config user.name`
+  and email as the holder, the current year, and `Apache-2.0` for the
+  LICENSE it emits — while the template files keep their upstream
+  lines. With no git identity it leaves a `<holder>` placeholder and
+  says so, never SubLang's name (projects-3, scaffold-58). The palette
+  runs the app's own CLI, so a project created from it carries the
+  holder at once.
+- A machine that once ran the SQLite-era app imported its former store
+  into every new Spex home — a second home, the smoke's scratch home, a
+  reinstall into a fresh one — since the import's only record was the
+  home's own. A store a home has imported is now marked beside itself
+  (`spex.db.imported`, `server.db.imported`), no later home reads a
+  marked store, and a home that took the store before this fix marks it
+  at its next start (core-service-64).
+- A project registered from a fresh clone listed every finished intent
+  record in History as "just now", in no order: the records' status
+  lines carry no date, and a clone sets every file's last change to one
+  moment. An undated record now dates by the last commit touching its
+  file, and by the file's last change only where Git tracks none
+  (dashboard-27, spec-view-14).
+- Space's Join card never came back on a home that had synced once:
+  changing the remote cleared the last check, but the card was gated on
+  the last sync, so joining another occupied space meant syncing into
+  "Unrelated history" first. The card now stands when the home has neither
+  checked nor synced with that remote; changing the remote clears both,
+  while restarting after a successful sync does not show it again
+  (space-45).
+- Space's Explore tab read an empty `sessions/` or `intents/` as "Stays
+  here", the mark reserved for the families that never sync; a tracked
+  kind with nothing committed yet now reads "Not yet shared" (space-23).
+- Creating a project from the palette scaffolds with the app's own
+  CLI — the checkout's `packages/cli` on the app's own Node — instead
+  of fetching `@sublang/spex` from the npm registry through `npx`, so
+  Create works offline, pays no download and generates exactly what the
+  app ships ([DR-096](specs/decisions/096-the-app-supplies-the-scaffold.md)).
+  Only a checkout without a built CLI still runs the registry's, and a
+  failed scaffold names the command that ran.
+- A project whose `origin` remote is not on GitHub, such as one at
+  `gitlab.com`, was told in its Overview and on the Dashboard that it had
+  no GitHub origin remote and should add one. Its guidance now says issues
+  and PRs come from GitHub and names the host its origin is at, never a
+  credential the URL carries; a project with no `origin` remote keeps the
+  sentence that asks for one (projects-7).
+- Your own group's spex repository, made at sign-in, and a project picked
+  into "Your own group" were asked of the instance by your own group's
+  id, which an instance looks up only among its own groups, so the
+  creation waited for ever. They now name no group, as the instance
+  expects (git-host-6).
+- One spex repository whose members the instance could not count failed
+  the whole read, so Refresh, set-up and every sync stopped while the
+  instance's own member reads failed. The read now holds that count as
+  unknown and goes on, and a first sync into a repository with an
+  unknown count still says the sharing notice (git-host-5, space-57).
+- Picking a team's spex repository for a project's records, on its row
+  in Space or as the project is added, no longer stops at "Read the
+  sharing notice before joining …" with nothing to read: where the
+  repository has other members, or its count is unknown, the picker says
+  the sharing notice beneath it, and Continue joins (space-57, space-58).
+- An authoring session's Compile control no longer says "30 to 120 minutes" but "a few minutes, longer for many roles", as compiles now take.
+- "Pick a group" reads each group by its name, then its path (space-58).
+- The group pickers read each group by its name, then its path (space-58, space-78).
+- An expanded package's intent in the Specs outline renders its links as an item body does, a record's ID opening the reader, and the collapsed line reads each link by its text, no longer printing `[DR-001](…)` as typed (spec-view-2).
+- The authoring preamble says that the runtime relays every Boss exchange — the question as asked and the answer verbatim — to every later role of the run, so a source need not say that a reviewer receives an answer, and names a later role as receiving it only where that role's step must carry the answer in its own data (playbook-library-35).
+- While the answer to a run's question runs, the session list and its state reports no longer read the session as interrupted — no `recovery`, no "Restore the interrupted turn first" — nor as still parked on the question, which leaves once the answer is accepted; Restore stands only for a turn cut off with none running (core-service-32).
+- A compiled playbook runs on the app's own playbook engine, no longer on the engine it was compiled with: its registry module imports `@sublang/playbook` and `xstate` through its folder's engine links instead of carrying a copy, and an install — or the start that finds a lock installed — bundles again from its shipped `<id>.registry.ts` a module an earlier Spex packaged with the engine inside, so a playbook published before a Playbook fix gets that fix without being recompiled; a module whose wrapper is missing is kept and named in the log, and a path source's playbooks gain the engine links too (playbook-library-14, playbook-library-46).
+
+### Security
+
+- A remote URL carrying a bare token before the host, such as
+  `https://<token>@github.com/…`, was accepted, written to the home's
+  Git configuration and printed in Space's failure reports. Anything
+  before the host of an `http(s)` remote is now refused, and a printed
+  remote drops an `http(s)` user ([DR-064](specs/decisions/064-honest-remote-failure.md)).
+
+## [0.8.0] - 2026-09-14
 
 ### Added
 
-- `spex scaffold --update` mode to refresh framework templates and
-  pristine seeds in place, with state-matrix coverage and indicator
-  output (SCAF-11, SCAF-12)
-- Automatic migration of legacy `specs/items/{user,dev,test}/`
-  layouts to the flat `specs/{user,dev,test}/` layout on `--update`
-- Bundled file-history manifest (SCAF-21) used to distinguish
-  customized seeds from pristine ones during `--update`
-- Copy-paste-ready LLM merge prompt printed by `--update`,
-  fenced for unambiguous selection
-- Spec rules META-21 (test scope), META-23/24/25 (DR/IR drafting
-  style), and META-26 (observable-outcome behaviors)
+- A control for a failed workflow: while a playbook run stands parked in
+  its recoverable failure state, the session shows a notice between the
+  Captain pane and the composer naming the workflow by its command, with
+  two controls that say in words what each does. Retry runs the recovery
+  the run itself advertises. Drop ends the run — it asks to confirm in
+  place, and it spends no model call, so the way out still works when a
+  failing provider is what broke the run. A dropped run is not
+  resumable; run the command again to take the work back.
+- Where the dropped session serves an open intent, Drop takes the
+  ledger's Drop verdict in the same gesture — one ruling, not two.
 
 ### Changed
 
-- Project specs flattened from `specs/items/{user,dev,test}/` to
-  `specs/{user,dev,test}/`; DR-000 and meta.md restructured to match,
-  with citation block renumbered (META-15..META-19 → META-16..META-20)
-- `--update` reports `unchanged` for refreshes whose post-run
-  content equals the pre-run content, instead of `(updated)`
-- Customized seed files are kept on `--update` and reported as
-  `(kept — user-modified)`
-- Trailing hints around the merge prompt reframed as suggestions
-  rather than commands
+- Retry selects the run's own advertised recovery through the runtime
+  instead of sending fixed prose as a Boss turn, and where a run
+  advertises no recovery Retry is absent rather than offered and
+  refused.
+- A failure that parked a run keeps asking for attention — on the
+  Dashboard, in the sidebar and on the tab — until that run leaves its
+  failure state. A later unrelated message no longer stands the summons
+  down while the run is still stuck. A failure that parked no run keeps
+  the rule it had: moving on acknowledges it.
+- The app requires Playbook 13.3 or later.
 
 ### Fixed
 
-- Canonical hashing for the file-history manifest normalizes
-  CRLF/CR line endings so cross-platform refreshes match
-- `.gitkeep` normalized to 0 bytes for stable hashing
-- File-history manifest scoped to published states only
+- A machine drawing wide enough to scroll sideways can be scrolled from
+  the keyboard.
 
-## [0.1.1] - 2026-04-05
-
-### Changed
-
-- Package description and npm keywords for better discoverability
-- README rewritten with workflow overview, usage example, and contributing section
-- RELEASE spec expanded with README requirement (RELEASE-14)
-
-## [0.1.0] - 2026-04-05
+## [0.7.0] - 2026-09-12
 
 ### Added
 
-- `spex scaffold [<path>]` subcommand to create specs directory structure
-- Target resolution: explicit path, git repo root, or cwd fallback
-- Recursive template copying from bundled `scaffold/specs/`
-- Agent spec instructions in `CLAUDE.md` and `AGENTS.md` with section replacement
-- Idempotent reruns with `(already exists)` / `(skipped)` indicators
-- CRLF support in agent file section detection
-- CI workflow for ubuntu, macos, windows with Node 20 and 22
-- Integration tests exercising the CLI binary end-to-end
-- RELEASE spec package with package hygiene and pre-release checks
+- Issue delivery through `/dev`: the Dashboard's issue seed is
+  `/dev Address #N: <title>` with the issue's URL and no delivery prose,
+  and Playbook 13.2's `dev` composes the `branch` and `pr` built-ins to
+  carry the work to a merged pull request with the default branch checked
+  out again — nothing is merged by hand.
+- The `branch` and `pr` built-ins join the playbook catalog, seeded with
+  their `coder` role bound to `dev.coder`.
+- While `dev` is configured without `branch` or `pr`, its Library card
+  names the built-ins to enable for pull-request delivery; a plain `/dev`
+  keeps working.
+- The Space surface: the Spex home at a glance, Initialize and Join a
+  space, the remote, local and incoming changes by unit in human words,
+  a core-driven sync on one shared branch with a per-unit conflict
+  picker, a "Stays on this device" panel, and a read-only annotated
+  explorer with previews.
+- The desktop bridge reveals a state-root path in the OS file manager;
+  the served page offers Copy path instead.
+- Chat-assisted playbook authoring: "New playbook" takes an id and opens a
+  two-pane draft workspace on the Playbooks surface — a conversation with
+  an authoring agent on the left, and Source, Gears, Machine, and Register
+  tabs with the compile watched in a band on the right. The agent writes
+  `<id>.md` in the draft directory on the Captain's block or a chosen
+  roster player, asks for compiles and proposes the registration through
+  fenced `spex` blocks, and receives a failed phase's output
+  automatically, bounded to three failures in a row. Registration writes
+  nothing until Register is pressed; drafts persist under `local/drafts/`
+  and list between the configured playbooks and the built-ins.
+- Protocol version 11: the `space.*` and `draft.*` command families, the
+  `draft` channel, and the `space.state`, `draft.record`, `draft.state`,
+  `draft.source`, and `draft.removed` messages.
 
-[Unreleased]: https://github.com/sublang-ai/spex/compare/v0.2.3...HEAD
-[0.2.3]: https://github.com/sublang-ai/spex/compare/v0.2.2...v0.2.3
-[0.2.2]: https://github.com/sublang-ai/spex/compare/v0.2.1...v0.2.2
-[0.2.1]: https://github.com/sublang-ai/spex/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/sublang-ai/spex/compare/v0.1.1...v0.2.0
-[0.1.1]: https://github.com/sublang-ai/spex/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/sublang-ai/spex/releases/tag/v0.1.0
+### Changed
+
+- Spex requires `@sublang/playbook` 13.2 or later.
+- The sidebar's "Workspace" entry and section read "Projects".
+- Cmd/Ctrl+1 through 5 switch surfaces: Dashboard, Projects, Playbooks,
+  Space, Settings.
+- The compile form is retired: pasting or picking a source is the Source
+  tab's paste mode, the registry form is the Register tab with a player per
+  derived role, and the slc example's prefill opens a draft in paste mode.
+
+## [0.6.1] - 2026-09-09
+
+### Fixed
+
+- Require supported Playbook trace evidence before advancing the intent queue.
+- Keep Running and interrupted attention consistent for sessions whose
+  transcripts have not loaded or are stale. A new Boss turn clears the
+  previous question even when it starts another intent.
+- Keep the Now band's state label and activity mark current before its
+  session transcript loads or catches up.
+
+## [0.6.0] - 2026-09-09
+
+### Added
+
+- Runtime model selection in Settings and role bindings, with model-specific
+  effort and fast-mode options, canonical IDs recognized through aliases,
+  explicit custom pins, and refresh. Adapter efforts supplement model lists
+  only where Cligent's discovery interface cannot report them.
+- Every message in the Captain thread — yours, the Captain's, and a
+  player's question — carries its clock time at the bubble's outer
+  foot, quiet and tabular, with the exact date and time on hover; the
+  thread's time separators speak the same clock.
+
+### Changed
+
+- Successful playbook completion starts the next unblocked intent in the
+  project's queue while keeping the finished intent's Confirm reminder.
+  Questions, failures, and replies without explicit completion pause the
+  queue; explicit after-links still wait for a human verdict.
+- New issue intents request work on a new branch, relevant checks, and a PR
+  whose description closes the issue when the Boss merges it.
+- Require Cligent 0.26 and Playbook 13.1 from the public registry.
+  Clarification replies identify the player as the questioner, avoid
+  repeating its question on resume, and retain task context for a fresh
+  provider session.
+- Refresh the app's SDK runtimes to Claude Code 2.1.263 and Codex 0.153.4.
+- **Nothing ends.** The runtime is held only for a turn: a session's
+  agents and its Playbook lease are released when a turn settles and
+  taken up again by the next message, so there is no End control, no
+  "ended" state, and the terminal can continue any Spex conversation
+  between turns. A session reads working, waiting on you, idle, or
+  history the core cannot continue; the sidebar orders sessions by
+  last activity; the Now band and Start on an intent follow the
+  project's current conversation.
+- **Settings apply on the next message.** Every message opens the
+  runtime on the settings the file holds, projected onto the session's
+  own playbooks and players — enabling another playbook no longer
+  invalidates a conversation. Model, effort, and fast-mode changes apply
+  on the next call; a structural change (adapter, permissions, roster,
+  bindings) is refused naming the fields that changed and offering a new
+  session.
+- A message to a project whose other session is mid-turn is refused
+  naming that session; delete, rebind, and remove wait only on a turn in
+  flight.
+- Settings presents the Captain as a row of the players' shape: its
+  chip opens the shared agent editor with Save and Cancel, one row's
+  editor open at a time.
+
+### Fixed
+
+- Prevent a checkpoint error when a message arrives during turn cleanup.
+- Keep agent and binding popovers inside the window as their options load
+  or change.
+- Preserve role tuning and comments when editing bindings, including an
+  explicit fast-mode Off override.
+- A player's failure shows once per call: an adapter that says the
+  same failure as prose, as repeated error events, and again in its
+  result now yields one failure line with a count, and a result line
+  that reads "failed" with the words in its tooltip.
+- Removing an Up next intent with the pointer no longer leaves the Undo
+  line standing until the next click: only a keyboard removal hands
+  focus to Undo, so the line lapses on schedule.
+
+## [0.5.0] - 2026-09-06
+
+### Added
+
+- Desktop and Playbook 13 CLI share session history, continuation,
+  recovery and deletion through one storage format. History preserves
+  Captain and player records, saved settings and recorded graphs.
+- Interrupted sessions offer **Retry** for the saved input and **Discard**
+  to restore the preceding checkpoint when effect evidence allows it.
+  Drafts and queued messages remain available while recovery is pending.
+- A Git workflow selects complete sessions or individual app files from
+  either branch, validates the result, and restores existing project IDs
+  with local path bindings. See the [storage catalog](https://github.com/sublang-ai/spex/blob/app-v0.5.0/docs/storage.md)
+  and [Git commands](https://github.com/sublang-ai/spex/blob/app-v0.5.0/docs/storage-git.md).
+
+### Changed
+
+- Desktop, server and CLI default to `~/.spex`; `SPEX_HOME` and explicit
+  config/session paths remain supported. Migration replaces desktop
+  sidecars and imports the former default CLI store, removing validated
+  source files after retaining their originals in local migration receipts.
+  Stop old writers and snapshot both `~/.spex` and the former
+  `$XDG_STATE_HOME/playbook` or `~/.local/state/playbook` before upgrading.
+  Do not reopen converted data with older versions; unsupported legacy
+  checkpoints remain readable history.
+- Provider hints stay local; managed Library paths use relative locations
+  and retain sources for rebuilding on another device.
+- The core requires Playbook 13 and Cligent 0.25. Definite provider session
+  rejection permits one fresh attempt; ambiguous failures retain recovery
+  evidence instead of retrying automatically.
+- Git synchronization requires an explicit whole-session choice when both
+  branches changed it. Run a session on one device at a time. Schema 7 does not
+  relocate repository or module paths: different paths permit history only.
+- Failed runtime cleanup keeps the session's lease and project reservation
+  until cleanup or owner shutdown is proven.
+- Desktop and server hosts require macOS or Linux with private POSIX
+  storage. Windows supports the scaffold CLI and browser client.
+- Player usage displays tokens only. Provider-reported costs remain in
+  stored records, without monetary figures in the interface.
+
+### Fixed
+
+- CLI history refresh stays responsive during continuous writes. Replaced
+  history reloads without duplicate folds or stale viewed markers; queued
+  sends wait for durable settlement and survive refused submissions.
+- Desktop waits for active CLI writers before offering session recovery
+  or management, and refreshes when their leases are released.
+- The spec graph fills its pane and remains readable at short heights
+  instead of collapsing packages onto one point.
+
+## [0.4.0] - 2026-09-02
+
+### Added
+
+- **Player lanes fold.** Each pane's header carries a collapse control;
+  a folded lane stands as a narrow rail with its name, running mark,
+  and an expand control, the remaining panes take the freed width,
+  and a folded lane unfolds itself when its call opens.
+- **History in a frame.** The Dashboard's History band lists every
+  loaded row inside a frame eight rows tall that scrolls, with
+  "Older…" at its end fetching the next page, so the groups below
+  never move.
+- **Frames the reader can resize.** The History frame and the
+  Playbooks stage box take the house divider idiom turned horizontal:
+  a bottom grip drags the height within bounds, arrow keys step it,
+  double-click restores the default, and the height is remembered per
+  frame; the grip hides while the content fits.
+- **The pipeline as a row.** Every Playbooks card shows
+  "Source → Gears → State machine" in place of the Pipeline button;
+  each stage toggles its artifact beneath, one at a time, with absent
+  stages struck through and the state list under the State machine.
+- **Sources open by default**, their three tabs in view; the fold is
+  remembered per project while the app runs.
+- **A done intent can be removed from History.** The row's remove
+  control opens the inline confirm; confirming appends a remove act
+  to the intent log, and the intent leaves every band without a
+  trace, on this and any synced copy.
+- **Gears as spec items.** The Playbooks Gears stage renders the
+  compiled GEARS file with the Specs outline's own item rows —
+  chip, group, first line, expandable body, in-artifact citation
+  jumps — and the State machine stage keeps its state list pinned
+  above the scrolling code.
+- **Citations preview at hand.** Every citation in the Specs view —
+  an entry in an item's cites row, a backlink, and a citation inline
+  in a body — shows the cited item's chip, first line, and opening
+  in a card after a short hover intent and at once on keyboard focus,
+  replacing the browser's slow tooltip; the Playbooks Gears rows
+  preview the same way. An item's citations sit in one block and its
+  Edit control moved to the header row.
+- **Running sessions listed again.** A Running band below Needs
+  attention lists every live session with a turn in flight that
+  needs nothing from the Boss — project, title, what it is doing —
+  and reads "Nothing running." while empty; the attention queue stays
+  the summons.
+
+### Changed
+
+- **The page never scrolls.** Every surface scrolls inside its own
+  box, vertically as well as sideways, every scroll box is a
+  positioned box so screen-reader-only text and popovers stay inside
+  it, and the fit journey measures both at 400 and 800 pixels tall on
+  every surface with a resize pass.
+
+### Fixed
+
+- **Back returns to where a record was opened.** A record opened from
+  the Dashboard or a project's Overview reads behind
+  "← Back to Dashboard" / "← Back to Overview", and Back lands on the
+  row that opened it; a record picked in the Specs tree keeps its
+  plain Back.
+- **The working lane comes into view** when its call opens beyond the
+  grid's edge, side by side or stacked.
+- **A parked question stands** until the parked run itself leaves its
+  park or is dismissed; the controller Captain's own state reports no
+  longer clear it from the composer or the Dashboard.
+- **The Sources tab row wraps** before it widens the band on narrow
+  panes.
+- **The sidebar's selection follows the surface**: on the Dashboard,
+  Playbooks, or Settings no project row reads as selected; the lit
+  entry alone says where you are, and Workspace restores the
+  remembered project.
+- **Queued Boss messages stay in their box.** The queue is a bounded
+  frame that scrolls, so the transcript and the composer's field and
+  actions keep their place at any queue length, and an unbroken URL
+  in a queued message wraps instead of widening it.
+- **The Captain agent popover opens where it fits**, below its anchor
+  when there is no room above, with its own scroll in a short window.
+- **The composer and the transcript follow their own pane**: the field
+  refits when the pane resizes without a window resize, a transcript
+  following its end keeps following after a resize, a machine drawing
+  scrolled to its end regains its fade when the pane narrows, and the
+  split divider lands under the pointer.
+- **Anchored editors stay inside their box.** The agent editor and the
+  role-binding popover are placed by one measured rule that keeps
+  them within the pane at every width from the 320px floor and lets
+  them scroll their own content.
+- **Rows and chips yield before they widen**: a labelled issue or
+  pull-request row folds its tags on a narrow pane, a long spec item
+  id truncates in the outline, the outline keeps a readable height
+  beside the graph, the graph's hover card stays inside its pane, and
+  the project palette fits a short window with its message reachable.
+
+## [0.3.0] - 2026-09-02
+
+### Added
+
+- **Records legible from a projector.** The type scale bottoms out at
+  12px: every chip, age, caption, and badge reads at the small step,
+  and the Captain thread's narration lines are left-aligned system
+  lines with their glyph in an icon slot.
+- **Machine cards that fit.** State names read at 13px in boxes as
+  wide as their column's longest label, a nested state goes by its
+  own segment with its parent as caption, unwalked exits into rest
+  states fold to a "+N" marker until walked or hovered, and a drawing
+  scales into a column it barely exceeds and scrolls behind a fade
+  past that; the Captain split defaults to 45% and holds still.
+- **Player panes tell the call.** Headers read "coder · dev.coder",
+  an untouched lane reads "Idle until the playbook calls ⟨lane⟩", a
+  running call ticks "coder working · 2m 13s" in the pane and the
+  thread, tool rows read as commands whichever runner made them, and
+  a finished call shows its span, tokens, and cost.
+- **Failures speak plain**, with the runtime's words in the tooltip;
+  agent text, prompts, bubbles, and code blocks wrap unbroken tokens.
+- **The Dashboard never reads empty while loading**: History says
+  "Loading…" until its first page and lists its newest eight rows
+  under "Older…", Sources says it is loading rather than not
+  connected, and the Now band reads "deciding" or "working" mid-turn.
+- **The served page carries the shell's version**, so Settings
+  never prints a dev placeholder over a remote connection.
+
+### Changed
+
+- **Playbook 12.2 with slc 0.7.** The core runs on `@sublang/playbook`
+  12.2, the release whose runtime the `slc` 0.7 compiler links every
+  compiled playbook against; the Playbooks example card shows slc
+  0.7's own two-agent change-and-review demo, and the `dev` built-in's
+  machine drawing gives each transition its own port.
+
+### Fixed
+
+- **Compiled playbooks register.** Registering a compiled playbook
+  matched its bound roles case-sensitively against slc's capitalized
+  role ids, so every compile ended in "no player was bound"; the
+  bindings now match however the submission cased them, and the
+  registry's absolute path imports as a file URL on Windows.
+- **The composer keeps one row.** A window laid out before it was
+  shown pinned the Boss field to no height, clipping its placeholder
+  until a reload; the field never drops under one row and refits
+  when the viewport resizes.
+- **A session with no player lanes** — one the playbook terminal
+  wrote — shows the Captain column alone at the home's reading width
+  instead of a divider beside an empty half.
+- **Nested machine states read by name.** A region of `/decide`'s
+  parallel proposals drew under its whole dotted id, trimmed past the
+  box; it now goes by its own segment with its parent as caption and
+  the whole path in tooltips and the status line.
+- **A codex coder's tool rows read as commands**: the login-shell
+  wrapper is unwrapped and its shell tool reads "shell", as a Claude
+  coder's rows already did.
+
+## [0.2.0] - 2026-09-02
+
+### Added
+
+- **Sessions continue.** An ended session is a paused conversation: a
+  message continues it, after the app restarts too, from a token-free
+  Captain snapshot kept beside the session; the End confirm says so.
+- **Every session can be deleted**, sessions run from the playbook
+  terminal included, behind a lease check that refuses while a
+  terminal still writes them.
+- **Spec editing.** Packages, decision records, and intent records
+  open in a plain-text editor with a markdown preview from the Specs
+  tab; saves are atomic and refuse to clobber a file an agent changed
+  meanwhile.
+- **Intent controls.** A working intent can be dropped from the
+  session's working line and the Dashboard's Now band; the Captain
+  home's next card can remove its intent.
+
+### Changed
+
+- **Chrome that fits.** The composer is rebuilt — field on top, actions
+  beneath, "Send" and "Send next", no native grip — and every row,
+  toolbar, and header yields at narrow widths instead of overlapping;
+  a browser journey now measures overlap at widths from 320px.
+- Record rows look and act alike everywhere — Specs decisions, History,
+  Sources — and open the record in the records reader.
+
+### Fixed
+
+- History and Sources record rows opened nothing; they now land in the
+  records reader.
+- A stale ledger reply could outlive a fresh one, leaving a started
+  intent shown as still queued.
+
+## [0.1.0] - 2026-09-02
+
+### Added
+
+- **Workspace.** Local git repositories as projects; Boss sessions with
+  a Captain pane, one pane per session player, live machine cards for
+  the playbook run, and a composer that queues messages during a turn
+  and answers a player's question in place; the project palette, the
+  Specs tab with outline, search, citations, and graph, and the
+  project Overview.
+- **Dashboard as the intent ledger.** An attention queue of questions,
+  failures, and finished work awaiting a verdict; per-project History,
+  Now, Up next, and Sources; one-gesture capture from GitHub issues,
+  pull requests, intent records, or a typed line; Start stages an
+  intent into the composer; Confirm or Drop closes it; History shows
+  done work with fixed bugs crossed out.
+- **Playbooks.** The `@sublang/playbook` built-ins (`/code`, `/review`,
+  `/decide`, `/dev`), per-role inline agents with fast mode, the
+  pipeline view, and a compile flow through `slc`.
+- **Settings.** The Captain agent, session players, adapter readiness
+  with in-place re-check, notifications, and comment-preserving edits
+  of the shared playbook config.
+- **Shared file state.** App state under `~/.spex` and sessions in the
+  playbook CLI's own store, so a session run from a terminal appears
+  in the app; the shared config lives under `~/.spex/playbook`.
+- **Server shell.** The interface and the core served from one port
+  behind a token URL, with optional TLS, for browsing a machine you own
+  from another.
+- **Desktop shell.** Single instance, OS notifications and dock badge,
+  and a guarded source launch that rebuilds and restores the native
+  module.
+- **Acceptance.** Browser journeys driving the served interface in
+  Chromium against a real core with substitute agents, including an
+  accessibility scan of every surface in both themes.
+
+[Unreleased]: https://github.com/sublang-ai/spex/compare/app-v0.8.0...HEAD
+[0.8.0]: https://github.com/sublang-ai/spex/compare/app-v0.7.0...app-v0.8.0
+[0.7.0]: https://github.com/sublang-ai/spex/compare/app-v0.6.1...app-v0.7.0
+[0.6.1]: https://github.com/sublang-ai/spex/compare/app-v0.6.0...app-v0.6.1
+[0.6.0]: https://github.com/sublang-ai/spex/compare/app-v0.5.0...app-v0.6.0
+[0.5.0]: https://github.com/sublang-ai/spex/compare/app-v0.4.0...app-v0.5.0
+[0.4.0]: https://github.com/sublang-ai/spex/compare/app-v0.3.0...app-v0.4.0
+[0.3.0]: https://github.com/sublang-ai/spex/compare/app-v0.2.0...app-v0.3.0
+[0.2.0]: https://github.com/sublang-ai/spex/compare/app-v0.1.0...app-v0.2.0
+[0.1.0]: https://github.com/sublang-ai/spex/releases/tag/app-v0.1.0

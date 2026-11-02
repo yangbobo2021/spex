@@ -1,0 +1,1302 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+import type { TmuxPlayApprovalHandler } from "@sublang/cligent/tmux-play";
+import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
+import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
+import { createTmuxPlayRuntime, type Captain, type PlayerAdapterImports, type TmuxPlayRuntime } from "@sublang/cligent/tmux-play";
+import type { OwnerAssetStore, SessionTurnInput } from "@sublang/playbook/session-assets";
+import { openSessionHost, discardSessionUncertain, type SessionHostController } from "@sublang/playbook/session-host";
+import {
+  assertCaptainSessionExecutionCompatible,
+  projectCaptainSessionStructure,
+  validateCaptainSessionExecutionProjection,
+  type SessionExecutionProjection,
+  type SessionStructuralProjection,
+  type ReplayStreamEntry,
+} from "@sublang/playbook/session-store";
+import { resolveArtifacts } from "./artifacts.js";
+import { i18n } from "./i18n.js";
+import { assertSubagentEffort, assertSubagentModel, type ComposedConfig, type LoadModule } from "./config.js";
+import { BOSS_ABORT_REASON, CORE_STOP_REASON, controlRecord, pendingRestore, restoredRecord, restoredRuns, restoreReports, restoringRecord, runsOnPhrase, runtimeRecord, type TurnControlKind } from "./control-record.js";
+import { foldConditions } from "./ledger.js";
+import { CAPTAIN_AGENT_ID, type AssignedRuntime, type MediaAsset, type ParkedRunAction, type ProjectInfo, type SessionAgentSettings, type SessionInfo, type SessionAgentSettingsMap, type TmuxPlayRecord } from "./protocol.js";
+import { Store } from "./store.js";
+
+export class CoreError extends Error {
+  /** `details` are the facts a page acts on, apart from the words it
+   * shows (core-service-111): a refusal is never matched by its prose. */
+  constructor(
+    readonly code: "not_found" | "busy" | "aborted" | "conflict" | "invalid_config" | "invalid_request" | "internal",
+    message: string,
+    readonly details?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "CoreError";
+  }
+}
+
+/** The refusal of a Restore with nothing interrupted (core-service-82):
+ * another client, the CLI or another device restored or discarded it
+ * first. */
+function nothingToRestore(): CoreError {
+  return new CoreError("invalid_request", i18n._({
+    id: "This session has no interrupted turn to restore",
+    comment:
+      "Refusal: Restore was asked of a session with nothing interrupted, as when another client restored or discarded it first",
+  }));
+}
+
+/** The refusal of a record assigned to another runtime (DR-134): the
+ * phrase, with that runtime's label as the detail a client acts on
+ * (core-service-111) — `invalid_request` for a session's continuation,
+ * control, Restore and Discard (core-service-73, core-service-82,
+ * core-service-83), `conflict` for an intent's turn, edit and close
+ * (core-service-43, core-service-46, core-service-47). */
+export function runsElsewhereRefusal(code: "invalid_request" | "conflict", runsOn: string): CoreError {
+  return new CoreError(code, runsOnPhrase(runsOn), { runsOn });
+}
+
+/** The refusal on a seat of a turn naming an intent that holds no
+ * runtime (core-service-47, core-service-125, DR-132): `conflict`, its
+ * phrase alone — no runtime to name as a detail. */
+export function runsNowhereRefusal(): CoreError {
+  return new CoreError("conflict", i18n._({
+    id: "Runs nowhere yet",
+    comment: "Why an intent cannot run on a team server's seat: it names no runtime, captured before runtimes were recorded or by the Playbook CLI, and a seat runs only what is assigned to it",
+  }));
+}
+
+/** A session assigned to another runtime runs there alone: refused
+ * before anything opens, whatever its checkpoint holds (DR-134). */
+export function assertRunsHere(session: SessionInfo | undefined): void {
+  if (session?.runsOn !== undefined) throw runsElsewhereRefusal("invalid_request", session.runsOn);
+}
+
+/** core-service-98: the optional control members a Captain shell may
+ * publish, forwarded from a wrapped shell by feature detection. */
+function controlSurfaces(shell: unknown): Record<string, unknown> {
+  const source = shell as Record<string, unknown>;
+  const forwarded: Record<string, unknown> = {};
+  for (const name of [
+    "describeRuntimeActions",
+    "submitRuntimeAction",
+    "describeShellActions",
+    "submitShellAction",
+  ]) {
+    const member = source[name];
+    if (typeof member === "function") {
+      forwarded[name] = (...args: unknown[]) => (member as (...a: unknown[]) => unknown).apply(source, args);
+    }
+  }
+  return forwarded;
+}
+
+/** Deterministic record fixtures; production uses Playbook's Captain
+ * shell. The session id lets a fixture keep state across the runtime
+ * releases the turn-held lifecycle makes (core-service-91). */
+export type CaptainFactory = (composed: ComposedConfig, sessionId: string) => Promise<Captain>;
+export interface SessionManagerOptions {
+  approvalHandler?: (sessionId: string) => TmuxPlayApprovalHandler;
+  cancelApprovals?: (sessionId: string) => void;
+  store: Store;
+  loadModule?: LoadModule;
+  adapterImports?: PlayerAdapterImports;
+  captainFactory?: CaptainFactory;
+  now?: () => number;
+  env?: NodeJS.ProcessEnv;
+  /** This runtime, read as a new session is assigned to it (storage-43,
+   * DR-134); none — or no reader — assigns nothing. */
+  runtime?: () => AssignedRuntime | undefined;
+}
+export interface RecordEnvelope {
+  sessionId: string;
+  seq: number;
+  record: TmuxPlayRecord;
+  hidden: boolean;
+  role?: string;
+}
+interface LiveSession {
+  info: SessionInfo;
+  controller: SessionHostController;
+  runtime: SessionHostController["host"];
+  seq: number;
+  turnActive: boolean;
+  pendingIntentId?: string;
+  /** Ownership at this turn's start, before a possible human verdict. */
+  turnIntentId?: string;
+  operation?: Promise<void>;
+  /** The reason of an abort requested while the runtime had no turn to
+   * abort — during the lifecycle's preparation of the turn — applied as
+   * the runtime begins it (core-service-6). */
+  pendingAbort?: string;
+}
+
+/** The members a stored structure names: its playbooks, and its
+ * referenced players in stored order (core-service-92). */
+export interface StoredMembers { playbookIds: string[]; playerIds: string[] }
+
+export function storedMembers(structure: SessionStructuralProjection): StoredMembers {
+  return {
+    playbookIds: Object.keys(structure.catalog),
+    playerIds: structure.players.map((player) => String((player as {id: unknown}).id)),
+  };
+}
+
+/** The drift lines two paths share, each phrased when it is composed
+ * (core-service-111); the ids stay as the config writes them. */
+const playbookGone = (playbookId: string): string =>
+  i18n._({
+    id: "playbook {playbookId} is no longer enabled",
+    comment: "One settings drift: a stored playbook left the config",
+    values: { playbookId },
+  });
+const playerNamed = (playerId: string): string =>
+  i18n._({
+    id: "player {playerId}",
+    comment: "A session player, named inside a settings-drift line",
+    values: { playerId },
+  });
+
+/** A drift the projection itself cannot express — a stored member the
+ * current config no longer holds (core-service-92). */
+export class SettingsDriftError extends Error {
+  constructor(readonly changes: string[]) {
+    super(i18n._({
+      id: "Settings changed since this session started: {changes}. Start a new session for the new settings, or change them back.",
+      comment:
+        "Refusal to continue a session; `changes` are the drift lines, themselves messages",
+      values: {
+        changes: changes.join(
+          i18n._({ id: "; ", comment: "Separates reasons listed in one message" }),
+        ),
+      },
+    }));
+    this.name = "SettingsDriftError";
+  }
+}
+
+/** Construct the shared execution projection from the validated desktop
+ * config — the whole enabled catalog for a new session, or the current
+ * config projected onto a stored session's members so an unrelated
+ * playbook or player never invalidates it (core-service-92, DR-051). */
+/** One agent's tuning read onto a composed block (core-service-100,
+ * DR-067): a string pins, `false` takes the provider's current
+ * default, and an absent field leaves the configured selection. The
+ * shell is told the outcome, exactly as composition tells it one. Every
+ * block passes through here, tuned or not: a subagent model's `false` —
+ * Off, carried this far so an effort beside it is refused — is dropped
+ * only now, as the shell takes no sentinel for it (DR-095). */
+function tuned<T extends {model: unknown; effort: unknown; fastMode?: boolean; subagentModel?: string | false; subagentEffort?: string}>(block: T, tuning: SessionAgentSettings | undefined, agent: {adapter: string; path: string}): Omit<T, "subagentModel"> & {subagentModel?: string} {
+  const selection = (value: string | false): unknown => value === false ? {kind: "provider-default"} : {kind: "value", value};
+  // A subagent model is validated where the agent's adapter is known —
+  // cligent's support, cligent's words (DR-093).
+  if (typeof tuning?.subagentModel === "string") assertSubagentModel(tuning.subagentModel, agent.adapter, agent.path);
+  // A session's `false` is Off for the model and the agent's own choice
+  // for the effort; an absent field keeps the block's, whose delegation
+  // default composition already resolved (DR-095).
+  const {subagentModel: configuredModel, subagentEffort: configuredEffort, ...rest} = block;
+  const subagentEffort = tuning?.subagentEffort === undefined ? configuredEffort : tuning.subagentEffort === false ? undefined : tuning.subagentEffort;
+  const subagentModel = tuning?.subagentModel === undefined ? configuredModel : tuning.subagentModel;
+  // The effort is checked against the model it now runs beside, at every
+  // site: a session may tune either one alone, and its Off reaches a
+  // binding whose own effort stands.
+  if (subagentEffort !== undefined && (tuning?.subagentEffort !== undefined || tuning?.subagentModel !== undefined)) {
+    assertSubagentEffort(subagentEffort, agent.adapter, subagentModel === false ? undefined : subagentModel, agent.path);
+  }
+  return {
+    ...rest,
+    ...(tuning?.model !== undefined ? {model: selection(tuning.model)} : {}),
+    ...(tuning?.effort !== undefined ? {effort: selection(tuning.effort)} : {}),
+    ...(tuning?.fastMode !== undefined ? {fastMode: tuning.fastMode} : {}),
+    ...(typeof subagentModel === "string" ? {subagentModel} : {}),
+    ...(subagentEffort !== undefined ? {subagentEffort} : {}),
+  } as Omit<T, "subagentModel"> & {subagentModel?: string};
+}
+
+export function executionConfig(composed: ComposedConfig, cwd: string, members?: StoredMembers, tuning?: SessionAgentSettingsMap): SessionExecutionProjection {
+  const playbooks = members
+    ? members.playbookIds.map((id) => composed.playbooks.find((playbook) => playbook.id === id))
+    : composed.playbooks;
+  const missingPlaybooks = members ? members.playbookIds.filter((id, index) => !playbooks[index]) : [];
+  const playerIds = members ? members.playerIds : composed.players.map(({id}) => id);
+  const missingPlayers = playerIds.filter((id) => !composed.captainOptions.sessionAgents.players[id]);
+  if (missingPlaybooks.length || missingPlayers.length) {
+    throw new SettingsDriftError([
+      ...missingPlaybooks.map((id) => playbookGone(id)),
+      ...missingPlayers.map((id) => i18n._({
+        id: "player {playerId} is no longer bound by the session's playbooks",
+        comment: "One settings drift: a stored player no longer serves any role",
+        values: { playerId: id },
+      })),
+    ]);
+  }
+  return validateCaptainSessionExecutionProjection({
+    schemaVersion: 2,
+    captain: {...tuned(composed.captainOptions.sessionAgents.captain, tuning?.[CAPTAIN_AGENT_ID], {adapter: composed.captainOptions.sessionAgents.captain.adapter, path: CAPTAIN_AGENT_ID}), ...(tuning?.[CAPTAIN_AGENT_ID]?.browser !== undefined ? {browser: tuning[CAPTAIN_AGENT_ID].browser} : {})},
+    players: playerIds.map((id) => ({ id, ...tuned(composed.captainOptions.sessionAgents.players[id], tuning?.[id], {adapter: composed.captainOptions.sessionAgents.players[id].adapter, path: `players.${id}`}), ...(tuning?.[id]?.browser !== undefined ? {browser: tuning[id].browser} : {}) })),
+    catalog: Object.fromEntries((playbooks as ComposedConfig["playbooks"]).map((playbook) => {
+      const block = composed.captainOptions.playbooks[playbook.id];
+      return [playbook.id, {
+        id: playbook.id, from: isAbsolute(playbook.from) ? pathToFileURL(playbook.from).href : playbook.from,
+        manifestCommand: playbook.manifestCommand,
+        command: playbook.command, intent: playbook.intent,
+        artifactSchema: playbook.artifactSchema,
+        requiredRoleIds: playbook.requiredRoleIds,
+        concurrentRoleSets: playbook.concurrentRoleSets,
+        // A role's provider call is built from its binding, so a tuned
+        // player must reach every binding naming it — patching the
+        // player's own block alone changes nothing at call time.
+        roles: Object.fromEntries(Object.entries(block.roles).map(([role, binding]) =>
+          [role, tuned(binding, tuning?.[binding.playerId], {adapter: composed.captainOptions.sessionAgents.players[binding.playerId]?.adapter ?? "", path: `playbooks.${playbook.id}.roles.${role}`})])),
+        options: { ...block.options, ...(playbook.acceptsCwdOption ? {cwd} : {}) },
+      }];
+    })),
+  });
+}
+
+/** The projection a session opens on, its own tuning read on. A
+ * continued session's tuning was validated against the adapters it
+ * started with, so when that tuning no longer fits, a structural drift
+ * behind it is named first — the change the session can act on, with a
+ * new session offered — and the tuning's own refusal only when the
+ * structure still matches (core-service-92). */
+function tunedExecution(composed: ComposedConfig, cwd: string, members: StoredMembers | undefined, tuning: SessionAgentSettingsMap | undefined, stored: SessionStructuralProjection | undefined): SessionExecutionProjection {
+  try { return keepStoredModules(executionConfig(composed, cwd, members, tuning), stored); }
+  catch (error) {
+    if (!stored || error instanceof SettingsDriftError) throw error;
+    const untuned = executionConfig(composed, cwd, members);
+    try { assertCaptainSessionExecutionCompatible(stored, untuned); }
+    catch { throw new SettingsDriftError(describeStructuralDrift(stored, projectCaptainSessionStructure(untuned))); }
+    throw error;
+  }
+}
+
+/**
+ * A continued session keeps the module each of its playbooks was opened
+ * on: the module location is the session's identity, which Playbook's
+ * continuation reproduces exactly, not a setting the current config
+ * applies (DR-051). So a session begun before its playbook came from an
+ * environment (DR-104) — on a package specifier or a library path —
+ * continues on that module, while every new session takes the module
+ * the environments export (environments-9).
+ */
+function keepStoredModules(config: SessionExecutionProjection, stored: SessionStructuralProjection | undefined): SessionExecutionProjection {
+  if (!stored) return config;
+  const storedCatalog = stored.catalog as Record<string, { from?: unknown }>;
+  const catalog = config.catalog as Record<string, { from: string }>;
+  let changed = false;
+  const next: Record<string, unknown> = {};
+  for (const [id, entry] of Object.entries(catalog)) {
+    const from = storedCatalog[id]?.from;
+    if (typeof from === "string" && from !== entry.from) { next[id] = { ...entry, from }; changed = true; }
+    else next[id] = entry;
+  }
+  return changed ? validateCaptainSessionExecutionProjection({ ...config, catalog: next } as SessionExecutionProjection) : config;
+}
+
+/** Name every structural field whose change makes the current projection
+ * incompatible with the stored one — Playbook's own refusal names none
+ * (core-service-92). */
+export function describeStructuralDrift(stored: SessionStructuralProjection, current: SessionStructuralProjection): string[] {
+  const changes: string[] = [];
+  const agentDrift = (who: string, before: Record<string, unknown>, after: Record<string, unknown>): void => {
+    for (const field of ["adapter", "instruction", "permissions"]) {
+      if (!isDeepStrictEqual(before[field], after[field])) changes.push(i18n._({
+        id: "{who}'s {field} changed",
+        comment:
+          "One settings drift; `who` is itself a message and `field` the config file's own field name",
+        values: { who, field },
+      }));
+    }
+  };
+  agentDrift(i18n._({
+    id: "the Captain",
+    comment: "The session's Captain, named inside a settings-drift line",
+  }), stored.captain, current.captain);
+  const currentPlayers = current.players.map((player) => player as Record<string, unknown>);
+  stored.players.forEach((entry, index) => {
+    const before = entry as Record<string, unknown>;
+    const after = currentPlayers.find((player) => player.id === before.id);
+    if (!after) changes.push(i18n._({
+      id: "player {playerId} is gone",
+      comment: "One settings drift: a stored player left the config",
+      values: { playerId: String(before.id) },
+    }));
+    else {
+      agentDrift(playerNamed(String(before.id)), before, after);
+      if (currentPlayers[index]?.id !== before.id) changes.push(i18n._({
+        id: "player {playerId} changed its place in the roster",
+        comment: "One settings drift: the players' order changed",
+        values: { playerId: String(before.id) },
+      }));
+    }
+  });
+  for (const player of currentPlayers) {
+    if (!stored.players.some((entry) => (entry as {id: unknown}).id === player.id)) changes.push(i18n._({
+      id: "player {playerId} joined the roster",
+      comment: "One settings drift: the config added a player",
+      values: { playerId: String(player.id) },
+    }));
+  }
+  for (const [id, before] of Object.entries(stored.catalog as Record<string, Record<string, unknown>>)) {
+    const after = (current.catalog as Record<string, Record<string, unknown>>)[id];
+    if (!after) { changes.push(playbookGone(id)); continue; }
+    for (const field of ["from", "manifestCommand", "command", "intent", "artifactSchema", "requiredRoleIds", "concurrentRoleSets", "options"]) {
+      if (!isDeepStrictEqual(before[field], after[field])) changes.push(i18n._({
+        id: "playbook {playbookId}'s {field} changed",
+        comment:
+          "One settings drift; `field` is the manifest's own field name",
+        values: { playbookId: id, field },
+      }));
+    }
+    const beforeRoles = (before.roles ?? {}) as Record<string, {playerId?: unknown}>;
+    const afterRoles = (after.roles ?? {}) as Record<string, {playerId?: unknown}>;
+    for (const [role, binding] of Object.entries(beforeRoles)) {
+      const now = afterRoles[role]?.playerId;
+      if (now !== binding.playerId) changes.push(i18n._({
+        id: "playbook {playbookId}'s {role} role now binds {player} instead of {before}",
+        comment:
+          "One settings drift: a role changed lanes; the ids are the config file's own",
+        values: {
+          playbookId: id,
+          role,
+          player: now === undefined || now === null
+            ? i18n._({ id: "no one", comment: "Stands where a role binds no player at all" })
+            : String(now),
+          before: String(binding.playerId),
+        },
+      }));
+    }
+  }
+  for (const id of Object.keys(current.catalog)) {
+    if (!(id in stored.catalog)) changes.push(i18n._({
+      id: "playbook {playbookId} joined the session",
+      comment: "One settings drift: the config enabled another playbook",
+      values: { playbookId: id },
+    }));
+  }
+  return changes.length ? changes : [i18n._({
+    id: "the session's structure no longer matches its stored one",
+    comment: "The settings drift where no single field names itself",
+  })];
+}
+
+/** A project's current conversation (core-service-93, DR-051): its live
+ * session, else the most recently active owned one that continues or
+ * still carries a recovery boundary — never one assigned to another
+ * runtime, even while a writer there reads as live (DR-134). */
+export function currentSession(sessions: SessionInfo[], projectId: string): SessionInfo | undefined {
+  const own = sessions.filter((session) => session.projectId === projectId && session.runsOn === undefined);
+  return own.find((session) => session.live) ?? own
+    .filter((session) => !session.externalWriter &&
+      (session.continuable || session.recovery))
+    .sort((a, b) => (b.endedAt ?? b.createdAt) - (a.endedAt ?? a.createdAt))[0];
+}
+
+/** A session's entry while this core holds its turn (core-service-32,
+ * DR-047). Playbook marks the checkpoint uncertain as a turn begins and
+ * settles it only with the turn — the evidence a turn cut off leaves —
+ * so while the turn is held its entry reads the turn, not that mark: no
+ * interrupted turn to restore, and no reason to restore it first. */
+function holdingTurn(session: SessionInfo): SessionInfo {
+  const { recovery: _recovery, continuationReason: _reason, ...held } = session;
+  return held;
+}
+
+export class SessionManager {
+  private readonly store: Store;
+  private readonly loadModule: LoadModule;
+  private readonly live = new Map<string, LiveSession>();
+  // Settlement outlives the runtime: admission must also wait for the
+  // released checkpoint's refreshed metadata and publication.
+  private readonly settling = new Map<string, {projectId: string; done: Promise<void>}>();
+  private readonly opening = new Set<string>();
+  // Shutdown drains openings; callers retain their original result/error.
+  private readonly openingOperations = new Set<Promise<void>>();
+  private readonly failedOpenings = new Map<string, unknown>();
+  private stopping = false;
+  /** Set once a bounded stop gives up on unconfirmed cleanup: a turn
+   * settling after that writes nothing (core-service-39). */
+  private abandoned = false;
+  private shutdownOpenings?: Promise<void[]>;
+  private readonly recovering = new Map<string, string>();
+  /** Sessions whose active turn is being stopped intentionally. */
+  private readonly intentionalStops = new Set<string>();
+  private readonly now: () => number;
+  onRecord: (envelope: RecordEnvelope) => void = () => {};
+  onSessionState: (session: SessionInfo) => unknown = () => {};
+  onLedgerChange: (projectId: string) => void = () => {};
+  /** Local turn completion, after release and the durable read model agree. */
+  onTurnSettled: (
+    sessionId: string,
+    turnId: number,
+    intentId?: string,
+    control?: TurnControlKind,
+  ) => void = () => {};
+
+  constructor(private readonly options: SessionManagerOptions) {
+    this.store = options.store;
+    this.loadModule = options.loadModule ?? ((specifier) => import(specifier));
+    this.now = options.now ?? Date.now;
+  }
+
+  listSessions(): SessionInfo[] {
+    return this.store.listSessions().map((session) => {
+      const live = this.live.get(session.id);
+      const settling = this.settling.has(session.id);
+      const listed = {...session, ...(live ? {externalWriter:undefined} : {}), live: !!live || session.live, turnActive: (live?.turnActive ?? (session.live ? session.turnActive ?? false : false)) || settling};
+      return live?.turnActive ? holdingTurn(listed) : listed;
+    });
+  }
+  /** One lane per project: its current or recovery-bound conversation
+   * (core-service-93, core-service-107). */
+  listLanes(): { sessionId: string; projectId: string; turnActive: boolean; settling: boolean }[] {
+    const sessions = this.listSessions();
+    const lanes: { sessionId: string; projectId: string; turnActive: boolean; settling: boolean }[] = [];
+    for (const projectId of new Set(sessions.map((session) => session.projectId))) {
+      // An aborted/failed conversation remains the queue's lane while
+      // its recovery boundary stands, even though it cannot continue a
+      // normal message yet. That is what lets the queue name the stop or
+      // failure instead of presenting an unqualified Start.
+      const current = currentSession(sessions, projectId);
+      if (current) lanes.push({sessionId: current.id, projectId, turnActive: current.turnActive ?? false, settling: this.settling.has(current.id)});
+    }
+    return lanes;
+  }
+  getLive(sessionId: string): LiveSession | undefined { return this.live.get(sessionId); }
+  /** Fence synchronously, before Core.stop awaits any other subsystem. */
+  beginShutdown(): void {
+    this.stopping = true;
+    this.shutdownOpenings ??= Promise.all([...this.openingOperations]);
+  }
+  private assertAdmission(): void {
+    if (this.stopping) throw new CoreError("busy", i18n._({id: "The core is stopping.", comment: "Refusal during core shutdown"}));
+  }
+  /** Wait out a settling turn's release, so a caller sees the session
+   * either held or released — never in between (core-service-91). */
+  async settled(sessionId: string): Promise<void> {
+    await this.settling.get(sessionId)?.done;
+  }
+  /** Wait out every release in flight across a project's sessions. */
+  async projectSettled(projectId: string): Promise<void> {
+    for (const entry of this.settling.values()) {
+      if (entry.projectId === projectId) await entry.done;
+    }
+  }
+
+  async createSession(project: ProjectInfo, composed: ComposedConfig, assertCurrent?: () => void): Promise<SessionInfo> {
+    return this.open(project, composed, randomUUID(), "new", assertCurrent);
+  }
+  async continueSession(project: ProjectInfo, composed: ComposedConfig, session: SessionInfo): Promise<SessionInfo> {
+    return this.open(project, composed, session.id, "continue");
+  }
+  /** Restore an interrupted turn (core-service-82, DR-088): Playbook's
+   * recover mode on the attempted configuration, then one turn that
+   * restores the saved position and reports what was recorded —
+   * nothing re-runs, and no agent is called. */
+  async restoreSession(project: ProjectInfo, sessionId: string): Promise<void> {
+    // Only interrupted work is restored (core-service-82). A stale
+    // Restore is refused before anything opens, so it writes nothing; a
+    // held or externally owned session is left to the lease to name.
+    // Playbook's recover mode also opens a settled record — it would
+    // take the missing input as a paused task's and fail the turn — so
+    // the record is read again under the lease before any turn starts.
+    const info = this.store.describeSession(sessionId);
+    // Another runtime's session is its own to restore (DR-134).
+    assertRunsHere(info);
+    if (info && !info.recovery && !info.externalWriter && !this.live.has(sessionId)) throw nothingToRestore();
+    await this.open(project, undefined, sessionId, "recover");
+    const entry = this.requireLive(sessionId);
+    let saved: {state?: string; uncertain?: {input?: string}} | undefined;
+    try { saved = await entry.controller.read(); } catch { saved = undefined; }
+    if (saved?.state !== "uncertain" || typeof saved.uncertain?.input !== "string") {
+      await this.disposeSession(sessionId);
+      throw nothingToRestore();
+    }
+    this.startTurn(entry, undefined, { input: saved.uncertain.input });
+  }
+  async discardSession(sessionId: string): Promise<{removed: boolean}> {
+    if (this.live.has(sessionId) || this.recovering.has(sessionId)) throw new CoreError("busy", i18n._({
+      id: "the session is active",
+      comment: "Refusal: the session is held, so it cannot be discarded now",
+    }));
+    const info = this.store.describeSession(sessionId);
+    if (!info) throw new CoreError("not_found", i18n._({
+      id: "no session {sessionId}",
+      comment: "Refusal: no session of this id is known",
+      values: { sessionId },
+    }));
+    assertRunsHere(info);
+    if (this.opening.has(info.projectId) || [...this.recovering.values()].includes(info.projectId)) throw new CoreError("busy", i18n._({
+      id: "the session is active",
+      comment: "Refusal: the session is held, so it cannot be discarded now",
+    }));
+    this.recovering.set(sessionId, info.projectId);
+    let removed = false;
+    let refused = false;
+    try {
+      const restored = await discardSessionUncertain(this.store.sessionStoreFor(sessionId), sessionId);
+      removed = !restored;
+      if (!restored) this.store.forgetSession(sessionId);
+      else await this.store.refreshSession(sessionId, false);
+      return {removed: !restored};
+    } catch (error) { refused = true; throw this.failure(error); }
+    finally {
+      try {
+        if (!removed) await this.refreshOwnership(sessionId);
+        this.onLedgerChange(info.projectId);
+      } catch (error) {
+        if (!refused) throw this.failure(error);
+        console.error(`spex: session ownership refresh failed: ${String(error)}`);
+      } finally { this.recovering.delete(sessionId); }
+    }
+  }
+
+  private async refreshOwnership(sessionId: string): Promise<void> {
+    await this.store.refreshSessionOwnership(sessionId);
+    const info = this.store.describeSession(sessionId);
+    if (info) await this.onSessionState(info);
+  }
+
+  private open(project: ProjectInfo, composed: ComposedConfig | undefined, sessionId: string, mode: "new" | "continue" | "recover", assertCurrent?: () => void): Promise<SessionInfo> {
+    this.assertAdmission();
+    // Own the complete opening, including its first settlement wait.
+    const operation = this.openAdmitted(project, composed, sessionId, mode, assertCurrent, (error) => {
+      this.failedOpenings.set(sessionId, error);
+    });
+    // The request keeps its own admission/config error. Shutdown reports
+    // unconfirmed cleanup, not that an otherwise clean opening refused.
+    const finished = operation.then(() => {}, () => {});
+    this.openingOperations.add(finished);
+    void finished.then(() => { this.openingOperations.delete(finished); });
+    return operation;
+  }
+
+  private async openAdmitted(project: ProjectInfo, composed: ComposedConfig | undefined, sessionId: string, mode: "new" | "continue" | "recover", assertCurrent: (() => void) | undefined, cleanupFailed: (error: unknown) => void): Promise<SessionInfo> {
+    // One working turn per project (core-service-4, DR-051): only a
+    // session whose runtime is held — a turn in flight or settling — or
+    // one another host holds stands in the way, and it is named. A
+    // sibling mid-release is waited out first.
+    await this.projectSettled(project.id);
+    this.assertAdmission();
+    if (this.opening.has(project.id)) throw new CoreError("busy", i18n._({
+      id: "a session is starting in {project} — wait a moment",
+      comment: "Refusal: another session of this project is opening",
+      values: { project: project.name },
+    }));
+    if ([...this.recovering.values()].includes(project.id)) throw new CoreError("busy", i18n._({
+      id: "the session is recovering",
+      comment: "Refusal: a Restore or Discard of this session is still running",
+    }));
+    this.opening.add(project.id);
+    let ownsLocalReservation = false;
+    let entry: LiveSession | undefined;
+    let controller: SessionHostController | undefined;
+    let constructingHost = false;
+    let cleanupUnconfirmed = false;
+    try {
+      for (const session of this.store.listSessions()) {
+        if (session.projectId === project.id && session.externalWriter) await this.refreshOwnership(session.id);
+      }
+      // A session assigned to another runtime never holds the project
+      // here, so this runtime starts its own beside it (core-service-93,
+      // DR-134).
+      const holder = this.store.listSessions().find((session) => session.projectId === project.id && session.runsOn === undefined && (session.live || session.externalWriter));
+      if (holder) {
+        const name = holder.title
+          ? i18n._({
+              id: "“{title}”",
+              comment: "A session's own title, quoted",
+              values: { title: holder.title },
+            })
+          : i18n._({
+              id: "a session",
+              comment: "Stands in for the title of a session that has none",
+            });
+        throw new CoreError("busy", holder.externalWriter
+          ? i18n._({
+              id: "{name} is in use elsewhere in {project}",
+              comment: "Refusal: another host holds this project's conversation",
+              values: { name, project: project.name },
+            })
+          : i18n._({
+              id: "{name} is still working in {project} — wait for it to finish, or abort it",
+              comment: "Refusal: one working turn per project",
+              values: { name, project: project.name },
+            }));
+      }
+      this.store.setLocalSession(sessionId, true, project.id);
+      ownsLocalReservation = true;
+      // A continued session takes the current config projected onto its
+      // stored members, and drift is named before the runtime opens —
+      // never after the provider hints are consumed (core-service-92).
+      const stored = composed && mode === "continue" ? await this.storedStructure(sessionId) : undefined;
+      const members = stored ? storedMembers(stored) : undefined;
+      const config = composed ? this.checkedExecution(project, composed, sessionId, stored) : undefined;
+      const memberPlaybooks = composed ? composed.playbooks.filter((playbook) => !members || members.playbookIds.includes(playbook.id)) : [];
+      const graphs = composed ? await Promise.all(memberPlaybooks.map(async (playbook) => ({
+        playbookId: playbook.id, graph: (await resolveArtifacts(playbook, this.options.env)).machine ?? null,
+      }))) : undefined;
+      const initialVisible = composed ? composed.initialVisible.filter((id) => !members || members.playerIds.includes(id)) : undefined;
+      const fixture = composed && this.options.captainFactory ? await this.options.captainFactory(composed, sessionId) : undefined;
+      // Nothing awaited between: a clone gone meanwhile is refused here,
+      // as one gone before the open is.
+      assertCurrent?.();
+      if (!this.store.openSessionsDir(project.id)) throw new CoreError("not_found", i18n._({
+        id: "no project {projectId}",
+        comment: "Refusal: no project of this id is registered",
+        values: { projectId: project.id },
+      }));
+      constructingHost = true;
+      controller = await openSessionHost({
+        store: this.store.sessionStore(project.id), sessionId, mode, cwd: project.path,
+        ...(this.options.approvalHandler ? {approvalHandler: this.options.approvalHandler(sessionId)} : {}),
+        ...(config ? {config} : {}), loadModule: this.loadModule,
+        ...(graphs ? {graphs} : {}),
+        ...(initialVisible ? {initialVisible} : {}),
+        ...(this.options.adapterImports ? {adapterImports: this.options.adapterImports} : {}),
+        // Observe the public cleanup hooks even if construction returns no
+        // controller. Fixtures may narrate records before the real shell
+        // turn; only the shell supplies its reply and durable settlement.
+        createHostRuntime: async (input: Parameters<typeof createTmuxPlayRuntime>[0]) => {
+          const shell = input.captain;
+          const runtime: TmuxPlayRuntime = await createTmuxPlayRuntime({...input, captain: {
+            async init(session) { await shell.init?.(session); await fixture?.init?.(session); },
+            async handleBossTurn(turn,context) {
+              // The runtime has begun the turn: an abort requested before
+              // it had one to abort takes effect now, ahead of any call
+              // (core-service-6).
+              if (entry?.pendingAbort !== undefined) {
+                const reason = entry.pendingAbort;
+                entry.pendingAbort = undefined;
+                runtime.abortActiveTurn(reason);
+              }
+              await fixture?.handleBossTurn(turn,{...context, emitReply: async () => {}});
+              await shell.handleBossTurn(turn,context);
+            },
+            async prepareDispose() {
+              try { await fixture?.prepareDispose?.(); await shell.prepareDispose?.(); }
+              catch (error) { cleanupUnconfirmed = true; cleanupFailed(error); throw error; }
+            },
+            async dispose() {
+              try { await fixture?.dispose?.(); await shell.dispose?.(); }
+              catch (error) { cleanupUnconfirmed = true; cleanupFailed(error); throw error; }
+            },
+            // core-service-98: the control surfaces are the real shell's,
+            // and a wrapper that forwarded only the turn members hid them
+            // — the notice then drew controls every activation refused.
+            // Forwarded by feature detection, so an older shell that
+            // publishes none still advertises none.
+            ...controlSurfaces(shell),
+          }});
+          return runtime;
+        },
+        onStoredRecord: async (record) => {
+          this.record(sessionId, record, entry);
+          const result = record.record.type === "captain_finished" ? record.record.result as {status?: string; error?: string; finalText?: string} : undefined;
+          // English, deliberately (core-service-111): the page matches
+          // this record's text to phrase the failure itself, and the
+          // reason is the runtime's own words.
+          const callTurn = (record.record as {turnId?: unknown}).turnId;
+          if (entry && result?.status === "error") await this.appendError(entry, `The Captain's turn failed: ${result.error ?? result.finalText ?? "unknown error"}`, typeof callTurn === "number" ? callTurn : null);
+        },
+        onCheckpoint: async () => {
+          await this.store.refreshSession(sessionId, true);
+          if (entry) await this.publish(sessionId);
+        },
+      });
+      constructingHost = false;
+      this.assertAdmission();
+      await this.store.refreshSession(sessionId, true);
+      const info = this.store.describeSession(sessionId);
+      // English, deliberately (core-service-111): the shared store just
+      // wrote this session, so an unreadable one is an internal failure.
+      if (!info) throw new Error("shared session has no readable project history");
+      entry = {info, controller, runtime: controller.host, seq: this.store.maxSeq(sessionId), turnActive: false};
+      this.live.set(sessionId, entry);
+      // A new session is assigned to this runtime before its first turn
+      // is admitted, under its lease, and before it is reported
+      // (core-service-4, storage-43).
+      if (mode === "new") {
+        const runtime = this.options.runtime?.();
+        if (runtime) await this.appendRuntime(entry, runtime);
+      }
+      // A restore whose core stopped before it recorded the position is
+      // completed by whichever open holds the session next
+      // (core-service-82): the settled checkpoint is still its position.
+      if (mode !== "recover") {
+        try { await this.completeRestore(entry); }
+        catch (error) { console.error(`spex: restored position not recorded: ${String(error)}`); }
+      }
+      this.assertAdmission();
+      await this.publish(sessionId);
+      this.assertAdmission();
+      return {...info, live:true, turnActive:false};
+    } catch (error) {
+      // A compound construction error cannot prove runtime cleanup, even
+      // when the outer shared lifecycle released its lease. Do not infer
+      // a particular cleanup defect or depend on factory error identity.
+      const hostCleanupFailed = cleanupUnconfirmed || (constructingHost && error instanceof AggregateError);
+      if (hostCleanupFailed) { cleanupUnconfirmed = true; cleanupFailed(error); }
+      try {
+        if (controller) await controller.dispose();
+        if (entry) this.live.delete(sessionId);
+        if (ownsLocalReservation && !hostCleanupFailed) this.store.setLocalSession(sessionId, false);
+        if (entry) {
+          await this.store.refreshSession(sessionId, false);
+          await this.publish(sessionId);
+        }
+      } catch (cleanupError) {
+        cleanupUnconfirmed = true;
+        cleanupFailed(cleanupError);
+        throw cleanupError;
+      }
+      if (error instanceof SettingsDriftError) throw new CoreError("invalid_config", error.message);
+      throw this.failure(error, mode === "new" ? "invalid_config" : "invalid_request");
+    } finally { if (!cleanupUnconfirmed) this.opening.delete(project.id); }
+  }
+
+  /** The stored structural projection of a schema-7 checkpoint, when it has one. */
+  async storedStructure(sessionId: string): Promise<SessionStructuralProjection | undefined> {
+    try {
+      const manifest = await this.store.sessionStoreFor(sessionId).readManifest(sessionId) as {schemaVersion?: unknown; structuralProjection?: SessionStructuralProjection};
+      return manifest.schemaVersion === 7 ? manifest.structuralProjection : undefined;
+    } catch { return undefined; }
+  }
+
+  /** The same execution check as opening, without a runtime, lease or hints. */
+  async checkContinuation(project: ProjectInfo, composed: ComposedConfig, sessionId: string): Promise<void> {
+    const executionProjection = this.checkedExecution(project, composed, sessionId, await this.storedStructure(sessionId));
+    const checked = await this.store.sessionStoreFor(sessionId).validate(sessionId, {cwd: project.path, executionProjection});
+    if (!checked.resumable) throw new CoreError("invalid_request", checked.reasons.join("; "));
+  }
+
+  private checkedExecution(project: ProjectInfo, composed: ComposedConfig, sessionId: string, stored: SessionStructuralProjection | undefined): SessionExecutionProjection {
+    const config = tunedExecution(composed, project.path, stored ? storedMembers(stored) : undefined, this.store.sessionAgentSettings(sessionId), stored);
+    if (stored) {
+      try { assertCaptainSessionExecutionCompatible(stored, config); }
+      catch { throw new SettingsDriftError(describeStructuralDrift(stored, projectCaptainSessionStructure(config))); }
+    }
+    return config;
+  }
+
+  /** The runtime is held only for a turn (core-service-91): once the
+   * checkpoint has settled, release it — the Playbook lease with it —
+   * keeping the provider hints settlement wrote. Unresolved repository
+   * effects hold nothing: Playbook's restore installs their fence, and
+   * the controls that fence advertises are captured first (DR-074). */
+  private async releaseAtSettle(entry: LiveSession): Promise<void> {
+    const id = entry.info.id;
+    let recovery: {state?: string} | undefined;
+    try { recovery = await entry.controller.read(); } catch { recovery = undefined; }
+    if (recovery?.state !== "settled") return;
+    // The restore's position is recorded before the park is read from
+    // the stream; where it cannot be, the park is read from the settled
+    // checkpoint instead, so its controls are still captured.
+    let unrecorded: unknown;
+    try { await this.completeRestore(entry); }
+    catch (error) {
+      console.error(`spex: restored position not recorded: ${String(error)}`);
+      unrecorded = (recovery as {snapshot?: unknown}).snapshot;
+    }
+    this.captureParkedRun(entry, unrecorded);
+    try {
+      await entry.controller.dispose();
+      this.live.delete(id);
+      this.store.setLocalSession(id, false);
+    } catch (error) {
+      console.error(`spex: runtime release failed; ownership retained: ${String(error)}`);
+    }
+  }
+
+  private record(sessionId: string, entry: ReplayStreamEntry, live?: LiveSession): void {
+    if (entry.seq <= this.store.maxSeq(sessionId)) return;
+    const record = entry.record as unknown as TmuxPlayRecord;
+    this.store.appendRecord(sessionId, entry.seq, record, entry.role);
+    this.store.foldStoredRecord(sessionId, record);
+    if (live) live.seq = entry.seq;
+    if (record.type === "turn_started" && live?.pendingIntentId) {
+      const turn = (record as {turn: {id: number}}).turn;
+      this.store.stampIntentDispatch(live.pendingIntentId, sessionId, turn.id, record.timestamp);
+      live.pendingIntentId = undefined;
+    }
+    if (record.type === "turn_started" && live) {
+      const owner = this.store.listSessionDispatches(sessionId).at(-1);
+      live.turnIntentId = owner?.open ? owner.intentId : undefined;
+    }
+    this.onRecord({sessionId, seq: entry.seq, record, hidden: entry.record.visibility === "hidden", ...(entry.role ? {role:entry.role} : {})});
+    if (live) {
+      void this.publish(sessionId);
+      this.onLedgerChange(live.info.projectId);
+    }
+  }
+
+  /** Record a failure of the core's own, naming the turn it lies in, or
+   * none where it came before any turn of its own started
+   * (core-service-135). */
+  private async appendError(entry: LiveSession, message: string, turnId: number | null = null): Promise<void> {
+    const afterSeq = this.store.maxSeq(entry.info.id);
+    await entry.controller.lease.append({type:"runtime_error", turnId, timestamp:this.now(), message});
+    const added = await entry.controller.lease.readStream({afterSeq});
+    for (const item of added.entries) this.record(entry.info.id, item, entry);
+  }
+
+  /** Persist which kind of control produced a turn. The Captain's
+   * ordinary turn record carries only the control label, which is not
+   * enough to distinguish recovery from ending after a restart. */
+  private async appendControl(
+    entry: LiveSession,
+    turnId: number,
+    kind: TurnControlKind,
+  ): Promise<void> {
+    const afterSeq = this.store.maxSeq(entry.info.id);
+    await entry.controller.lease.append(controlRecord(turnId, kind, this.now()));
+    const added = await entry.controller.lease.readStream({ afterSeq });
+    for (const item of added.entries) this.record(entry.info.id, item, entry);
+  }
+
+  /** Assign a new session to this runtime (storage-43, DR-134): one
+   * hidden record naming it, written once under the session's lease so
+   * it rides the session bundle, and never rewritten. */
+  private async appendRuntime(entry: LiveSession, runtime: AssignedRuntime): Promise<void> {
+    const afterSeq = this.store.maxSeq(entry.info.id);
+    await entry.controller.lease.append(runtimeRecord(runtime, this.now()));
+    const added = await entry.controller.lease.readStream({ afterSeq });
+    for (const item of added.entries) this.record(entry.info.id, item, entry);
+  }
+
+  /** Mark the restore before it runs (core-service-82, DR-088): the
+   * visible marker names the turn that next starts with the saved input
+   * as the restore's report, so that turn reads as one — and its
+   * position can still be recorded — whatever stops the core after. */
+  private async appendRestoring(entry: LiveSession, input: string): Promise<void> {
+    const afterSeq = this.store.maxSeq(entry.info.id);
+    await entry.controller.lease.append(restoringRecord(input, this.now()));
+    const added = await entry.controller.lease.readStream({ afterSeq });
+    for (const item of added.entries) this.record(entry.info.id, item, entry);
+  }
+
+  /** Record the position a restore settled (core-service-82, DR-088),
+   * once, for a report still standing without one. Playbook's report
+   * moves no traced state — a run restored into its failure state never
+   * traced the move — so the stream would go on showing where the lost
+   * turn last was. The settled checkpoint says where each run stands;
+   * one visible record carries that, before the settlement's release
+   * reads the park from the stream. */
+  private async completeRestore(entry: LiveSession, justRestored = false): Promise<void> {
+    const records = this.store.getRecords(entry.info.id);
+    let turnId = pendingRestore(records)?.turnId;
+    // The report the restore just settled is its last turn, whatever
+    // the marker could name.
+    if (turnId === undefined && justRestored) {
+      const last = this.store.listTurns(entry.info.id).at(-1)?.turnId;
+      const recorded = restoreReports(records).some((report) => report.turnId === last && report.positionSeq !== undefined);
+      if (!recorded) turnId = last;
+    }
+    if (turnId === undefined) return;
+    const settled = await entry.controller.read();
+    // English, deliberately (core-service-111): the report settled, so
+    // an unsettled read is an internal fault.
+    if (settled?.state !== "settled") throw new Error("the restore settled no readable checkpoint");
+    const afterSeq = this.store.maxSeq(entry.info.id);
+    await entry.controller.lease.append(restoredRecord(turnId, restoredRuns(settled.snapshot), this.now()));
+    const added = await entry.controller.lease.readStream({ afterSeq });
+    for (const item of added.entries) this.record(entry.info.id, item, entry);
+  }
+
+  /** Complete every restore a stopped core left unrecorded
+   * (core-service-82) in the named sessions — every session, at start —
+   * that no one holds: under its lease, the settled checkpoint's
+   * position is appended once, and the session's history and summary
+   * refresh with it. A session held elsewhere is left to the next open,
+   * and one assigned to another runtime — its `runsOn`, the label
+   * `runsElsewhere` reads from its runtime record against this home's
+   * device — is left as it is, that runtime's to complete (storage-43,
+   * DR-134); one naming no runtime is completed as before. */
+  async completeRestores(ids?: Iterable<string>): Promise<void> {
+    const named = ids ? new Set(ids) : undefined;
+    for (const session of this.store.listSessions()) {
+      if (named && !named.has(session.id)) continue;
+      if (session.runsOn !== undefined) continue;
+      if (session.live || session.externalWriter || this.live.has(session.id) || this.settling.has(session.id)) continue;
+      const pending = pendingRestore(this.store.getRecords(session.id));
+      if (!pending) continue;
+      try {
+        const lease = await this.store.sessionStoreFor(session.id).acquire(session.id);
+        try {
+          const settled = await lease.read();
+          if (settled?.state !== "settled") continue;
+          await lease.append(restoredRecord(pending.turnId, restoredRuns(settled.snapshot), this.now()));
+        } finally { await lease.release(); }
+        const update = await this.store.refreshSession(session.id, false);
+        for (const entry of update?.appended ?? []) {
+          this.onRecord({
+            sessionId: session.id, seq: entry.seq, record: entry.record,
+            hidden: "visibility" in entry.record && entry.record.visibility === "hidden",
+            ...(entry.role ? { role: entry.role } : {}),
+          });
+        }
+        await this.publish(session.id);
+        this.onLedgerChange(session.projectId);
+      } catch (error) {
+        console.error(`spex: restored position not recorded for ${session.id}: ${String(error)}`);
+      }
+    }
+  }
+
+  /** What the opened shell advertises now (core-service-98): the
+   * parked leaf's own actions for a recovery, the shell's own controls
+   * for an ending. An unreadable control view advertises nothing
+   * rather than failing in a way a notice cannot explain. Fields the
+   * installed runtime does not report are simply absent. */
+  private advertised(entry: LiveSession, kind: "recovery" | "ending"): ParkedRunAction[] {
+    const controller = entry.controller as {
+      listRuntimeActions?(): readonly Partial<ParkedRunAction>[];
+      listShellActions?(): readonly Partial<ParkedRunAction>[];
+    };
+    let offered: readonly Partial<ParkedRunAction>[] = [];
+    try {
+      offered = (kind === "recovery" ? controller.listRuntimeActions?.() : controller.listShellActions?.()) ?? [];
+    } catch { offered = []; }
+    return offered.flatMap((action) => typeof action?.id === "string" && typeof action.label === "string" ? [{
+      id: action.id, label: action.label,
+      ...(action.standing ? {standing: action.standing} : {}),
+      ...(action.reason ? {reason: action.reason} : {}),
+    }] : []);
+  }
+
+  /** The parked run's advertised controls, read at settlement while the
+   * shell is still held — the only moment they can be read without
+   * opening the session — and kept with the local preferences, so the
+   * summary carries them after a restart (core-service-32, DR-074). A
+   * settlement that finds no run parked leaves no reading behind. */
+  private captureParkedRun(entry: LiveSession, unrecorded?: unknown): void {
+    const id = entry.info.id;
+    const records = this.store.getRecords(id);
+    const pending = unrecorded !== undefined ? pendingRestore(records) : undefined;
+    const conditions = foldConditions(pending
+      ? [...records, { seq: Number.MAX_SAFE_INTEGER, record: restoredRecord(pending.turnId, restoredRuns(unrecorded), this.now()) }]
+      : records);
+    const reason = conditions.failure ? "failure" as const : conditions.question ? "question" as const : undefined;
+    const actions = reason ? this.advertised(entry, "recovery") : [];
+    const ending = reason ? this.advertised(entry, "ending")[0] : undefined;
+    try {
+      this.store.setParkedRun(id, reason && (actions.length > 0 || ending)
+        ? {reason, actions, ...(ending ? {ending: {id: ending.id, label: ending.label}} : {})}
+        : undefined);
+    } catch (error) {
+      console.error(`spex: parked-run controls not recorded: ${String(error)}`);
+    }
+  }
+
+  /** core-service-98: run one advertised control as the next turn. */
+  submitControl(sessionId: string, kind: "recovery" | "ending", actionId?: string): void {
+    const entry = this.requireLive(sessionId);
+    if (entry.turnActive) throw new CoreError("busy", i18n._({
+      id: "a turn is already running in this session",
+      comment: "Refusal: this conversation is mid-turn",
+    }));
+    if (this.store.describeSession(sessionId)?.recovery) throw new CoreError("invalid_request", i18n._({
+      id: "Restore the interrupted turn first",
+      comment: "Refusal; Restore is the control the interface offers for interrupted work",
+    }));
+    // The runtime is held only for a turn (core-service-91), so what a
+    // run advertises can be read only while the session is open — which
+    // it is by the time this runs. The named control is validated here,
+    // at activation, against what the opened shell advertises now,
+    // never against the reading the client held.
+    const offered = this.advertised(entry, kind);
+    const control = actionId === undefined ? offered[0] : offered.find((action) => action.id === actionId);
+    if (!control) {
+      throw new CoreError(
+        "invalid_request",
+        actionId !== undefined
+          ? kind === "recovery"
+            ? i18n._({
+                id: "This run no longer offers “{actionId}”.",
+                comment:
+                  "Refusal: the recovery the reader activated is no longer advertised; the id is the runtime's own",
+                values: { actionId },
+              })
+            : i18n._({
+                id: "This session no longer offers “{actionId}” to end its run.",
+                comment:
+                  "Refusal: the ending the reader activated is no longer advertised; the id is the runtime's own",
+                values: { actionId },
+              })
+          : kind === "recovery"
+            ? i18n._({
+                id: "This run offers no recovery to rerun.",
+                comment: "Refusal: the run advertises no recovery action",
+              })
+            : i18n._({
+                id: "This session offers no way to end its run.",
+                comment: "Refusal: the run advertises no ending action",
+              }),
+      );
+    }
+    this.startTurn(entry, undefined, false, { kind, controlId: control.id });
+  }
+
+  /** The same control, awaited to its settlement (DR-073): a caller that
+   * rules on what the control did — the Drop that ends a parked run
+   * before it records its verdict — reads a settled session. */
+  async runControl(sessionId: string, kind: "recovery" | "ending", actionId?: string): Promise<void> {
+    this.submitControl(sessionId, kind, actionId);
+    await this.live.get(sessionId)?.operation;
+    await this.settled(sessionId);
+  }
+
+  /** Publish independent session-owned copies before the core acknowledges a
+   * content-bearing turn. The lifecycle's existing lease guards every write. */
+  async importAttachments(sessionId: string, source: OwnerAssetStore, references: readonly MediaAsset[]): Promise<readonly MediaAsset[]> {
+    await source.prepare();
+    const entry = this.requireLive(sessionId);
+    if (entry.turnActive) throw new CoreError("busy", i18n._({id: "A turn is already running in this session.", comment: "Refusal during attachment admission"}));
+    const copied: MediaAsset[] = [];
+    for (const reference of references) {
+      const input = await source.resolveAttachment(reference);
+      const stored = await entry.controller.lease.importAsset({ path: input.path, mimeType: reference.mimeType, ...(reference.name ? {name: reference.name} : {}) });
+      if (stored.assetId !== reference.assetId || stored.byteLength !== reference.byteLength) throw new CoreError("invalid_request", i18n._({id: "The attachment changed before it could be submitted. Retry the upload.", comment: "Attachment transfer or storage diagnostic"}));
+      copied.push(stored);
+    }
+    return Object.freeze(copied);
+  }
+
+  submitTurn(sessionId: string, text: string, intentId?: string, attachments?: readonly MediaAsset[]): void {
+    this.assertAdmission();
+    const entry = this.requireLive(sessionId);
+    if (entry.turnActive) throw new CoreError("busy", i18n._({
+      id: "a turn is already running in this session",
+      comment: "Refusal: this conversation is mid-turn",
+    }));
+    if (this.store.describeSession(sessionId)?.recovery) throw new CoreError("invalid_request", i18n._({
+      id: "Restore the interrupted turn first",
+      comment: "Refusal; Restore is the control the interface offers for interrupted work",
+    }));
+    entry.pendingIntentId = intentId;
+    this.startTurn(entry, attachments?.length ? {text, attachments} : text, false);
+  }
+
+  private startTurn(entry: LiveSession, text: string | SessionTurnInput | undefined, restore: { input: string } | false, control?: { kind: "recovery" | "ending"; controlId: string }): void {
+    this.assertAdmission();
+    entry.turnIntentId = undefined;
+    entry.pendingAbort = undefined;
+    entry.turnActive = true;
+    // Where this operation's own turn starts: a failure after it names
+    // that turn, one before it names none (core-service-135).
+    const operationSeq = this.store.maxSeq(entry.info.id);
+    // A turn accepted while a run waits on the Boss's question answers
+    // it or asks it back (DR-119), so the question the last settlement
+    // read leaves now; this turn's own settlement reads the run afresh
+    // (core-service-32, core-service-91).
+    if (this.store.parkedRun(entry.info.id)?.reason === "question") {
+      try { this.store.setParkedRun(entry.info.id, undefined); }
+      catch (error) { console.error(`spex: parked-run controls not cleared: ${String(error)}`); }
+    }
+    void this.publish(entry.info.id);
+    entry.operation = (async () => {
+      let failed = false;
+      try {
+        if (restore) {
+          await this.appendRestoring(entry, restore.input);
+          await entry.controller.recover();
+          await this.completeRestore(entry, true);
+        } else if (control) {
+          const controller = entry.controller as {
+            submitRuntimeAction(id: string): Promise<unknown>;
+            submitShellAction(id: string): Promise<unknown>;
+          };
+          await (control.kind === "recovery"
+            ? controller.submitRuntimeAction(control.controlId)
+            : controller.submitShellAction(control.controlId));
+          const turnId = this.store.listTurns(entry.info.id).at(-1)?.turnId;
+          if (turnId !== undefined) await this.appendControl(entry, turnId, control.kind);
+        } else await entry.controller.handleBossTurn(text!);
+      } catch (error) {
+        failed = true;
+        // The runtime reports an intentional stop through the same
+        // rejected promise as a fault, after durably ending its turn as
+        // aborted. Its stopped outcome is sufficient evidence; recording
+        // a runtime_error as well would misclassify it as failure.
+        const stopped = this.intentionalStops.has(entry.info.id);
+        if (!stopped) {
+          const started = this.store.getRecords(entry.info.id, {afterSeq: operationSeq})
+            .filter(({record}) => record.type === "turn_started").at(-1)?.record as {turn?: {id?: unknown}; turnId?: unknown} | undefined;
+          const turnId = started?.turn?.id ?? started?.turnId;
+          try { await this.appendError(entry, error instanceof Error ? error.message : String(error), typeof turnId === "number" ? turnId : null); }
+          catch { /* The lifecycle retains incomplete evidence and ownership. */ }
+        }
+      } finally {
+        this.options.cancelApprovals?.(entry.info.id);
+        entry.turnActive = false;
+        entry.pendingAbort = undefined;
+        entry.pendingIntentId = undefined;
+        const turnId = this.store.listTurns(entry.info.id).at(-1)?.turnId;
+        const intentId = entry.turnIntentId;
+        // Register before cleanup starts, including the failed/aborted
+        // path, and keep the barrier after cleanup removes the runtime.
+        const done = Promise.resolve().then(async () => {
+          // A stop that gave up on this turn released its lease and is
+          // closing the store: the turn stands as it was cut
+          // (core-service-39).
+          if (this.abandoned) return;
+          // A turn that stopped after saving progress — an abort or a
+          // failure — settles at that position (DR-088), where its run
+          // may stand parked: it is released as a settled turn is, its
+          // controls captured with it (core-service-32). Only a turn
+          // left uncertain is disposed, and whatever an earlier
+          // settlement read of its run no longer stands.
+          let settledAfterStop = false;
+          if (failed) {
+            try { settledAfterStop = (await entry.controller.read())?.state === "settled"; }
+            catch { settledAfterStop = false; }
+          }
+          if (failed && !settledAfterStop) {
+            try { this.store.setParkedRun(entry.info.id, undefined); }
+            catch (error) { console.error(`spex: parked-run controls not cleared: ${String(error)}`); }
+            try { await entry.controller.dispose(); this.live.delete(entry.info.id); this.store.setLocalSession(entry.info.id, false); }
+            catch (error) { console.error(`spex: session cleanup failed; ownership retained: ${String(error)}`); }
+          } else {
+            await this.releaseAtSettle(entry);
+          }
+          await this.store.refreshSession(entry.info.id, this.live.has(entry.info.id));
+          await this.publish(entry.info.id);
+          this.onLedgerChange(entry.info.projectId);
+        });
+        this.settling.set(entry.info.id, {projectId: entry.info.projectId, done});
+        try { await done; }
+        finally {
+          this.settling.delete(entry.info.id);
+          this.intentionalStops.delete(entry.info.id);
+        }
+        // A restore only reports: what runs next is the Boss's choice,
+        // so it hands no queued intent on (core-service-82, DR-088).
+        if (!failed && !restore && turnId !== undefined && !this.abandoned) {
+          this.onTurnSettled(entry.info.id, turnId, intentId, control?.kind);
+        }
+      }
+    })().catch((error) => console.error(`spex: session state refresh failed: ${String(error)}`));
+  }
+
+  abortTurn(sessionId: string): boolean {
+    const entry = this.requireLive(sessionId);
+    if (!entry.turnActive) return false;
+    this.stopActiveTurn(entry, BOSS_ABORT_REASON);
+    return true;
+  }
+
+  private stopActiveTurn(entry: LiveSession, reason: string): void {
+    this.intentionalStops.add(entry.info.id);
+    try {
+      // The runtime aborts only a turn it has begun, and it begins the
+      // turn after the shared lifecycle has prepared it — the lease
+      // marked, the repository reconciled — so an abort requested in
+      // that window would be lost and the first call would run its
+      // whole length under a live signal. The reason is held on the
+      // entry as well, and applied as the runtime begins the turn
+      // (core-service-6).
+      entry.pendingAbort = reason;
+      (entry.runtime.abortActiveTurn as (reason?: string) => void)(reason);
+      this.options.cancelApprovals?.(entry.info.id);
+    } catch (error) {
+      entry.pendingAbort = undefined;
+      this.intentionalStops.delete(entry.info.id);
+      throw error;
+    }
+  }
+
+  async disposeSession(sessionId: string): Promise<void> {
+    if (!this.live.has(sessionId) && this.settling.has(sessionId)) {
+      await this.settled(sessionId);
+      return;
+    }
+    const entry = this.requireLive(sessionId);
+    if (entry.turnActive) {
+      this.stopActiveTurn(entry, CORE_STOP_REASON);
+    }
+    this.options.cancelApprovals?.(sessionId);
+    await entry.operation;
+    // The turn's own settlement may have released the runtime already;
+    // a stop that gave up on it has released its lease.
+    if (!this.live.has(sessionId) || this.abandoned) return;
+    await entry.controller.dispose();
+    this.failedOpenings.delete(sessionId);
+    this.opening.delete(entry.info.projectId);
+    this.live.delete(sessionId);
+    this.store.setLocalSession(sessionId, false);
+    await this.store.refreshSession(sessionId, false);
+    await this.publish(sessionId);
+    this.onLedgerChange(entry.info.projectId);
+  }
+  /** Abort every active turn with `reason` as a stop closes admission
+   * (core-service-39, DR-134). Resolves once those turns, and any
+   * release already in flight, have settled; undefined when there are
+   * none. */
+  abortAll(reason: string): Promise<void> | undefined {
+    const active = [...this.live.values()].filter((entry) => entry.turnActive);
+    for (const entry of active) {
+      try { this.stopActiveTurn(entry, reason); }
+      catch (error) { console.error(`spex: turn not aborted at stop: ${String(error)}`); }
+    }
+    const settling = [...this.settling.values()].map(({done}) => done);
+    if (!active.length && !settling.length) return undefined;
+    return Promise.allSettled([...active.map((entry) => entry.operation), ...settling]).then(() => {});
+  }
+
+  /** Dispose every runtime (core-service-39). With a `deadline`, the
+   * cleanup still unconfirmed when it passes is reported as such and
+   * its lease released — the stop has killed the agents — and a turn
+   * settling afterwards writes nothing. */
+  async disposeAll(deadline?: Promise<void>): Promise<void> {
+    let expired = false;
+    const cut = deadline?.then(() => { expired = true; });
+    const within = (work: Promise<unknown>): Promise<unknown> => cut ? Promise.race([work, cut]) : work;
+    let opened = false;
+    await within((this.shutdownOpenings ?? Promise.all([...this.openingOperations])).then(() => { opened = true; }));
+    const ids = new Set([...this.live.keys(), ...this.settling.keys()]);
+    const settled = new Map<string, PromiseSettledResult<void>>();
+    if (!expired) await within(Promise.all([...ids].map((id) => this.disposeSession(id).then(
+      () => { settled.set(id, {status: "fulfilled", value: undefined}); },
+      (reason: unknown) => { settled.set(id, {status: "rejected", reason}); },
+    ))));
+    const failures = [...this.failedOpenings.values()];
+    failures.push(...[...settled.values()].flatMap((result) => result.status === "rejected" ? [result.reason] : []));
+    if (expired) {
+      this.abandoned = true;
+      if (!opened) failures.push(new Error("a session opening was not confirmed within the stop's bounds"));
+      const unconfirmed = [...new Set([...ids, ...this.live.keys(), ...this.settling.keys()])].filter((id) => !settled.has(id));
+      for (const id of unconfirmed) failures.push(new Error(`session ${id} cleanup was not confirmed within the stop's bounds`));
+      await Promise.all(unconfirmed.map(async (id) => {
+        try { await this.live.get(id)?.controller.lease.release(); }
+        catch (error) { console.error(`spex: session lease not released at stop: ${String(error)}`); }
+      }));
+    }
+    if (failures.length) throw new AggregateError([...new Set(failures)], "session cleanup was not confirmed");
+  }
+  private async publish(sessionId: string): Promise<void> {
+    const session = this.store.describeSession(sessionId);
+    const entry = this.live.get(sessionId);
+    if (!session) return;
+    const reported = {...session, ...(entry ? {externalWriter:undefined} : {}), live:!!entry, turnActive:entry?.turnActive ?? false};
+    await this.onSessionState(entry?.turnActive ? holdingTurn(reported) : reported);
+  }
+
+  private requireLive(sessionId: string): LiveSession {
+    const entry = this.live.get(sessionId);
+    if (!entry) throw new CoreError("not_found", i18n._({
+      id: "no live session {sessionId}",
+      comment: "Refusal: the session named holds no runtime right now",
+      values: { sessionId },
+    }));
+    return entry;
+  }
+  private failure(error: unknown, fallback: CoreError["code"] = "invalid_request"): CoreError {
+    if (error instanceof CoreError) return error;
+    const message = error instanceof Error ? error.message : String(error);
+    return new CoreError(/lease|already active|already held|owned by/.test(message) ? "busy" : /structur|execution config|catalog.*(changed|mismatch)|players.*(changed|mismatch)/i.test(message) ? "invalid_config" : fallback, message);
+  }
+}

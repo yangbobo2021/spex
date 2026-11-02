@@ -1,0 +1,1916 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// run-view-70/72: the sidebar is the navigator and the tabs are the
+// working set (DR-029), and the chrome folds without dropping a duty
+// (DR-030). Both drive the whole App against store state, because the
+// contract is about how the rail, the strip and the run view agree.
+
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
+
+afterEach(cleanup);
+
+const { commandMock } = vi.hoisted(() => ({ commandMock: vi.fn() }));
+
+/** The reply a command with no test-specific answer gets.
+ *
+ * `{}` is not a legal reply for every command, and a stub that hands
+ * one back tests nothing — it makes the view crash on a shape the core
+ * never sends. `specs.get` promises a parsed tree carrying its lists,
+ * empty when the project has no `specs/` directory rather than absent
+ * (spec-view-10), so that is what an unanswered `specs.get` replies
+ * here. Add a command to this table rather than teaching a caller to
+ * survive a reply the protocol forbids. */
+function defaultReply(type: string): object {
+  return type === "specs.get"
+    ? { present: false, legacy: false, files: [], decisions: [], intents: [], notices: [], readAt: 0 }
+    : type === "environment.get"
+      ? { repository: "p1", language: null, requests: {}, packages: [], stale: null, conflicts: null, busy: null, error: null }
+      : type === "environment.playbooks"
+        ? { project: [], own: [] }
+        : type === "space.get"
+          ? groupsState()
+          : type === "draft.list"
+            ? []
+            : type === "draft.defaults"
+              ? { org: "me", license: "Apache-2.0" }
+              : {};
+}
+
+vi.mock("./state/store.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./state/store.js")>();
+  return { ...actual, getClient: () => ({ command: commandMock }) };
+});
+
+import { App } from "./App.js";
+import {
+  deliverServerMessageForTests,
+  setClientForTests,
+  useAppStore,
+} from "./state/store.js";
+import { applyRecords, initialSessionView, type SessionView } from "./state/reducer.js";
+import { keyLabel } from "./lib/shortcuts.js";
+import type { SessionInfo, TmuxPlayRecord } from "@sublang/spex-core/protocol";
+import { currentLocale } from "./i18n.js";
+import { groupsState, instanceState, namespace, repositoryRow } from "./fixtures/groups-state.js";
+
+// A live clock: the rows print ages relative to now.
+const NOW = Date.now();
+const PLAYERS = [{ id: "dev.coder", adapter: "claude" as const }];
+
+function session(over: Partial<SessionInfo> & { id: string }): SessionInfo {
+  return {
+    projectId: "p1",
+    projectPath: "/tmp/alpha",
+    createdAt: NOW - 60_000,
+    live: false,
+    endedAt: NOW - 30_000,
+    // Idle by default (DR-051): a message continues it.
+    continuable: true,
+    players: PLAYERS,
+    initialVisible: ["dev.coder"],
+    turns: 1,
+    failed: false,
+    ...over,
+  };
+}
+
+/** A loaded transcript whose lanes a call has reached, so each stands
+ * (run-view-7); `question` parks it awaiting a Boss reply. */
+function view(question?: string): SessionView {
+  const loaded = applyRecords(initialSessionView(PLAYERS), PLAYERS.map(({ id }, index) => ({
+    seq: 901 + index,
+    record: { type: "player_finished", turnId: 1, timestamp: 901 + index, playerId: id,
+      result: { status: "ok", playerId: id, turnId: 1 } } as unknown as TmuxPlayRecord,
+  })));
+  loaded.loading = false;
+  if (question) loaded.pendingQuestion = question;
+  return loaded;
+}
+
+const OLD_ENDED = Array.from({ length: 6 }, (_, index) =>
+  session({
+    id: `old-${index}`,
+    title: `older work ${index}`,
+    endedAt: NOW - 3_600_000 * (index + 2),
+  }),
+);
+
+const SESSIONS: SessionInfo[] = [
+  session({
+    id: "a-live",
+    title: "harden the session refresh",
+    live: true,
+    endedAt: null,
+    createdAt: NOW - 120_000,
+    turns: 2,
+  }),
+  session({
+    id: "a-failed",
+    title: "chase the flaky test",
+    failed: true,
+    endedAt: NOW - 600_000,
+  }),
+  session({ id: "a-bare", turns: 0, endedAt: NOW - 900_000 }),
+  ...OLD_ENDED,
+  session({
+    id: "b-live",
+    projectId: "p2",
+    projectPath: "/tmp/beta",
+    title: "beta is asking",
+    live: true,
+    endedAt: null,
+  }),
+  session({
+    id: "b-ended",
+    projectId: "p2",
+    projectPath: "/tmp/beta",
+    title: "beta wrapped up",
+    // History the core cannot continue: read-only.
+    continuable: false,
+    continuationReason: "session replay is incomplete",
+  }),
+];
+
+// The one attention fold (DR-035): the badge and every dot re-source
+// from the core-derived ledger, so the fixture serves one.
+const LEDGER = {
+  intents: [],
+  attention: [
+    {
+      band: "interrupted",
+      kind: "question",
+      title: "Which migration should I run first?",
+      projectId: "p1",
+      sessionId: "a-live",
+      since: NOW - 60_000,
+    },
+    {
+      band: "interrupted",
+      kind: "question",
+      title: "Should I rebase?",
+      projectId: "p2",
+      sessionId: "b-live",
+      since: NOW - 30_000,
+    },
+  ],
+  badge: 2,
+} as never;
+
+function seed(): void {
+  useAppStore.setState({
+    connection: "open",
+    everConnected: true,
+    projects: [
+      { id: "p1", name: "alpha", path: "/tmp/alpha", registeredAt: 0, repository: { key: "p1", name: "alpha-spex", group: "me", own: true } },
+      { id: "p2", name: "beta", path: "/tmp/beta", registeredAt: 1, repository: { key: "p2", name: "beta-spex", group: "me", own: true } },
+    ] as never,
+    projectMeta: {},
+    space: undefined,
+    sessions: SESSIONS,
+    views: {
+      "a-live": view("Which migration should I run first?"),
+      "b-live": view("Should I rebase?"),
+      "b-ended": view(),
+    },
+    composers: {},
+    runErrors: {},
+    currentProjectId: "p1",
+    activeSessionId: "a-live",
+    workspaceTabs: { p1: "a-live" },
+    openTabs: { p1: ["a-live"] },
+    expandedProjects: {},
+    railCollapsed: false,
+    captainSplit: 45,
+    specTrees: {},
+    specErrors: {},
+    homeDraft: "",
+    readiness: [],
+    machineGraphs: {},
+    ledger: LEDGER,
+    stagedIntents: {},
+    history: {},
+    configState: {
+      status: "valid",
+      summary: { playbooks: [], captain: undefined },
+    } as never,
+    projectConfigs: {},
+  });
+}
+
+// jsdom has no layout, so the strip's keep-in-view call needs a stub.
+Element.prototype.scrollIntoView = vi.fn();
+
+beforeEach(() => {
+  commandMock.mockReset();
+  // The App re-pulls the ledger once connected (DR-035): the default
+  // reply must keep serving the seeded fold.
+  commandMock.mockImplementation(async (type: string) =>
+    type === "ledger.get" ? (LEDGER as object) : defaultReply(type),
+  );
+  // Store actions resolve the module-local client, which the module
+  // mock above cannot reach.
+  setClientForTests({
+    command: commandMock,
+    subscribe: vi.fn(async () => {}),
+  } as never);
+  seed();
+});
+
+describe("run-view-70: the sidebar navigates, the tabs hold what is open", () => {
+  test("session ages span the compact vocabulary with exact and accessible readings", () => {
+    const moments = [
+      { id: "age-now", at: NOW + 60_000, compact: "now", spoken: "just now", live: true },
+      { id: "age-minute", at: NOW - 3 * 60_000, compact: "3m", spoken: "3m ago", live: false },
+      { id: "age-hour", at: NOW - 2 * 3_600_000, compact: "2h", spoken: "2h ago", live: false },
+      { id: "age-day", at: NOW - 5 * 24 * 3_600_000, compact: "5d", spoken: "5d ago", live: false },
+      { id: "age-week", at: NOW - 3 * 7 * 24 * 3_600_000, compact: "3w", spoken: "3w ago", live: false },
+    ] as const;
+    const sessions = moments.map((moment) => session({
+      id: moment.id,
+      title: moment.id,
+      live: moment.live,
+      createdAt: moment.live ? moment.at : NOW - 30 * 24 * 3_600_000,
+      endedAt: moment.live ? null : moment.at,
+    }));
+    useAppStore.setState({
+      sessions,
+      views: { "age-now": view() },
+      activeSessionId: "age-now",
+      workspaceTabs: { p1: "age-now" },
+      openTabs: { p1: ["age-now"] },
+      ledger: { intents: [], attention: [], badge: 0 } as never,
+    });
+
+    render(<App />);
+
+    for (const moment of moments) {
+      const age = screen.getByTestId(`sidebar-age-${moment.id}`);
+      const row = screen.getByTestId(`sidebar-session-${moment.id}`);
+      expect(age.textContent).toBe(moment.compact);
+      expect(age.title).toBe(new Date(moment.at).toLocaleString(currentLocale()));
+      expect(row.getAttribute("aria-label")).toContain(moment.spoken);
+    }
+  });
+
+  test.each(["loaded transcript", "session summary"])("an earlier delivery stays counted without marking later work as waiting for a reply (%s)", async (source) => {
+    render(<App />);
+    await act(async () => {});
+    const working = view();
+    working.turnActive = true;
+    working.currentTurnId = 2;
+    act(() => useAppStore.setState({
+      views: source === "session summary" ? {} : { ...useAppStore.getState().views, "a-live": working },
+      sessions: SESSIONS.map((session) => source === "session summary" && session.id === "a-live"
+        ? { ...session, turnActive: true } : session),
+      ledger: {
+        intents: [],
+        attention: [{
+          band: "finished",
+          kind: "finish",
+          intentId: "i-first",
+          title: "The earlier delivery",
+          projectId: "p1",
+          sessionId: "a-live",
+          turnId: 1,
+          since: NOW - 60_000,
+        }],
+        badge: 1,
+      },
+    }));
+    expect(screen.getByTestId("nav-attention-badge").textContent).toBe("1");
+    expect(screen.getByTestId("sidebar-mark-a-live").dataset.life).toBe("running");
+    expect(screen.getByTestId("sidebar-session-a-live").getAttribute("aria-label"))
+      .not.toContain("waiting for your reply");
+    expect(screen.getByRole("tab", { name: /^harden the session refresh/ }).getAttribute("aria-label"))
+      .not.toContain("needs your reply");
+  });
+
+  test("rows read as conversations, attention first, history quiet", () => {
+    render(<App />);
+
+    // Dashboard stands first and carries the cross-project count
+    // (run-view-34): both live sessions are waiting.
+    const rail = screen.getByTestId("sidebar");
+    const entries = Array.from(rail.querySelectorAll("button")).map(
+      (button) => button.textContent,
+    );
+    expect(entries[0]).toContain("Dashboard");
+    expect(screen.getByTestId("nav-attention-badge").textContent).toBe("2");
+
+    // Past nine the badge prints "9+", the count in the entry's name
+    // and tooltip (run-view-108).
+    act(() => {
+      useAppStore.setState({
+        ledger: { ...(LEDGER as Record<string, unknown>), badge: 12 } as never,
+      });
+    });
+    expect(screen.getByTestId("nav-attention-badge").textContent).toBe("9+");
+    expect(screen.getByTestId("nav-attention-badge").title).toContain("12");
+    expect(
+      screen.getByRole("button", { name: "Dashboard — 12 need your attention" }),
+    ).toBeTruthy();
+    act(() => {
+      useAppStore.setState({ ledger: LEDGER });
+    });
+
+    // The current project is disclosed; its live row wears amber for
+    // the waiting question, not emerald for merely being alive.
+    const liveRow = screen.getByTestId("sidebar-session-a-live");
+    expect(liveRow.dataset.selected).toBeUndefined();
+    expect(
+      screen.getByTestId("sidebar-mark-a-live").dataset.life,
+    ).toBe("question");
+    expect(liveRow.textContent).toContain("harden the session refresh");
+    // The compact age is printed with the exact moment on hover, and
+    // the fuller scent is in the accessible description (run-view-73).
+    expect(liveRow.textContent).toContain("2m");
+    expect(screen.getByTestId("sidebar-age-a-live").title).toBe(
+      new Date(NOW - 120_000).toLocaleString(currentLocale()),
+    );
+    expect(liveRow.getAttribute("aria-label")).toContain("2m ago");
+    expect(liveRow.getAttribute("aria-label")).toContain("2 turns");
+
+    // A failure still standing that summons nothing is history, not a
+    // summons; an idle session whose failure no longer stands reads
+    // plain idle (run-view-73, core-service-32).
+    expect(
+      screen.getByTestId("sidebar-mark-a-failed").dataset.life,
+    ).toBe("idle-failed");
+    expect(
+      screen.getByTestId("sidebar-session-a-failed").getAttribute("aria-label"),
+    ).toContain("held a failure");
+    expect(screen.getByTestId("sidebar-mark-old-0").dataset.life).toBe("idle");
+    expect(
+      screen.getByTestId("sidebar-session-old-0").getAttribute("aria-label"),
+    ).not.toContain("held a failure");
+
+    // A session that never spoke says so instead of faking a name.
+    expect(screen.getByTestId("sidebar-session-a-bare").textContent).toContain(
+      "no messages yet",
+    );
+
+    // The other project is collapsed and still shows it needs a human.
+    expect(screen.queryByTestId("sidebar-session-b-ended")).toBeNull();
+    expect(screen.getByTestId("sidebar-project-attention-p2")).toBeTruthy();
+  });
+
+  test("the recent window holds, and its control reveals the rest", () => {
+    render(<App />);
+    // Six ended sessions plus the live one: only five ended list.
+    expect(screen.queryByTestId("sidebar-session-old-5")).toBeNull();
+    fireEvent.click(screen.getByTestId("sidebar-more-p1"));
+    expect(screen.getByTestId("sidebar-session-old-5")).toBeTruthy();
+  });
+
+  test("a project's Specs entry shows that project with its Specs tab", () => {
+    render(<App />);
+    // On the project's own row: shown on the current project, revealed
+    // on hover or focus elsewhere (run-view-67).
+    expect(screen.getByTestId("sidebar-specs-p1").className).not.toContain("opacity-0");
+    expect(screen.getByTestId("sidebar-specs-p2").className).toContain("opacity-0");
+    expect(screen.getByTestId("sidebar-specs-p2").className).toContain("group-hover:opacity-100");
+    // A pointer control outside the tree's one tab stop (run-view-67).
+    expect(screen.getByTestId("sidebar-specs-p2").tabIndex).toBe(-1);
+    fireEvent.click(screen.getByTestId("sidebar-specs-p2"));
+    // The specs are a sidebar's step away (run-view-67).
+    expect(useAppStore.getState().currentProjectId).toBe("p2");
+    expect(useAppStore.getState().workspaceTabs.p2).toBe("specs");
+  });
+
+  test("disclosing another project leaves the workspace where it is", () => {
+    render(<App />);
+    fireEvent.click(screen.getByTestId("sidebar-disclose-p2"));
+    expect(screen.getByTestId("sidebar-session-b-ended")).toBeTruthy();
+    expect(useAppStore.getState().currentProjectId).toBe("p1");
+  });
+
+  test("selection follows the surface, and Projects restores it", () => {
+    render(<App />);
+    const rail = screen.getByTestId("sidebar");
+    const selectedRows = () =>
+      rail.querySelectorAll('[role="treeitem"][aria-selected="true"]');
+    const entry = (name: string) =>
+      within(rail).getByRole("button", { name });
+
+    // Projects is the surface: the current project is selected,
+    // and so is the session whose tab it is showing.
+    expect(selectedRows().length).toBe(2);
+    expect(
+      screen.getByTestId("sidebar-project-p1").getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(
+      screen.getByTestId("sidebar-session-a-live").getAttribute("aria-selected"),
+    ).toBe("true");
+
+    // Space is a place of its own: its entry is the only current one,
+    // and no row in the tree still reads as where the reader is.
+    fireEvent.click(entry("Space"));
+    expect(entry("Space").getAttribute("aria-current")).toBe("page");
+    expect(selectedRows().length).toBe(0);
+
+    // The store still remembers the project, so choosing Projects
+    // again lights the same rows.
+    fireEvent.click(entry("Projects"));
+    expect(
+      screen.getByTestId("sidebar-project-p1").getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(selectedRows().length).toBe(2);
+  });
+
+  test("a foreign session opens as a read-only tab, once", async () => {
+    commandMock.mockResolvedValue({ records: [] });
+    render(<App />);
+    fireEvent.click(screen.getByTestId("sidebar-disclose-p2"));
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("sidebar-session-b-ended"));
+    });
+    expect(useAppStore.getState().currentProjectId).toBe("p2");
+    expect(useAppStore.getState().openTabs.p2).toEqual(["b-ended"]);
+    // History the core cannot continue is read-only: the composer
+    // gives way to the notice (run-view-33).
+    expect(screen.getByTestId("history-notice")).toBeTruthy();
+    expect(screen.queryByTestId("boss-composer")).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("sidebar-session-b-ended"));
+    });
+    expect(useAppStore.getState().openTabs.p2).toEqual(["b-ended"]);
+  });
+
+  test("a turn settling keeps the transcript put and reads idle, never ended", async () => {
+    render(<App />);
+    // The boot's ledger read lands first, so the fold below is not
+    // overwritten by it.
+    await act(async () => {});
+    // There is no ending control (DR-051).
+    expect(screen.queryByTestId("end-session")).toBeNull();
+
+    // The core reports the runtime released at settlement: the tab
+    // must not move, nothing says ended, and the composer stands
+    // ready for the next message (run-view-69). The answered question
+    // leaves the ledger fold (intents.changed re-pulls it in
+    // production).
+    await act(async () => {
+      useAppStore.setState({
+        sessions: SESSIONS.map((entry) =>
+          entry.id === "a-live"
+            ? { ...entry, live: false, endedAt: NOW, continuable: true }
+            : entry,
+        ),
+        ledger: {
+          ...(LEDGER as { attention: { sessionId: string }[] }),
+          attention: (
+            LEDGER as { attention: { sessionId: string }[] }
+          ).attention.filter((entry) => entry.sessionId !== "a-live"),
+          badge: 1,
+        } as never,
+      });
+    });
+    expect(useAppStore.getState().openTabs.p1).toEqual(["a-live"]);
+    expect(screen.queryByTestId("history-notice")).toBeNull();
+    expect(screen.queryByTestId("session-last-active")).toBeNull();
+    expect(screen.getByTestId("boss-composer")).toBeTruthy();
+    expect(screen.queryByTestId("tab-history-a-live")).toBeNull();
+    const tab = screen.getByRole("tab", { name: /^harden the session refresh/ });
+    expect(tab.getAttribute("aria-label")).not.toMatch(/ended|history/);
+    expect(screen.getByTestId("sidebar-mark-a-live").dataset.life).toBe(
+      "idle",
+    );
+    expect(
+      screen.getByTestId("sidebar-session-a-live").getAttribute("aria-label"),
+    ).toContain("idle");
+  });
+
+  test("the tree walks by keyboard and keeps its own letters", async () => {
+    render(<App />);
+    const project = screen.getByTestId("sidebar-project-p1");
+    project.focus();
+
+    // One focus stop, arrow keys within it (run-view-67).
+    fireEvent.keyDown(project, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(
+      screen.getByTestId("sidebar-session-a-live"),
+    );
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowLeft" });
+    expect(document.activeElement).toBe(project);
+
+    // Disclosure by keyboard, and it never moves the workspace.
+    fireEvent.keyDown(project, { key: "ArrowLeft" });
+    expect(project.getAttribute("aria-expanded")).toBe("false");
+    expect(useAppStore.getState().currentProjectId).toBe("p1");
+
+    // Type-ahead reaches a session by its own first words, and the
+    // composer does not steal the letter (run-view-49).
+    fireEvent.keyDown(project, { key: "ArrowRight" });
+    fireEvent.keyDown(project, { key: "c" });
+    expect(document.activeElement).toBe(
+      screen.getByTestId("sidebar-session-a-failed"),
+    );
+  });
+
+  test("closing a tab files the session back, still listed", () => {
+    render(<App />);
+    fireEvent.click(screen.getByTestId("tab-close-a-live"));
+    expect(useAppStore.getState().openTabs.p1).toEqual([]);
+    // Closing stops nothing: no dispose was asked for.
+    expect(commandMock).not.toHaveBeenCalledWith(
+      "session.dispose",
+      expect.anything(),
+    );
+    expect(screen.getByTestId("sidebar-session-a-live")).toBeTruthy();
+  });
+});
+
+describe("dashboard-10/54: a session another runtime runs", () => {
+  test("reads the core's phrase as its reason, offers no continuation, Restore or Discard, and summons nothing here", async () => {
+    // As the core lists it (core-service-32): `runsOn` with that
+    // runtime's label, not continuable, the phrase as its reason, no
+    // recovery — whatever failed or was cut short there.
+    const elsewhere = session({
+      id: "elsewhere",
+      title: "ship the parser",
+      failed: true,
+      continuable: undefined,
+      continuationReason: "Runs on build-server",
+      runsOn: "build-server",
+    });
+    const ledger = { intents: [], attention: [], badge: 0 };
+    commandMock.mockImplementation(async (type: string) =>
+      type === "ledger.get"
+        ? ledger
+        : type === "history.get"
+          ? { records: [] }
+          : defaultReply(type),
+    );
+    useAppStore.setState({
+      sessions: [elsewhere],
+      views: { elsewhere: view() },
+      activeSessionId: "elsewhere",
+      workspaceTabs: { p1: "elsewhere" },
+      openTabs: { p1: ["elsewhere"] },
+      ledger: ledger as never,
+    });
+    render(<App />);
+    await act(async () => {});
+
+    // The history notice carries the phrase, and nothing continues,
+    // restores or discards it.
+    expect(screen.getByTestId("history-notice").textContent).toContain(
+      "Runs on build-server",
+    );
+    expect(screen.queryByTestId("boss-composer")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Interrupted turn" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Restore" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Discard" })).toBeNull();
+    // The fold serves no entry for it, and the surfaces add none: no
+    // badge, and its sidebar mark is quiet history, not a summons.
+    expect(screen.queryByTestId("nav-attention-badge")).toBeNull();
+    expect(screen.getByTestId("sidebar-mark-elsewhere").dataset.life).toBe(
+      "history",
+    );
+    expect(
+      commandMock.mock.calls.map(([type]) => type),
+    ).not.toContain("session.restore");
+  });
+});
+
+describe("run-view-72: the chrome folds without dropping a duty", () => {
+  test("the binding collapses and the foot control restores", () => {
+    const { unmount } = render(<App />);
+    expect(screen.getByTestId("sidebar").dataset.collapsed).toBe("0");
+
+    fireEvent.keyDown(window, { key: "b", metaKey: true });
+    const collapsed = screen.getByTestId("sidebar");
+    expect(collapsed.dataset.collapsed).toBe("1");
+    // The binding lands focus on the sidebar's own control, so
+    // collapsing never strands it (run-view-71).
+    expect(document.activeElement).toBe(screen.getByTestId("sidebar-collapse"));
+    // Collapsed entries keep their names and the count survives.
+    expect(screen.getByLabelText(/^Space$/)).toBeTruthy();
+    expect(screen.getByTestId("nav-attention-badge").textContent).toBe("2");
+    // Sessions stop listing, but the open tab is still the reach.
+    expect(screen.queryByTestId("sidebar-session-a-live")).toBeNull();
+    expect(screen.getByRole("tab", { selected: true })).toBeTruthy();
+    // The add control keeps its icon-only form under the Projects
+    // entry (DR-030): collapse never hides a duty.
+    const addProject = screen.getByLabelText("Add a local project");
+    expect(addProject.title).toBe("Add a local project");
+    fireEvent.click(addProject);
+    expect(screen.getByRole("dialog", { name: "Add a project" })).toBeTruthy();
+    expect(screen.getByTestId("palette-own-project")).toBeTruthy();
+    fireEvent.keyDown(screen.getByTestId("palette-path"), { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Add a project" })).toBeNull();
+
+    // Chrome state is a preference: it survives a remount.
+    unmount();
+    render(<App />);
+    expect(screen.getByTestId("sidebar").dataset.collapsed).toBe("1");
+
+    fireEvent.click(screen.getByTestId("sidebar-collapse"));
+    expect(screen.getByTestId("sidebar").dataset.collapsed).toBe("0");
+  });
+
+  test("a surface shortcut lands focus inside the surface it opens", () => {
+    render(<App />);
+    const main = screen.getByRole("main");
+    // From the Boss composer, Dashboard by number: the surface region,
+    // named for what it is, takes focus (run-view-50).
+    screen.getByTestId("boss-composer").focus();
+    fireEvent.keyDown(window, { key: "1", metaKey: true });
+    expect(main.getAttribute("aria-label")).toBe("Dashboard");
+    expect(main.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(document.body);
+    // Space by number, from the Dashboard's region (run-view-49).
+    fireEvent.keyDown(window, { key: "3", metaKey: true });
+    expect(main.getAttribute("aria-label")).toBe("Space");
+    expect(main.contains(document.activeElement)).toBe(true);
+    // Back to Projects by number: the composer is the stop.
+    fireEvent.keyDown(window, { key: "2", metaKey: true });
+    expect(document.activeElement).toBe(screen.getByTestId("boss-composer"));
+  });
+
+  test("a surface shortcut leaves focus in the open palette", () => {
+    render(<App />);
+    const main = screen.getByRole("main");
+    fireEvent.keyDown(window, { key: "p", metaKey: true });
+    const palette = screen.getByRole("dialog", { name: "Choose a project" });
+    expect(palette.contains(document.activeElement)).toBe(true);
+    // The surface still switches, but the modal palette keeps focus
+    // (run-view-42).
+    fireEvent.keyDown(window, { key: "1", metaKey: true });
+    expect(main.getAttribute("aria-label")).toBe("Dashboard");
+    expect(screen.getByRole("dialog", { name: "Choose a project" })).toBe(
+      palette,
+    );
+    expect(palette.contains(document.activeElement)).toBe(true);
+    // Closing it lands focus in the surface the shortcut opened, never
+    // on the body (run-view-50).
+    fireEvent.keyDown(screen.getByTestId("palette-search"), { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Choose a project" })).toBeNull();
+    expect(main.contains(document.activeElement)).toBe(true);
+  });
+
+  test("a broken config keeps its red voice while collapsed", () => {
+    useAppStore.setState({
+      configState: { status: "invalid", errors: ["captain: missing"] } as never,
+      railCollapsed: true,
+    });
+    render(<App />);
+    expect(
+      screen.getByLabelText("Config invalid — open Settings"),
+    ).toBeTruthy();
+  });
+});
+
+describe("run-view-50: a boot that never connects says so, after its grace", () => {
+  test("the banner waits eight seconds, then names the endpoint with Retry", () => {
+    vi.useFakeTimers();
+    try {
+      useAppStore.setState({
+        connection: "closed",
+        everConnected: false,
+        coreUrl: "ws://127.0.0.1:8137/?token=secret",
+      } as never);
+      render(<App />);
+      act(() => {
+        vi.advanceTimersByTime(7_900);
+      });
+      expect(screen.queryByRole("alert")).toBeNull();
+      act(() => {
+        vi.advanceTimersByTime(200);
+      });
+      const banner = screen.getByRole("alert");
+      expect(banner.textContent).toContain("Can't reach the Spex core");
+      expect(banner.textContent).toContain("ws://127.0.0.1:8137/?token=…");
+      expect(within(banner).getByRole("button", { name: "Retry" })).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("run-view-81: the reader sets the Captain/players split", () => {
+  // The split rides a custom property the side-by-side form reads;
+  // stacked below 42rem the column is full width (run-view-107).
+  const split = () =>
+    screen.getByTestId("captain-column").style.getPropertyValue("--captain-split");
+
+  test("keys move it, a double-click restores it, and it persists", () => {
+    const { unmount } = render(<App />);
+    expect(split()).toBe("45%");
+
+    const divider = screen.getByTestId("captain-divider");
+    fireEvent.keyDown(divider, { key: "ArrowRight" });
+    expect(split()).toBe("47%");
+
+    // Chrome state is a preference: it survives a remount (DR-030).
+    unmount();
+    render(<App />);
+    expect(split()).toBe("47%");
+
+    fireEvent.doubleClick(screen.getByTestId("captain-divider"));
+    expect(split()).toBe("45%");
+  });
+
+  test("neither side can be squeezed away", () => {
+    render(<App />);
+    const divider = screen.getByTestId("captain-divider");
+    for (let nudge = 0; nudge < 40; nudge += 1) {
+      fireEvent.keyDown(divider, { key: "ArrowLeft" });
+    }
+    expect(split()).toBe("22%");
+    for (let nudge = 0; nudge < 60; nudge += 1) {
+      fireEvent.keyDown(divider, { key: "ArrowRight" });
+    }
+    expect(split()).toBe("70%");
+  });
+});
+
+describe("run-view-57: a workspace holding projects opens inside one", () => {
+  test("a launch with nothing remembered adopts a registered project", async () => {
+    // Nothing persisted and no live session — the state a first launch
+    // after registering elsewhere lands in. The workspace still opens
+    // in a project rather than sending the reader to the sidebar.
+    // Ids no earlier run could have remembered, so the assertion can
+    // only be met by the fallback and not by a persisted choice.
+    useAppStore.setState({ currentProjectId: undefined, projects: [] });
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "project.list") {
+        return [
+          { id: "fresh-1", name: "alpha", path: "/tmp/alpha", registeredAt: 0 },
+          { id: "fresh-2", name: "beta", path: "/tmp/beta", registeredAt: 1 },
+        ];
+      }
+      if (type === "session.list") return [];
+      if (type === "readiness.get") return [];
+      if (type === "config.get") {
+        return { status: "valid", summary: { playbooks: [], captain: undefined } };
+      }
+      return defaultReply(type);
+    });
+
+    await useAppStore.getState().refresh();
+
+    expect(useAppStore.getState().currentProjectId).toBe("fresh-1");
+  });
+});
+
+describe("run-view-172: first-project welcome route", () => {
+  test("landing and sidebar add the same way; the switch shortcut still offers Academy", () => {
+    useAppStore.setState({
+      projects: [],
+      sessions: [],
+      views: {},
+      currentProjectId: undefined,
+      activeSessionId: undefined,
+      workspaceTabs: {},
+      openTabs: {},
+      ledger: { intents: [], attention: [], badge: 0 } as never,
+    });
+    render(<App />);
+
+    expect(screen.getByTestId("welcome-home")).toBeTruthy();
+    expect(screen.queryByTestId("sidebar-add-project")).toBeNull();
+    fireEvent.click(screen.getByTestId("home-add-project"));
+    expect(document.activeElement).toBe(screen.getByTestId("palette-path"));
+    expect(screen.queryByTestId("palette-academy")).toBeNull();
+
+    fireEvent.keyDown(window, { key: "p", metaKey: true });
+    expect(screen.queryByTestId("project-palette")).toBeNull();
+    fireEvent.click(screen.getByTestId("sidebar-palette"));
+    expect(screen.getByTestId("palette-own-project")).toBeTruthy();
+    expect(screen.queryByTestId("palette-academy")).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("palette-path"), { key: "Escape" });
+    fireEvent.keyDown(window, { key: "p", metaKey: true });
+    expect(screen.getByTestId("palette-academy")).toBeTruthy();
+  });
+});
+
+describe("playbook-library-34, core-service-2: the slash menus offer the project's composed catalog", () => {
+  const entry = (id: string) => ({ id, from: "", command: id, intent: `the ${id} playbook`, roles: {} });
+  const valid = (...ids: string[]) =>
+    ({ status: "valid", seeded: false, summary: { path: "/config", captain: { adapter: "claude" }, players: [], playbooks: ids.map(entry) } }) as never;
+
+  test("a playbook the project enables is offered there, read with its id and followed through the broadcast", async () => {
+    commandMock.mockImplementation(async (type: string, fields: { projectId?: string }) =>
+      type === "config.get" && fields?.projectId === "p1" ? valid("code", "decide") : defaultReply(type),
+    );
+    useAppStore.setState({ configState: valid("code"), workspaceTabs: { p1: "start" } });
+    render(<App />);
+
+    // Your own group's config enables /code alone; the project's on top
+    // adds /decide, which the Captain home's menu offers.
+    await vi.waitFor(() =>
+      expect(commandMock).toHaveBeenCalledWith("config.get", { projectId: "p1" }),
+    );
+    const composer = screen.getByTestId("start-composer");
+    fireEvent.change(composer, { target: { value: "/" } });
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("slash-menu").textContent).toContain("/decide"),
+    );
+    expect(screen.getByTestId("slash-menu").textContent).toContain("/code");
+
+    // A broadcast carries every project's composition whole: the
+    // project disabled /decide, so the menu no longer offers it.
+    act(() => {
+      deliverServerMessageForTests({
+        type: "config.state",
+        state: valid("code"),
+        projects: { p1: valid("code", "review") },
+      });
+    });
+    fireEvent.change(composer, { target: { value: "" } });
+    fireEvent.change(composer, { target: { value: "/" } });
+    const menu = screen.getByTestId("slash-menu");
+    expect(menu.textContent).toContain("/review");
+    expect(menu.textContent).not.toContain("/decide");
+  });
+
+  test("a project whose composition is refused offers your own group's catalog", async () => {
+    commandMock.mockImplementation(async (type: string, fields: { projectId?: string }) =>
+      type === "config.get" && fields?.projectId === "p1"
+        ? { status: "invalid", path: "/p1/config", errors: ["dev.auditor is not set up"] }
+        : defaultReply(type),
+    );
+    useAppStore.setState({ configState: valid("code"), workspaceTabs: { p1: "start" } });
+    render(<App />);
+    await vi.waitFor(() =>
+      expect(useAppStore.getState().projectConfigs.p1?.status).toBe("invalid"),
+    );
+    fireEvent.change(screen.getByTestId("start-composer"), { target: { value: "/" } });
+    expect(screen.getByTestId("slash-menu").textContent).toContain("/code");
+  });
+});
+
+describe("space-59, space-60, space-63: the page follows a project a move re-keys or a join adds", () => {
+  const repo = (key: string, folder: string | null) => repositoryRow(key, { folder });
+  const groups = (...repositories: ReturnType<typeof repo>[]) => groupsState({ own: { name: "me", named: true, repositories } });
+  const ALPHA = { id: "acme/alpha-spex", name: "alpha", path: "/tmp/alpha", registeredAt: 0, repository: { key: "acme/alpha-spex", name: "alpha-spex", group: "acme", own: false } };
+  const BETA = { id: "p2", name: "beta", path: "/tmp/beta", registeredAt: 1, repository: { key: "p2", name: "beta-spex", group: "me", own: true } };
+  const GAMMA = { id: "acme/gamma-spex", name: "gamma", path: "/tmp/gamma", registeredAt: 2, repository: { key: "acme/gamma-spex", name: "gamma-spex", group: "acme", own: false } };
+
+  test("a Groups state naming the projects the page holds re-reads nothing", () => {
+    render(<App />);
+    act(() => {
+      deliverServerMessageForTests({ type: "space.state", state: groups(repo("p1", "/tmp/alpha"), repo("p2", "/tmp/beta"), repo("acme/team-spex", null)) });
+    });
+    expect(commandMock).not.toHaveBeenCalledWith("project.list", {});
+  });
+
+  test("space-59, space-60, space-63: a Groups state whose project row stands under a second instance re-reads nothing", () => {
+    render(<App />);
+    // alpha's row stands under the second instance's group, beta's under
+    // your own group: both are the page's projects, wherever the state
+    // heads them (space-1, DR-127).
+    const state = groupsState({
+      own: { name: "me", named: false, repositories: [repo("p2", "/tmp/beta")] },
+      instances: [
+        instanceState("https://host.test", { groups: [namespace("me")] }),
+        instanceState("https://second.test", {
+          groups: [
+            namespace("me"),
+            {
+              id: "30", login: null, mine: false, fullPath: "acme", name: "acme",
+              can: { createSubgroup: false, manageMembers: false, rename: false, delete: false },
+              placed: [],
+              repositories: [repositoryRow("p1", { instance: "https://second.test", folder: "/tmp/alpha", state: "reachable" })],
+            },
+          ],
+        }),
+      ],
+    });
+    act(() => {
+      deliverServerMessageForTests({ type: "space.state", state });
+    });
+    expect(commandMock).not.toHaveBeenCalledWith("project.list", {});
+  });
+
+  test("a moved project is followed to its new key, current and open; a joined one lists", async () => {
+    let listed = [ALPHA, BETA];
+    commandMock.mockImplementation(async (type: string) =>
+      type === "project.list"
+        ? listed
+        : type === "session.list"
+          ? SESSIONS.map((entry) => (entry.projectId === "p1" ? { ...entry, projectId: ALPHA.id } : entry))
+          : type === "ledger.get"
+            ? LEDGER
+            : defaultReply(type),
+    );
+    render(<App />);
+    // The sync moved alpha's clone after the host (space-60).
+    act(() => {
+      deliverServerMessageForTests({ type: "space.state", state: groups(repo(ALPHA.id, "/tmp/alpha"), repo("p2", "/tmp/beta")) });
+    });
+    await vi.waitFor(() => expect(useAppStore.getState().currentProjectId).toBe(ALPHA.id));
+    const state = useAppStore.getState();
+    expect(state.projects.map((project) => project.id)).toEqual([ALPHA.id, "p2"]);
+    expect(state.openTabs[ALPHA.id]).toEqual(["a-live"]);
+    expect(state.openTabs.p1).toBeUndefined();
+    expect(state.workspaceTabs[ALPHA.id]).toBe("a-live");
+    expect(state.sessions.find((entry) => entry.id === "a-live")?.projectId).toBe(ALPHA.id);
+    await screen.findByTestId(`sidebar-project-${ALPHA.id}`);
+    expect(screen.queryByTestId("sidebar-project-p1")).toBeNull();
+
+    // A join paired another (space-63): it lists in the sidebar.
+    listed = [ALPHA, BETA, GAMMA];
+    act(() => {
+      deliverServerMessageForTests({ type: "space.state", state: groups(repo(ALPHA.id, "/tmp/alpha"), repo("p2", "/tmp/beta"), repo(GAMMA.id, "/tmp/gamma")) });
+    });
+    await screen.findByTestId(`sidebar-project-${GAMMA.id}`);
+    expect(useAppStore.getState().currentProjectId).toBe(ALPHA.id);
+  });
+});
+
+describe("run-view-58, projects-4: the Overview tab pins the project's group", () => {
+  test("the strip ends with Specs and Overview; the Overview draws header and group", async () => {
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "ledger.get") return LEDGER;
+      if (type === "project.status") {
+        return { branch: "main", dirty: true, ahead: 2, behind: 0 };
+      }
+      if (type === "forge.items") {
+        return {
+          adapter: "github",
+          authenticated: null,
+          issues: [],
+          prs: [],
+          guidance:
+            "No GitHub remote — run git remote add origin … to see issues and PRs",
+        };
+      }
+      if (type === "specs.get") {
+        return {
+          present: true,
+          legacy: false,
+          files: [],
+          decisions: [],
+          intents: [],
+          notices: [],
+          readAt: NOW,
+        };
+      }
+      if (type === "ledger.history") return { intents: [], more: false };
+      return defaultReply(type);
+    });
+    render(<App />);
+    expect(screen.queryByTestId("workspace-tab-repo")).toBeNull();
+    const tab = screen.getByTestId("workspace-tab-overview");
+    expect(tab.textContent).toBe("Overview");
+    fireEvent.click(tab);
+    const overview = await screen.findByTestId("overview-tab");
+
+    // The repository header (projects-4).
+    await vi.waitFor(() => expect(overview.textContent).toContain("main"));
+    expect(overview.textContent).toContain("/tmp/alpha");
+    expect(within(overview).getByTitle("uncommitted changes")).toBeTruthy();
+    expect(within(overview).getByTitle("ahead of upstream").textContent).toBe(
+      "↑2",
+    );
+    expect(
+      within(overview).getByRole("button", { name: "Remove project" }),
+    ).toBeTruthy();
+
+    // The project's own group, no project filter (dashboard-26, DR-038).
+    expect(within(overview).getByTestId("project-group-p1")).toBeTruthy();
+    for (const band of ["history", "now", "upnext", "sources"]) {
+      expect(within(overview).getByTestId(`${band}-p1`)).toBeTruthy();
+    }
+    expect(
+      within(overview).queryByRole("combobox", { name: "Filter by project" }),
+    ).toBeNull();
+
+    // The GitHub setup guidance sits in the Sources band (projects-7,
+    // dashboard-8), so the Dashboard and the Overview show one thing.
+    expect(
+      within(overview).getByTestId("sources-guidance-p1").textContent,
+    ).toContain("No GitHub remote");
+  });
+
+  test("projects-4, space-61: the header's records field reads 'Records · <group> · <standing>', the group left out while the records are in none, a waiting creation's phrase standing for their standing, never the records' key", async () => {
+    const row = (state: "local-only" | "reachable", extra: Parameters<typeof repositoryRow>[1] = {}) =>
+      repositoryRow("p1", { name: "alpha-spex", folder: "/tmp/alpha", state, ...extra });
+    const SPEX = "https://host.test";
+    // Your own group's rows stand in no group (space-1).
+    const local = (repository: ReturnType<typeof row>) => groupsState({ own: { name: "me", named: true, repositories: [repository] } });
+    // A Space holding the records in Personal, or in a group.
+    const at = (repository: ReturnType<typeof row>, where: "personal" | "acme") =>
+      groupsState({
+        own: { name: "me", named: false, repositories: [] },
+        instances: [
+          instanceState(SPEX, {
+            displayName: "Host",
+            groups:
+              where === "personal"
+                ? [namespace("me", [repository])]
+                : [namespace("me"), { id: "30", login: null, mine: false, fullPath: "acme/research", name: "Research", can: { createSubgroup: false, manageMembers: false, rename: false, delete: false }, placed: [], repositories: [repository] }],
+          }),
+        ],
+      });
+    commandMock.mockImplementation(async (type: string) =>
+      type === "space.get"
+        ? local(row("local-only"))
+        : type === "ledger.get"
+          ? LEDGER
+          : type === "ledger.history"
+            ? { intents: [], more: false }
+            : defaultReply(type),
+    );
+    useAppStore.setState({ workspaceTabs: { p1: "overview" } });
+    render(<App />);
+    const records = await screen.findByTestId("overview-records");
+
+    // The Space state is asked for; records in no group read the field's
+    // name alone — no group, no phrase (projects-4, space-61, space-120).
+    await vi.waitFor(() => expect(commandMock).toHaveBeenCalledWith("space.get", {}));
+    await vi.waitFor(() => expect(records.textContent).toBe("Records"));
+    expect(records.textContent).not.toContain("alpha-spex");
+    expect(records.hasAttribute("title")).toBe(false);
+
+    // A waiting creation reads its phrase, which the Space surface
+    // carries on its line alone (space-64).
+    act(() => {
+      deliverServerMessageForTests({
+        type: "space.state",
+        state: local(row("local-only", { waiting: { step: "create", group: "acme", message: "" } })),
+      });
+    });
+    expect(screen.getByTestId("overview-records-state").textContent).toBe(
+      "Waiting for a member who can create it in acme",
+    );
+    expect(screen.queryByTestId("overview-records-group")).toBeNull();
+
+    // In Personal at a Space, its group reads "Personal" and its standing
+    // follows (projects-4).
+    act(() => {
+      deliverServerMessageForTests({ type: "space.state", state: at(row("reachable", { instance: SPEX, governing: SPEX, id: "9", branch: null }), "personal") });
+    });
+    expect(screen.getByTestId("overview-records-group").textContent).toBe("Personal");
+    expect(records.textContent).toMatch(/^Records · Personal · /);
+
+    // In a group, the group by its name, its path in the title.
+    act(() => {
+      deliverServerMessageForTests({ type: "space.state", state: at(row("reachable", { instance: SPEX, governing: SPEX, id: "9", branch: null }), "acme") });
+    });
+    expect(screen.getByTestId("overview-records-group").textContent).toBe("Research");
+    expect(records.title).toBe("acme/research");
+    expect(records.textContent).not.toMatch(/spex|@host/);
+  });
+
+  test("projects-9: records that never reached a Space ask a second confirmation counting them", async () => {
+    const { SpexCommandError } = await import("./lib/client.js");
+    commandMock.mockImplementation(async (type: string, fields?: { confirm?: boolean }) => {
+      if (type === "project.remove" && !fields?.confirm) {
+        throw new SpexCommandError("conflict", "2 records have not reached a Space", { units: 2 });
+      }
+      return type === "ledger.get"
+        ? LEDGER
+        : type === "ledger.history"
+          ? { intents: [], more: false }
+          : defaultReply(type);
+    });
+    // No turn of the project runs, so its removal is offered (projects-9).
+    useAppStore.setState({ workspaceTabs: { p1: "overview" }, sessions: SESSIONS.map((entry) => ({ ...entry, live: false })) });
+    render(<App />);
+    const overview = await screen.findByTestId("overview-tab");
+    fireEvent.click(within(overview).getByRole("button", { name: "Remove project" }));
+    await act(async () => {
+      fireEvent.click(within(overview).getByRole("button", { name: "Remove" }));
+    });
+    // The count rides the question, in the reader's words (projects-9).
+    const second = await screen.findByTestId("remove-project-unsent");
+    expect(second.textContent).toContain("2 records never reached a Space. Remove anyway?");
+    expect(second.textContent).not.toContain("have not reached");
+  });
+
+  test("a remembered 'repo' tab lands on the Overview, and the cycle walks it", () => {
+    useAppStore.setState({ workspaceTabs: { p1: "repo" } });
+    render(<App />);
+    expect(
+      screen.getByTestId("workspace-tab-overview").getAttribute("aria-selected"),
+    ).toBe("true");
+    // ⌘⇧[ from the Overview reaches Packages; ⌘⇧] returns (run-view-58).
+    fireEvent.keyDown(window, {
+      code: "BracketLeft",
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(useAppStore.getState().workspaceTabs.p1).toBe("packages");
+    fireEvent.keyDown(window, {
+      code: "BracketRight",
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(useAppStore.getState().workspaceTabs.p1).toBe("overview");
+  });
+});
+
+describe("DR-038, core-service-70: sessions can be deleted from the sidebar", () => {
+  test.each(["active", "unknown"] as const)("external %s ownership removes an open Delete confirmation and keeps the transcript", (externalWriter) => {
+    const composer = {draft: "Keep draft", queued: [{text: "Keep queue"}]};
+    useAppStore.setState({composers: {"a-live": composer}});
+    render(<App />);
+    fireEvent.click(screen.getByTestId("sidebar-delete-a-failed"));
+    expect(screen.getByTestId("sidebar-delete-confirm-a-failed")).toBeTruthy();
+    act(() => {
+      useAppStore.setState({sessions: SESSIONS.map((entry) =>
+        ["a-live", "a-failed"].includes(entry.id)
+          ? {...entry, externalWriter, live: externalWriter === "active", endedAt: null}
+          : entry)});
+    });
+    expect(screen.getByTestId("session-external-owner")).toBeTruthy();
+    expect(screen.getByTestId("captain-pane")).toBeTruthy();
+    expect(screen.queryByTestId("boss-composer")).toBeNull();
+    expect(screen.queryByTestId("tab-history-a-live")).toBeNull();
+    expect(screen.queryByTestId("sidebar-delete-confirm-a-failed")).toBeNull();
+    expect(screen.queryByTestId("sidebar-delete-a-failed")).toBeNull();
+    expect(screen.queryByTestId("sidebar-delete-a-live")).toBeNull();
+    expect(screen.getByTestId("sidebar-session-a-live").getAttribute("aria-label"))
+      .toContain(externalWriter === "active" ? "in use elsewhere" : "ownership unknown");
+    expect(useAppStore.getState().composers["a-live"]).toEqual(composer);
+    expect(commandMock).not.toHaveBeenCalledWith("session.dispose", expect.anything());
+    expect(commandMock).not.toHaveBeenCalledWith("session.delete", expect.anything());
+  });
+
+  test("an idle session offers delete; the confirm sends session.delete and every trace goes", async () => {
+    render(<App />);
+    // A working session carries no delete control; an idle one does.
+    expect(screen.queryByTestId("sidebar-delete-a-live")).toBeNull();
+    const control = screen.getByTestId("sidebar-delete-a-failed");
+    expect(control.getAttribute("aria-label")).toBe(
+      "Delete session chase the flaky test",
+    );
+    fireEvent.click(control);
+    // The control never activates the row.
+    expect(useAppStore.getState().openTabs.p1).toEqual(["a-live"]);
+    const confirm = screen.getByTestId("sidebar-delete-confirm-a-failed");
+    expect(confirm.textContent).toContain(
+      "Delete this session and its transcript?",
+    );
+    // Keep backs out, and nothing was asked of the core.
+    fireEvent.click(within(confirm).getByRole("button", { name: "Keep" }));
+    expect(screen.queryByTestId("sidebar-delete-confirm-a-failed")).toBeNull();
+    expect(commandMock).not.toHaveBeenCalledWith(
+      "session.delete",
+      expect.anything(),
+    );
+
+    // Open the idle session as a tab, so the removal has one to close.
+    commandMock.mockImplementation(async (type: string) =>
+      type === "ledger.get"
+        ? (LEDGER as object)
+        : type === "history.get"
+          ? { records: [] }
+          : defaultReply(type),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("sidebar-session-a-failed"));
+    });
+    expect(useAppStore.getState().openTabs.p1).toEqual(["a-live", "a-failed"]);
+
+    fireEvent.click(screen.getByTestId("sidebar-delete-a-failed"));
+    await act(async () => {
+      fireEvent.click(
+        within(
+          screen.getByTestId("sidebar-delete-confirm-a-failed"),
+        ).getByRole("button", { name: "Delete" }),
+      );
+    });
+    expect(commandMock).toHaveBeenCalledWith("session.delete", {
+      sessionId: "a-failed",
+    });
+    // The reply forgets it: the listing, its tab, its transcript.
+    expect(screen.queryByTestId("sidebar-session-a-failed")).toBeNull();
+    expect(useAppStore.getState().openTabs.p1).toEqual(["a-live"]);
+    expect(useAppStore.getState().views["a-failed"]).toBeUndefined();
+  });
+
+  test("a session another host wrote offers delete, the confirm naming the terminal history (DR-042)", async () => {
+    useAppStore.setState({
+      sessions: SESSIONS.map((entry) =>
+        entry.id === "a-failed" ? { ...entry, foreign: true as const } : entry,
+      ),
+    });
+    render(<App />);
+    expect(screen.getByTestId("sidebar-delete-a-bare")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("sidebar-delete-a-failed"));
+    const confirm = screen.getByTestId("sidebar-delete-confirm-a-failed");
+    expect(confirm.textContent).toContain(
+      "Delete this session? It was run from the terminal; its history goes too.",
+    );
+    await act(async () => {
+      fireEvent.click(within(confirm).getByRole("button", { name: "Delete" }));
+    });
+    expect(commandMock).toHaveBeenCalledWith("session.delete", {
+      sessionId: "a-failed",
+    });
+  });
+
+  test("the removal broadcast drops the session and closes its tab", () => {
+    useAppStore.setState({
+      openTabs: { p1: ["a-live", "a-failed"] },
+      workspaceTabs: { p1: "a-failed" },
+      views: { ...useAppStore.getState().views, "a-failed": view() },
+    });
+    render(<App />);
+    act(() => {
+      deliverServerMessageForTests({
+        type: "session.removed",
+        sessionId: "a-failed",
+        projectId: "p1",
+      });
+    });
+    expect(screen.queryByTestId("sidebar-session-a-failed")).toBeNull();
+    expect(useAppStore.getState().openTabs.p1).toEqual(["a-live"]);
+    // The closed tab lands on a neighbour (run-view-47).
+    expect(useAppStore.getState().workspaceTabs.p1).toBe("a-live");
+    expect(useAppStore.getState().views["a-failed"]).toBeUndefined();
+  });
+
+  test("the core's refusal shows at the row, the session kept", async () => {
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "session.delete") {
+        throw new Error("the session is live — end it first");
+      }
+      return type === "ledger.get" ? (LEDGER as object) : defaultReply(type);
+    });
+    render(<App />);
+    fireEvent.click(screen.getByTestId("sidebar-delete-a-failed"));
+    await act(async () => {
+      fireEvent.click(
+        within(
+          screen.getByTestId("sidebar-delete-confirm-a-failed"),
+        ).getByRole("button", { name: "Delete" }),
+      );
+    });
+    expect(screen.getByTestId("sidebar-delete-error-a-failed").title).toContain(
+      "end it first",
+    );
+    expect(screen.getByTestId("sidebar-session-a-failed")).toBeTruthy();
+  });
+});
+
+describe("run-view-48/50: the strip walks by keyboard and names its attention", () => {
+  beforeEach(() => {
+    useAppStore.setState({ openTabs: { p1: ["a-live", "a-failed"] } });
+  });
+
+  test("one Tab stop, arrows and Home/End between tabs, attention in the name", () => {
+    render(<App />);
+    const live = screen.getByRole("tab", {
+      name: "harden the session refresh — needs your reply",
+    });
+    const failed = screen.getByRole("tab", {
+      name: "chase the flaky test",
+    });
+    const plus = screen.getByRole("tab", { name: "New task" });
+    const specs = screen.getByTestId("workspace-tab-specs");
+    const playbooks = screen.getByTestId("workspace-tab-playbooks");
+    const packages = screen.getByTestId("workspace-tab-packages");
+    const overview = screen.getByTestId("workspace-tab-overview");
+    expect(live.tabIndex).toBe(0);
+    for (const other of [failed, plus, specs, playbooks, packages, overview]) {
+      expect(other.tabIndex).toBe(-1);
+    }
+
+    live.focus();
+    fireEvent.keyDown(live, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(failed);
+    fireEvent.keyDown(failed, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(plus);
+    fireEvent.keyDown(plus, { key: "End" });
+    expect(document.activeElement).toBe(overview);
+    fireEvent.keyDown(overview, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(live);
+    fireEvent.keyDown(live, { key: "ArrowLeft" });
+    expect(document.activeElement).toBe(overview);
+    fireEvent.keyDown(overview, { key: "Home" });
+    expect(document.activeElement).toBe(live);
+    // Walking the strip activates nothing.
+    expect(useAppStore.getState().workspaceTabs.p1).toBe("a-live");
+
+    // A tooltip naming a shortcut prints the platform's own modifier;
+    // each pinned tab says what it holds in the tab's own words
+    // (DR-172): the project's own specs, what a session can run, and the
+    // project's packages with yours.
+    expect(specs.title).toBe(
+      `The project's specs (${keyLabel("⇧S")})`,
+    );
+    expect(playbooks.title).toBe("What a session in this project can run");
+    expect(packages.title).toBe("This project's packages and your Personal ones");
+    expect(plus.title).toBe(`New task (${keyLabel("N")})`);
+  });
+
+  test("a failure tab's tooltip says why it failed", async () => {
+    // The mark is never the only channel, and what it says is the
+    // catalogue's phrase for the cause the fold carried (run-view-48,
+    // DR-075) — no surface phrases a failure of its own.
+    const fold = {
+      intents: [],
+      attention: [
+        {
+          band: "interrupted",
+          kind: "failure",
+          parked: true,
+          title: "chase the flaky test",
+          projectId: "p1",
+          sessionId: "a-idle",
+          since: NOW - 60_000,
+          cause: {
+            code: "pre-existing-lost",
+            evidence: { paths: { lost: ["src/a.ts"], truncated: 2 } },
+          },
+        },
+      ],
+      badge: 1,
+    } as never;
+    commandMock.mockImplementation(async (type: string) =>
+      type === "ledger.get" ? (fold as object) : defaultReply(type),
+    );
+    useAppStore.setState({
+      sessions: [
+        ...SESSIONS,
+        session({ id: "a-idle", title: "chase the flaky test", failed: true }),
+      ],
+      openTabs: { p1: ["a-idle"] },
+      workspaceTabs: { p1: "a-idle" },
+      views: { ...useAppStore.getState().views, "a-idle": view() },
+      ledger: fold,
+    });
+    render(<App />);
+    const tab = await screen.findByRole("tab", {
+      name: "chase the flaky test — failed",
+    });
+    expect(tab.title).toContain(
+      "Uncommitted changes you had were lost: src/a.ts, … and 2 more",
+    );
+  });
+
+  test("closing tabs leaves focus on a tab", async () => {
+    render(<App />);
+    const failed = screen.getByRole("tab", {
+      name: "chase the flaky test",
+    });
+    failed.focus();
+    fireEvent.keyDown(failed, { key: "Delete" });
+    expect(useAppStore.getState().openTabs.p1).toEqual(["a-live"]);
+    const live = screen.getByRole("tab", { name: /harden the session refresh/ });
+    expect(document.activeElement).toBe(live);
+
+    // The last session tab closed: the workspace falls to the start
+    // view, whose composer is ready to type — never the body.
+    fireEvent.keyDown(live, { key: "Delete" });
+    expect(useAppStore.getState().openTabs.p1).toEqual([]);
+    expect(document.activeElement).toBe(screen.getByTestId("start-composer"));
+  });
+});
+
+describe("run-view-88: Captain Home consumes the published next standing", () => {
+  const manualIntent = {
+    id: "i-manual",
+    projectId: "p1",
+    text: "Start the published task\nwith its full context",
+    rank: "a",
+    createdAt: 1,
+  };
+  const manualFold = {
+    intents: [
+      {
+        intent: manualIntent,
+        state: "queued",
+        next: { standing: "manual-ready", manualStart: true },
+      },
+    ],
+    attention: [],
+    badge: 0,
+  } as never;
+
+  test("an earlier unmarked row cannot replace the core-published next", async () => {
+    const fold = {
+      intents: [
+        {
+          intent: {
+            id: "i-earlier",
+            projectId: "p1",
+            text: "Earlier queued row",
+            rank: "a",
+            createdAt: 1,
+          },
+          state: "queued",
+        },
+        {
+          intent: {
+            id: "i-published",
+            projectId: "p1",
+            text: "Core-published next row",
+            rank: "b",
+            createdAt: 2,
+          },
+          state: "queued",
+          next: { standing: "question-park", manualStart: false },
+        },
+      ],
+      attention: [],
+      badge: 0,
+    } as never;
+    commandMock.mockImplementation(async (type: string) =>
+      type === "ledger.get" ? (fold as object) : defaultReply(type),
+    );
+    useAppStore.setState({
+      ledger: fold,
+      workspaceTabs: { p1: "start" },
+    });
+
+    render(<App />);
+    const card = await screen.findByTestId("next-card");
+    expect(card.textContent).toContain("Core-published next row");
+    expect(card.textContent).not.toContain("Earlier queued row");
+    expect(card.textContent).toContain("waiting — your reply");
+    expect(card.textContent).toContain("+1 more queued");
+    expect(within(card).getByTestId("next-queued").textContent).toBe("Queued");
+    expect(within(card).queryByTestId("next-start")).toBeNull();
+  });
+
+  test("Start stages into the project's current conversation", async () => {
+    const idle = session({
+      id: "a-idle",
+      title: "the current conversation",
+      live: false,
+      endedAt: NOW - 1_000,
+      continuable: true,
+    });
+    commandMock.mockImplementation(async (type: string) =>
+      type === "ledger.get" ? (manualFold as object) : defaultReply(type),
+    );
+    useAppStore.setState({
+      ledger: manualFold,
+      sessions: [idle],
+      views: { "a-idle": view() },
+      openTabs: { p1: ["a-idle"] },
+      workspaceTabs: { p1: "start" },
+      activeSessionId: "a-idle",
+      composers: {},
+      stagedIntents: {},
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByTestId("next-start"));
+    await vi.waitFor(() =>
+      expect(useAppStore.getState().stagedIntents["a-idle"]?.intentId).toBe(
+        "i-manual",
+      ),
+    );
+    expect(useAppStore.getState().composers["a-idle"]?.draft).toBe(
+      manualIntent.text,
+    );
+    expect(useAppStore.getState().workspaceTabs.p1).toBe("a-idle");
+    expect(useAppStore.getState().stagedIntents.home).toBeUndefined();
+  });
+
+  test("Start stages into Captain Home when no conversation exists", async () => {
+    commandMock.mockImplementation(async (type: string) =>
+      type === "ledger.get" ? (manualFold as object) : defaultReply(type),
+    );
+    useAppStore.setState({
+      ledger: manualFold,
+      sessions: [],
+      views: {},
+      openTabs: { p1: [] },
+      workspaceTabs: { p1: "start" },
+      activeSessionId: undefined,
+      homeDraft: "",
+      stagedIntents: {},
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByTestId("next-start"));
+    await vi.waitFor(() =>
+      expect(useAppStore.getState().stagedIntents.home?.intentId).toBe(
+        "i-manual",
+      ),
+    );
+    expect(useAppStore.getState().homeDraft).toBe(manualIntent.text);
+    expect(useAppStore.getState().workspaceTabs.p1).toBe("start");
+  });
+});
+
+describe("spec-view-58: the Specs tab on a project with no specs/", () => {
+  test("the project start links to existing specs and the pinned tab shows item count", async () => {
+    useAppStore.setState({
+      workspaceTabs: { p1: "start" },
+      specTrees: { p1: {
+        present: true, legacy: false, decisions: [], intents: [], notices: [], readAt: 1,
+        files: [
+          { path: "specs/packages/design.md", key: "design", dir: "", basename: "design", notices: [], items: [
+            { id: "design-1", group: "external", section: "External Behavior", firstLine: "A goal", text: "A goal", cites: [] },
+          ] },
+          { path: "specs/packages/git.md", key: "git", dir: "", basename: "git", notices: [], items: [] },
+        ],
+      } },
+    });
+    render(<App />);
+    const tab = screen.getByTestId("workspace-tab-specs");
+    expect(tab.querySelector('[aria-hidden="true"]')?.textContent).toBe("(1)");
+    expect(screen.getByRole("tab", { name: "Specs, 1 spec item" })).toBe(tab);
+    expect(tab.getAttribute("aria-selected")).toBe("false");
+    expect(screen.getByTestId("project-spec-status").textContent).toContain("2 packages · 1 item");
+    fireEvent.click(within(screen.getByTestId("project-spec-status")).getByRole("button", { name: "View specs" }));
+    expect(tab.getAttribute("aria-selected")).toBe("true");
+    fireEvent.click(screen.getByRole("tab", { name: "New task" }));
+    expect(tab.getAttribute("aria-selected")).toBe("false");
+    expect(screen.getByRole("textbox", { name: "Describe a project task" })).toBeTruthy();
+  });
+
+  // The tree the core replies with when a project has no `specs/`
+  // directory: absence stated with empty lists, never a failure and
+  // never a reply missing them (spec-view-10). The view reads those
+  // lists as it renders, so a reply without them took the whole app
+  // down through its error boundary rather than showing this state.
+  test("the absent tree renders its empty state rather than crashing", async () => {
+    render(<App />);
+    await screen.findByTestId("sidebar-session-a-live");
+    fireEvent.click(screen.getByTestId("workspace-tab-specs"));
+
+    const empty = await screen.findByTestId("specs-empty");
+    expect(empty.textContent).toMatch(/npx @sublang\/spex scaffold/);
+    expect(commandMock).toHaveBeenCalledWith("specs.get", { projectId: "p1" });
+    // The tab really is the shown one, so the empty state is what the
+    // reader is looking at and not something rendered off-surface.
+    expect(
+      screen.getByTestId("workspace-tab-specs").getAttribute("aria-selected"),
+    ).toBe("true");
+  });
+});
+
+describe("run-view-134/137: the marker is the reader's own showing", () => {
+  const UNREAD = {
+    band: "finished",
+    kind: "review",
+    title: "written somewhere else",
+    projectId: "p1",
+    sessionId: "a-unread",
+    turnId: 3,
+    since: NOW - 120_000,
+  };
+
+  /** The owner's own case: a conversation whose turn finished before
+   * this client ever learned of it, so no live record can clear it. */
+  function seedUnread(): void {
+    const fold = { intents: [], attention: [UNREAD], badge: 1 } as never;
+    commandMock.mockImplementation(async (type: string) =>
+      type === "ledger.get" ? (fold as object) : defaultReply(type),
+    );
+    useAppStore.setState({
+      sessions: [
+        ...SESSIONS,
+        session({ id: "a-unread", title: "written somewhere else", turns: 4 }),
+      ],
+      views: {
+        ...useAppStore.getState().views,
+        "a-unread": view(),
+      },
+      ledger: fold,
+    });
+  }
+
+  function viewedCalls(): unknown[][] {
+    return commandMock.mock.calls.filter(
+      (call) => call[0] === "session.viewed",
+    );
+  }
+
+  test("a session drawn in a list is never marked; showing it marks it once", async () => {
+    seedUnread();
+    render(<App />);
+    await screen.findByTestId("sidebar-session-a-unread");
+
+    // Listed, subscribed, and counted — and settled by none of that
+    // (DR-065): the row is not a gesture taken on the conversation.
+    expect(viewedCalls()).toEqual([]);
+    expect(screen.getByTestId("nav-attention-badge").textContent).toBe("1");
+    expect(screen.getByTestId("sidebar-mark-a-unread").dataset.life).toBe(
+      "review",
+    );
+    expect(
+      screen.getByTestId("sidebar-session-a-unread").getAttribute("aria-label"),
+    ).toContain("unread turn");
+    expect(
+      screen.getByTestId("sidebar-project-attention-p1").getAttribute("title"),
+    ).toBe("A session has an unread turn");
+
+    // Showing it is the gesture, and it names the fold's own turn.
+    fireEvent.click(screen.getByTestId("sidebar-session-a-unread"));
+    await vi.waitFor(() =>
+      expect(viewedCalls()).toEqual([
+        ["session.viewed", { sessionId: "a-unread", turnId: 3 }],
+      ]),
+    );
+
+    // Standing, not repeating: further renders of the same fold send
+    // nothing more.
+    fireEvent.click(screen.getByTestId("sidebar-session-a-live"));
+    fireEvent.click(screen.getByTestId("sidebar-session-a-unread"));
+    await vi.waitFor(() =>
+      expect(
+        screen.getByRole("tab", { name: /^written somewhere else/ }),
+      ).toBeTruthy(),
+    );
+    expect(viewedCalls()).toHaveLength(1);
+  });
+
+  test("a shown session the fold names no unread turn for sends nothing", async () => {
+    render(<App />);
+    await screen.findByTestId("sidebar-session-a-live");
+    // a-live carries a question, not an unread turn: its act is a
+    // reply, and nothing here may fake one.
+    expect(viewedCalls()).toEqual([]);
+    // Nor does a pinned tab, which is no conversation at all.
+    fireEvent.click(screen.getByTestId("workspace-tab-specs"));
+    await vi.waitFor(() =>
+      expect(
+        screen.getByTestId("workspace-tab-specs").getAttribute("aria-selected"),
+      ).toBe("true"),
+    );
+    expect(viewedCalls()).toEqual([]);
+  });
+});
+
+describe("run-view-135/136: a summons the session answers names its turn", () => {
+  test("a permission request is a line in its player's pane and a mark nowhere", async () => {
+    render(<App />);
+    await screen.findByTestId("player-pane-dev.coder");
+    act(() => {
+      deliverServerMessageForTests({
+        type: "record",
+        sessionId: "a-live",
+        seq: 900,
+        record: {
+          type: "player_event",
+          playerId: "dev.coder",
+          turnId: 1,
+          timestamp: NOW,
+          event: {
+            type: "permission_request",
+            payload: { toolName: "Bash" },
+          },
+        },
+      } as never);
+    });
+
+    // A recorded approval request is history too: its tool and the
+    // native reason where one was given (run-view-136).
+    for (const [seq, payload] of [
+      [901, { toolName: "Bash", reason: "Run the test suite" }],
+      [902, { toolName: "Edit" }],
+    ] as const) {
+      act(() => {
+        deliverServerMessageForTests({
+          type: "record",
+          sessionId: "a-live",
+          seq,
+          record: {
+            type: "player_event",
+            playerId: "dev.coder",
+            turnId: 1,
+            timestamp: NOW,
+            event: { type: "approval_request", payload },
+          },
+        } as never);
+      });
+    }
+
+    // No control answers one, so the request stands where it is true
+    // and summons nobody (DR-066).
+    const pane = screen.getByTestId("player-pane-dev.coder");
+    expect(pane.textContent).toContain("Asked permission to use Bash");
+    expect(pane.textContent).toContain("historical permission event; no live answer is available");
+    expect(pane.textContent).toContain("Requested tool approval: Bash — Run the test suite");
+    expect(pane.textContent).toContain("Requested tool approval: Edit");
+    expect(pane.textContent).not.toContain("Requested tool approval: Edit —");
+    expect(screen.getByTestId("nav-attention-badge").textContent).toBe("2");
+  });
+
+  test("a failure that parked no run names the message that picks it up", async () => {
+    const fold = {
+      intents: [],
+      attention: [
+        {
+          band: "interrupted",
+          kind: "failure",
+          title: "chase the flaky test",
+          projectId: "p1",
+          sessionId: "a-idle",
+          since: NOW - 60_000,
+        },
+      ],
+      badge: 1,
+    } as never;
+    commandMock.mockImplementation(async (type: string) =>
+      type === "ledger.get" ? (fold as object) : defaultReply(type),
+    );
+    // The runtime's own account of the failure travels with the
+    // record (DR-075): the notice phrases it rather than saying only
+    // that a turn failed.
+    const failed = view();
+    failed.captain.push({
+      kind: "error",
+      text: "the coder could not sign in",
+      turnId: 1,
+      at: NOW - 60_000,
+      data: {
+        lastError: {
+          message: "OAuth session expired",
+          cause: {
+            code: "player-failed",
+            evidence: {
+              roleId: "coder",
+              playerId: "dev.coder",
+              error: "OAuth session expired",
+            },
+          },
+        },
+      },
+    });
+    useAppStore.setState({
+      sessions: [
+        ...SESSIONS,
+        session({ id: "a-idle", title: "chase the flaky test", failed: true }),
+      ],
+      views: { ...useAppStore.getState().views, "a-idle": failed },
+      ledger: fold,
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByTestId("sidebar-session-a-idle"));
+
+    // Nothing is stuck, and until now this state named no act at all.
+    const notice = await screen.findByTestId("unparked-failure-notice");
+    expect(notice.textContent).toContain(
+      "The last turn failed. Send a message to pick it up.",
+    );
+    // Why, and what to do about it outside Spex (run-view-135, DR-075).
+    expect(screen.getByTestId("unparked-failure-why").textContent).toBe(
+      "coder failed: The agent's sign-in has expired — in a terminal, sign in again with that agent's CLI",
+    );
+    expect(screen.getByTestId("unparked-failure-next").textContent).toBe(
+      "Sign in to coder again",
+    );
+    expect(screen.getByTestId("boss-composer")).toBeTruthy();
+  });
+});
+
+describe("DR-172: the rail of four, and the project's Playbooks and Packages tabs", () => {
+  /** This page's storage, kept in memory for one test: the host's own
+   * may answer no call. */
+  function keepStorage(initial: Record<string, string>): { kept: Map<string, string>; restore: () => void } {
+    const kept = new Map(Object.entries(initial));
+    const real = Object.getOwnPropertyDescriptor(window, "localStorage");
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (key: string) => kept.get(key) ?? null,
+        setItem: (key: string, value: string) => kept.set(key, value),
+        removeItem: (key: string) => kept.delete(key),
+        clear: () => kept.clear(),
+        key: (index: number) => [...kept.keys()][index] ?? null,
+        get length() {
+          return kept.size;
+        },
+      },
+    });
+    return { kept, restore: () => { if (real) Object.defineProperty(window, "localStorage", real); } };
+  }
+
+  test("[run-view-67] [run-view-49] the rail reads Dashboard, Projects, Space and Settings, Cmd/Ctrl+1..4 in its order", () => {
+    // A config Settings can draw without a Captain.
+    useAppStore.setState({ configState: { status: "missing", path: "/tmp/config.yaml" } as never });
+    render(<App />);
+    const rail = screen.getByTestId("sidebar");
+    expect([...rail.querySelectorAll<HTMLElement>("[data-surface]")].map((entry) => entry.dataset.surface)).toEqual([
+      "Dashboard",
+      "Space",
+      "Settings",
+    ]);
+    expect(within(rail).getByTestId("sidebar-workspace").textContent).toBe("Projects");
+    expect(rail.querySelector('[data-surface="Playbooks"]')).toBeNull();
+    const main = screen.getByRole("main");
+    for (const [key, label] of [["1", "Dashboard"], ["2", "Projects"], ["3", "Space"], ["4", "Settings"]] as const) {
+      fireEvent.keyDown(window, { key, metaKey: true });
+      expect(main.getAttribute("aria-label")).toBe(label);
+    }
+    // No fifth surface: the key moves nothing.
+    fireEvent.keyDown(window, { key: "5", metaKey: true });
+    expect(main.getAttribute("aria-label")).toBe("Settings");
+  });
+
+  test("[run-view-67] a remembered Playbooks surface opens Projects at the current project's Playbooks tab, read once", async () => {
+    const storage = keepStorage({ "spex.surface": "Playbooks" });
+    try {
+      render(<App />);
+      expect(screen.getByRole("main").getAttribute("aria-label")).toBe("Projects");
+      await vi.waitFor(() => expect(useAppStore.getState().workspaceTabs.p1).toBe("playbooks"));
+      expect(screen.getByTestId("workspace-tab-playbooks").getAttribute("aria-selected")).toBe("true");
+      expect(await screen.findByTestId("playbooks-tab")).toBeTruthy();
+      // The stored value is mapped once: Projects stands in its place.
+      expect(storage.kept.get("spex.surface")).toBe("Workspace");
+    } finally {
+      storage.restore();
+    }
+  });
+
+  test("[run-view-67] a remembered Playbooks surface waits for the projects' read, and owes nothing once it shows none", async () => {
+    const seeded = useAppStore.getState().projects;
+    const storage = keepStorage({ "spex.surface": "Playbooks" });
+    try {
+      // Read and empty: a project added later opens as any other.
+      useAppStore.setState({ projects: [], currentProjectId: undefined, projectsRead: true, workspaceTabs: {} });
+      const view = render(<App />);
+      expect(screen.getByRole("main").getAttribute("aria-label")).toBe("Projects");
+      await act(async () => {});
+      act(() => useAppStore.setState({ projects: seeded, currentProjectId: "p1" }));
+      await act(async () => {});
+      expect(useAppStore.getState().workspaceTabs.p1).not.toBe("playbooks");
+      view.unmount();
+
+      // Not read yet: the first current project lands on its Playbooks tab.
+      storage.kept.set("spex.surface", "Playbooks");
+      useAppStore.setState({ projects: [], currentProjectId: undefined, projectsRead: false, workspaceTabs: {} });
+      render(<App />);
+      await act(async () => {});
+      act(() => useAppStore.setState({ projects: seeded, currentProjectId: "p1", projectsRead: true }));
+      await vi.waitFor(() => expect(useAppStore.getState().workspaceTabs.p1).toBe("playbooks"));
+    } finally {
+      storage.restore();
+    }
+  });
+
+  test("[run-view-67] a stored surface the rail does not hold opens Projects", () => {
+    const storage = keepStorage({ "spex.surface": "Environments" });
+    try {
+      render(<App />);
+      expect(screen.getByRole("main").getAttribute("aria-label")).toBe("Projects");
+      expect(useAppStore.getState().workspaceTabs.p1).toBe("a-live");
+    } finally {
+      storage.restore();
+    }
+  });
+
+  test("[run-view-58] the strip pins Specs, Playbooks, Packages and Overview in order, each in the tab list and the cycle", async () => {
+    render(<App />);
+    const pinned = [...screen.getAllByRole("tab")].filter((tab) => tab.dataset.testid?.startsWith("workspace-tab-"));
+    expect(pinned.map((tab) => tab.dataset.testid)).toEqual([
+      "workspace-tab-specs",
+      "workspace-tab-playbooks",
+      "workspace-tab-packages",
+      "workspace-tab-overview",
+    ]);
+    expect(screen.getByTestId("workspace-tab-playbooks").textContent).toBe("Playbooks");
+    expect(screen.getByTestId("workspace-tab-packages").textContent).toBe("Packages");
+
+    // The arrows walk them in order.
+    const specs = screen.getByTestId("workspace-tab-specs");
+    specs.focus();
+    fireEvent.keyDown(specs, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(screen.getByTestId("workspace-tab-playbooks"));
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(screen.getByTestId("workspace-tab-packages"));
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(screen.getByTestId("workspace-tab-overview"));
+
+    // Activated, each shows its view.
+    fireEvent.click(screen.getByTestId("workspace-tab-playbooks"));
+    expect(useAppStore.getState().workspaceTabs.p1).toBe("playbooks");
+    expect(await screen.findByTestId("playbooks-tab")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("workspace-tab-packages"));
+    expect(useAppStore.getState().workspaceTabs.p1).toBe("packages");
+    expect(await screen.findByTestId("packages-tab")).toBeTruthy();
+    expect(screen.queryByTestId("playbooks-tab")).toBeNull();
+    // Their commands name the project (playbook-library-1, -92).
+    await vi.waitFor(() => expect(commandMock).toHaveBeenCalledWith("environment.get", { repository: "p1" }));
+    expect(commandMock).toHaveBeenCalledWith("environment.playbooks", { projectId: "p1" });
+
+    // ⌘⇧] from Specs walks Playbooks, Packages, then Overview.
+    fireEvent.click(specs);
+    for (const next of ["playbooks", "packages", "overview"]) {
+      fireEvent.keyDown(window, { code: "BracketRight", metaKey: true, shiftKey: true });
+      expect(useAppStore.getState().workspaceTabs.p1).toBe(next);
+    }
+  });
+
+  test("the start view's way to the playbooks opens the project's Playbooks tab", async () => {
+    useAppStore.setState({ workspaceTabs: { p1: "start" } });
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "No playbooks available" }));
+    expect(useAppStore.getState().workspaceTabs.p1).toBe("playbooks");
+    expect(screen.getByRole("main").getAttribute("aria-label")).toBe("Projects");
+    expect(await screen.findByTestId("playbooks-tab")).toBeTruthy();
+  });
+});

@@ -1,0 +1,306 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai> -->
+
+# app-shell: Desktop Shell
+
+## Intent
+
+This spec covers the Spex desktop shell (`apps/desktop`) — the single-window Electron app with OS notifications, dock badge, native dialogs, and app lifecycle — its guarded source-development launch, its implementation requirements (process topology over the core's WebSocket protocol, login-shell environment capture, packaging that keeps spawned agent binaries executable), and its source-run and packaged-app verification coverage.
+
+## External Behavior
+
+### Launch
+
+#### app-shell-1
+
+Where the host platform is supported [[core-service-89](core-service.md#core-service-89)], when the user launches Spex, the app shall open a single main window whose UI is connected to the in-app core service — and, through its relay paths, to each seat the person opens on a team server [[core-service-129](core-service.md#core-service-129)] ([DR-133](../decisions/133-one-desktop-over-several-cores.md)) — without requiring the user to start any separate server or open a browser.
+
+#### app-shell-2
+
+While a Spex instance is running, when the user launches Spex again, the app shall focus the running instance's main window and exit the second launch without opening another window or starting a second core service.
+
+### Notifications and Attention
+
+#### app-shell-40
+
+While the main window is open, the app shall refuse to narrow it below 600px, so the spec view's stacked graph keeps its 320px floor beside the open sidebar ([DR-158](../decisions/158-a-legible-graph-and-outline.md)).
+
+#### app-shell-3
+
+Where the shared config file's notification preferences enable an event kind, when a project session emits an event of that kind — a finished turn (`turn_finished`), a question awaiting the Boss's reply (`awaitBossReply`), or a failure — the app shall post a native desktop notification naming the project and the event:
+
+- Where the preferences disable an event kind, the app posts no notification for events of that kind.
+
+#### app-shell-29
+
+When the app composes text of its own — a notification's title and body [[app-shell-3](#app-shell-3)], the quit confirmation [[app-shell-7](#app-shell-7)], the startup failure — the app shall speak the home's interface language, resolved as a client of the embedded core with the operating system's languages standing for the reader's system [[localization-2](localization.md#localization-2)], from its own catalog [[localization-6](localization.md#localization-6)], so the desktop's own words match the page's:
+
+- the shell passes the operating system's preferred languages to the core it embeds at start, so the core resolves the reader's system as the shell does [[core-service-111](core-service.md#core-service-111)].
+
+#### app-shell-4
+
+While the attention count published by the Dashboard [[dashboard-9](dashboard.md#dashboard-9)] is non-zero — the count the core reads over its own badge and each open seat's [[core-service-129](core-service.md#core-service-129)] — the app shall display that count as the dock or taskbar badge:
+
+- When the attention count becomes zero, the app removes the badge.
+
+#### app-shell-5
+
+When the user clicks a desktop notification posted by the app, the app shall focus the main window and bring the project session that produced the notified event into view.
+
+### Native Dialogs
+
+#### app-shell-6
+
+When a UI flow requests a file or directory selection (for example, choosing a project directory or a playbook source), the app shall present the operating system's native file dialog and deliver the selected path to the requesting flow:
+
+- When the user cancels the dialog, the app delivers no path and changes no state.
+
+#### app-shell-28
+
+When a UI flow asks to reveal a path lying inside the state root, the app shall show that path in the operating system's file manager and change no state ([DR-057](../decisions/057-space-surface.md)): a path outside the state root is ignored, and a deployment without the bridge offers the path itself instead.
+
+#### app-shell-37
+
+When a UI flow asks to open an instance's sign-in URL, the app shall open that URL in the operating system's default browser and change no state ([DR-103](../decisions/103-the-home-and-its-groups.md), [DR-127](../decisions/127-a-home-signed-in-to-several-instances.md)): a URL not at the origin of an instance the home lists [[storage-2](storage.md#storage-2)] or is signing in to [[git-host-2](git-host.md#git-host-2)], or one carrying a credential, is refused with no browser opened, and a deployment without the bridge shows the URL as a link to open instead.
+
+### Quit
+
+#### app-shell-7
+
+While at least one project session has an active turn, when the user initiates quit, the app shall show a confirmation naming the projects with active turns and shall quit only after explicit confirmation:
+
+- When the user cancels that confirmation, the app keeps running with those sessions unaffected.
+- When the app quits, the app disposes every live session's runtime [[core-service-39](core-service.md#core-service-39)] before the process exits, leaving no orphan agent processes; the confirmation says a message continues the conversation later ([DR-051](../decisions/051-runtime-held-for-a-turn.md)).
+
+#### app-shell-39
+
+When the desktop's main process receives `SIGINT` or `SIGTERM`, the app shall stop the core [[core-service-39](core-service.md#core-service-39)] without the active-turn confirmation of [[app-shell-7](#app-shell-7)] and exit with status 130 or 143 respectively once the core has stopped or after 10 seconds, whichever comes first ([DR-108](../decisions/108-the-root-lease-names-the-machine.md)):
+
+- a second signal during that wait exits at once with the same status;
+- the core's stop releases the state root, so `Ctrl+C` in `npm start` leaves no `.lease/` behind.
+
+### Offline Operation
+
+#### app-shell-8
+
+The app shall require network access only for agent turns and forge operations ([DR-006](../decisions/006-projects-and-forge.md)):
+
+- While the machine has no network connectivity, the app launches, opens projects, browses session history, and edits settings, and surfaces agent-turn and forge-operation failures as errors without blocking other functionality.
+
+### About
+
+#### app-shell-9
+
+When the user opens the About dialog, the app shall display the application name Spex and the installed build's version (the `MAJOR.MINOR.PATCH` of its `app-v*` release tag; see [[app-shell-14](#app-shell-14)]).
+
+#### app-shell-21
+
+When the user activates an external link anywhere in the app, the shell shall open it in the system browser and keep the app window on the app — the window shall never navigate to a remote page or open one in a child window.
+
+#### app-shell-41
+
+While the main window shows a frame inside the page — an applet's [[applets-2](applets.md#applets-2)] — when the framed page navigates that frame, by script, a link or a form, the shell shall let the navigation proceed only at the in-app core endpoint's origin, `http://127.0.0.1:<port>`, and otherwise prevent it before any request leaves, nothing opening in the system browser, so a page the IDE frames carries what it read nowhere else ([DR-161](../decisions/161-an-applet-is-a-page-the-ide-serves.md)); the window's own navigation keeps its rule [[app-shell-21](#app-shell-21)].
+
+### App Icon
+
+#### app-shell-23
+
+Where the app is built for distribution, the packaged app shall carry the Spex product logo ([DR-013](../decisions/013-sublang-brand.md)) as its application icon, so the dock, app switcher, and installer show the brand mark.
+
+### Source Development
+
+#### app-shell-26
+
+Where `npm ci` has installed the repository dependencies and built `better-sqlite3` for system Node, when a contributor invokes root `npm start`, the command shall invoke root `npm run build` and, after it succeeds, rebuild `better-sqlite3` for Electron, launch the desktop app with the contributor's command-line arguments forwarded unchanged to Electron, and rebuild `better-sqlite3` for system Node before returning:
+
+1. A build failure returns non-zero without changing the native ABI.
+2. Once the Electron rebuild is attempted, normal app exit, command failure, SIGINT, and SIGTERM each lead through the Node rebuild before the command returns.
+3. An interrupted or failed build, Electron rebuild, or app launch returns non-zero after any required restore.
+4. A failed Node rebuild reports the restore failure with an actionable warning and any preceding stage failure, then selects the command outcome in this order: a signal that interrupted an active stage returns 130 or 143; otherwise, a preceding stage failure keeps its status; otherwise, a signal first received during restoration returns 130 or 143 even when restoration fails; otherwise, the restore failure returns 1.
+5. On Windows, the ABI rebuild stages return without rebuilding an addon, since legacy database reads use bundled Node SQLite ([DR-178](../decisions/178-native-windows-private-storage.md)).
+6. On a POSIX host, a signal forwarded to the launch stage's process group is followed, 15 seconds later if that stage has not exited, by `SIGKILL` to the same group, so the Node rebuild is never held by an app that ignores the signal ([DR-108](../decisions/108-the-root-lease-names-the-machine.md)).
+
+#### app-shell-31
+
+Where the host is macOS, when `better-sqlite3` is rebuilt for either ABI [[app-shell-26](#app-shell-26)], the rebuild shall run its build with the bare name `libtool` resolving to the Apple toolchain's `libtool` — the one `xcrun --find libtool` names — even when another `libtool` precedes it on the contributor's PATH, with the rest of the environment as the contributor set it:
+
+- Where `xcrun` names no `libtool`, the rebuild runs with the environment as the contributor set it.
+
+### Process Topology
+
+#### app-shell-10
+
+The shell shall run the core service in the Electron main process or an Electron utility process, load the built UI in a renderer window, and connect the renderer to the core over the core's WebSocket protocol exactly as a browser client connects:
+
+- The shell carries no application features — commands, state, records, config — over Electron IPC; Electron-specific channels are limited to the shell's own OS integrations (native dialogs, notifications, badge, quit handling), so the UI bundle runs unmodified in a browser against the same core.
+
+## Internal Behavior
+
+### Renderer Isolation
+
+#### app-shell-11
+
+The shell shall create renderer windows with the Chromium sandbox enabled, Node integration disabled, and context isolation enabled [[1]]:
+
+- The renderer has no direct Node or Electron API access; its data and effects flow only through the WebSocket protocol and the shell's OS-integration channels.
+
+### Environment Capture
+
+#### app-shell-12
+
+When the app starts, the shell shall pass its inherited launch environment to the core, merged on POSIX with the user's login-shell environment captured once, before the core runs any adapter readiness check or spawns any agent process ([DR-178](../decisions/178-native-windows-private-storage.md)):
+
+- On Windows, the inherited PATH follows the application directory, the bundled Git command directory and its actual root `usr/bin` helper directory, so supplied helpers such as `env.exe` are callable without WSL or a global tool installation.
+- The shell persists no captured environment values and does not refresh the snapshot while running, so shell-profile changes take effect on the next launch.
+
+### Supplied Runtimes
+
+#### app-shell-33
+
+The desktop shell shall declare the `claude`, `codex` and `opencode` agent SDKs at the unconstrained range ([DR-024](../decisions/024-app-supplied-agent-runtimes.md)), the playbook compiler `@sublang/slc` at a caret on its CLI contract ([DR-081](../decisions/081-the-app-supplies-the-compiler.md)), and its host engine `@sublang/playbook` at a range compatible with the core and compiler ([DR-167](../decisions/167-the-compiler-shares-the-apps-engine.md)) as its `apps/desktop` package's own dependencies, and shall start the core it embeds with its own Electron binary as the compile runtime and the module directories above its own module [[playbook-library-83](playbook-library.md#playbook-library-83)] — each inside the asar archive named by its asar-unpacked copy [[app-shell-13](#app-shell-13)], so the engine links an install provisions [[environments-11](environments.md#environments-11)] resolve on the real file system — and with the checkout's own scaffold CLI `@sublang/spex` found there, on that binary run as Node, as the scaffold command [[projects-31](projects.md#projects-31)] ([DR-096](../decisions/096-the-app-supplies-the-scaffold.md)), so compiles and scaffolds run on the app's own Node and find the compiler, the scaffold CLI and the SDKs the app ships:
+
+- bounded Windows Codex calls use the supplied adapter's compatible native sandbox selection and command-shell guidance, preserving their declared permission and approval values ([DR-175](../decisions/175-windows-bounded-codex-commands.md));
+- the shell declares the same shared Playbook dependency as its embedded core, so packaging keeps an older compiler-private runtime from becoming the engine linked into installed playbooks ([DR-178](../decisions/178-native-windows-private-storage.md));
+- the shell also ships the built-in spec package the core seeds at start [[environments-11](environments.md#environments-11)], staged from the `@sublang/playbook` it depends on at build time, so the built-in playbooks work offline from the first start ([DR-104](../decisions/104-spec-package-format-and-client-environments.md)).
+
+### Packaging
+
+#### app-shell-13
+
+Where the app is packaged, the packaged app shall ship its complete `node_modules` dependency tree outside the asar archive as asar-unpacked files [[2]], keeping spawned native binaries and Cligent-owned Node child modules in one physically resolvable dependency tree, while app code and UI remain archived ([DR-097](../decisions/097-media-and-browser-tools-across-hosts.md)).
+
+### Release
+
+#### app-shell-14
+
+When a valid tag matching `app-v*` is pushed, the app release workflow shall create a GitHub release for that tag carrying the version's notes from the app changelog, the run-from-source instructions and both native desktop downloads ([DR-176](../decisions/176-native-desktop-tag-packages.md)):
+
+- the workflow confirms the CI workflow concluded `success` for the tagged commit, verifies the tag's version against both shells' `package.json`, and builds and tests the tree before creating the release — empty notes or a mismatch fail it without a release;
+- the release names Node.js 22.19 or later and, from a checkout of its tag, `npm ci`, `npm start` for the desktop, and `npm run start:server` for the server shell as the way to run it;
+- the desktop package names its Electron version exactly, never as a range: the local packager (`npm run package -w apps/desktop`, electron-builder [[3]]) downloads the platform binaries of one release and refuses a range outright;
+- the downloads are a macOS Apple Silicon DMG and a Windows x64 per-user NSIS installer ([DR-177](../decisions/177-native-desktop-installers.md)), named with version, platform and architecture, with SHA-256 checksums and notes identifying unsigned and non-notarized status;
+- native runners build both downloads with the shipped physical dependency tree [[app-shell-13](#app-shell-13)], and the workflow publishes only after both packaging jobs succeed [[release-37](release.md#release-37)];
+- the workflow does not publish to npm and does not run for CLI tags, keeping the release channels disjoint [[release-19](release.md#release-19)].
+
+### App Data
+
+#### app-shell-15
+
+The shell shall start the core against the shared state root of [DR-036](../decisions/036-file-state-store.md), keeping under Electron `userData` [[4]] only the renderer profile the browser engine itself writes:
+
+- The shell writes no app-only state to the shared config file or into project working trees ([DR-004](../decisions/004-config-and-persistence.md)).
+- The shell hands the core the legacy `userData` store path, so the core's one-time import [[core-service-64](core-service.md#core-service-64)] finds a store an earlier release left there.
+- The shell starts the core with the browser sign-in flow [[git-host-2](git-host.md#git-host-2)] and names its own executable as the runtime of the Git credential helper [[git-host-9](git-host.md#git-host-9)], so a clone, fetch or push to the Git host runs with no Node beyond the app's.
+
+### Native Bridge
+
+#### app-shell-20
+
+The desktop package shall expose the native bridge of [DR-008](../decisions/008-native-shell-bridge.md) as a `contextBridge` API from a sandboxed preload, limited to OS affordances impossible from a sandboxed web page (directory picking, path reveal, and opening the Git host's sign-in URL in the system browser [[git-host-2](git-host.md#git-host-2)], one invoke channel each), carrying no application feature, and absent by design in non-Electron deployments so the UI's feature detection selects the manual fallback:
+
+- the open-URL channel accepts only a URL at the origin of an instance the home lists or is signing in to [[app-shell-37](#app-shell-37)], refusing any other ([DR-127](../decisions/127-a-home-signed-in-to-several-instances.md)).
+
+#### app-shell-22
+
+The renderer shall enforce a content security policy that denies remote script, connection, image, and media loading (data: images and local blob: image/media URLs excepted):
+
+- Transcript markdown does not fetch remote images, so untrusted agent output cannot beacon out of the app.
+
+#### app-shell-24
+
+Where the live-smoke handshake variable names a file ([DR-020](../decisions/020-desktop-live-smoke.md)) or the acceptance variable names a screenshot, and the smoke user-data variable names a directory, when the desktop app starts, the desktop package shall redirect its user-data directory and its state root to that directory before taking its single-instance lock and before opening any store — so a developer's own running Spex neither holds the run's lock nor shares its state — start the core as usual, and, in the handshake case, write the core's socket address to the named file only after the core is listening:
+
+- Where the handshake and acceptance variables are both set, the app refuses to launch naming the conflict.
+- Where neither variable is set, the behavior is unchanged.
+
+## Verification
+
+### Packaged App Coverage
+
+#### app-shell-16
+
+Where a packaged macOS arm64 build is installed with a profile backed by a fake adapter that spawns a child process, when the test suite launches the packaged app, the test suite shall assert that a single main window opens with the UI connected to the in-app core [[app-shell-1](#app-shell-1)] over WebSocket [[app-shell-10](#app-shell-10)], and that a Boss turn through the fake adapter's spawned child completes [[app-shell-13](#app-shell-13)] with its records rendered in the session's run view, so packaged spawning and the protocol seam are proven together:
+
+- the Space surface's reveal control shows a state-root path in the operating system's file manager, and a path outside the state root changes nothing [[app-shell-28](#app-shell-28)].
+
+#### app-shell-17
+
+While a packaged app instance is running, when the test suite launches a second instance, the test suite shall assert that the second launch exits without opening a window, that the first instance's main window gains focus [[app-shell-2](#app-shell-2)], and that exactly one core WebSocket endpoint remains listening.
+
+### Notification Coverage
+
+#### app-shell-18
+
+Where a fixture playbook that raises an `awaitBossReply` question is enabled and the shared config enables that notification kind, when the test suite runs a session until the question is raised, the test suite shall assert that a native desktop notification is posted identifying the project session [[app-shell-3](#app-shell-3)]:
+
+- While the question awaits a reply, the test suite asserts that the dock or taskbar badge displays the attention count [[app-shell-4](#app-shell-4)].
+- When the question is then answered, the test suite asserts that the badge is removed [[app-shell-4](#app-shell-4)].
+- Where the shared config disables that notification kind, the test suite asserts that the same fixture run posts no notification [[app-shell-3](#app-shell-3)].
+
+#### app-shell-30
+
+Where the home's interface language is `zh`, when a project session finishes a turn, the test suite shall assert that the notification's title and body read their Chinese phrases, and that with no stored choice the system languages `["zh-Hans-CN", "en-US"]` yield the same while `["en-US"]` yields English [[app-shell-29](#app-shell-29)].
+
+### App Data Coverage
+
+#### app-shell-25
+
+Where a packaged build launches with its user-data directory and state root redirected [[app-shell-24](#app-shell-24)] and a legacy store seeded at the redirected user-data path, the test suite shall assert the state-root contract of [[app-shell-15](#app-shell-15)]: the app's durable state lands under the redirected root, nothing but the renderer profile is written under user-data, and the seeded store's sessions appear in the app's session list.
+
+### Environment Coverage
+
+#### app-shell-19
+
+Where an environment variable consulted by an adapter readiness check (for example, `ANTHROPIC_API_KEY`) is exported only in the user's login-shell profile and absent from the app's launch environment, when the test suite starts the app and queries adapter readiness, the test suite shall assert that the check reports the adapter ready, proving the captured login-shell environment reached the core before readiness checks ran [[app-shell-12](#app-shell-12)].
+
+### Supplied Runtime Coverage
+
+#### app-shell-34
+
+When the desktop's test suite reads the package manifest and resolves the compile toolchain with the desktop's Electron binary as the runtime over the module directories above the desktop's own module, the test suite shall assert that the three SDKs, the compiler and its host Playbook are declared, that the resolved compiler is the app's own copy run on that binary, that the scaffold command resolved over those directories is the checkout's own `packages/cli` entry on that binary run as Node, and that for a module inside an asar archive the directories handed are the archive's asar-unpacked ones [[app-shell-33](#app-shell-33)].
+
+### Source-Run Coverage
+
+#### app-shell-27
+
+Where executable npm and Electron fixtures stand in for their external effects, when the source-run integration suite drives the desktop runner through its real process executor, the suite shall assert the guarded launch behavior of [[app-shell-26](#app-shell-26)]:
+
+- a normal run invokes the repository-root build, Electron rebuild, app launch, and Node restore in order, forwarding the launch arguments unchanged [[app-shell-26](#app-shell-26)];
+- build, Electron-rebuild, launch, and restore failures take the required restore path, report both a stage and restore failure when they coincide, and return the required status [[app-shell-26](#app-shell-26)];
+- on a POSIX host, real SIGINT and SIGTERM delivery during launch terminates the detached fixture app and its grandchild, leaves neither orphaned, runs the Node restore, and returns 130 and 143 respectively [[app-shell-26](#app-shell-26)];
+- on a POSIX host, a signal first delivered during a failing restore waits for the restore and reports its failure; after otherwise successful stages it returns the signal status, while after an app-launch failure it also reports that failure and preserves its status [[app-shell-26](#app-shell-26)];
+- a launch stage that ignores the forwarded signal is killed with `SIGKILL` after the bounded wait and the run still restores Node and returns the signal status, while a stage that exits within the wait is never killed [[app-shell-26](#app-shell-26)].
+
+#### app-shell-32
+
+Where the host is macOS with Apple's command-line tools installed, when the source-run integration suite runs each ABI rebuild — the Node restore with a stub `npm`, the Electron rebuild with a stub `@electron/rebuild` — on a PATH led by the stubs' directory and a fixture `libtool` that rejects every option, the suite shall assert for each rebuild that the `libtool` the stub resolves is the file `xcrun --find libtool` names and answers `-V` as Apple's while the fixture answers on the same PATH outside the rebuild, that the contributor's PATH follows the one directory the rebuild prepends, and that the directory is gone once the rebuild returns [[app-shell-31](#app-shell-31)].
+
+#### app-shell-35
+
+Where the fresh-install smoke ([DR-086](../decisions/086-tests-in-tiers.md)) has cloned the committed tree into a scratch directory and installed it with `npm ci` on an empty npm cache, when the smoke runs that clone's root `npm start` with the acceptance variable naming a screenshot, the smoke user-data variable naming a scratch directory whose Spex home stores English as its language, and a scratch Spex home, the smoke shall assert the guarded launch in its installed shape: the command builds the workspaces, rebuilds the native module for Electron, launches the app, and returns zero after restoring the module for Node [[app-shell-26](#app-shell-26)]; the app took its lock and its state under the scratch directories, the developer's own Spex untouched [[app-shell-24](#app-shell-24)]; the render exited clean with the screenshot written; and the render reported the main window's minimum width as 600px [[app-shell-40](#app-shell-40)].
+
+#### app-shell-38
+
+When the desktop's test suite starts a real core through the shell's own option builder with a home listing the first of two stand-in instances and drives the open-URL channel while a sign-in to the second runs, the test suite shall assert that the core was started with the browser sign-in flow and the Electron binary as the helper's runtime [[app-shell-15](#app-shell-15)], that the channel opens the core's own browser sign-in URL at the second instance and a URL at the first [[app-shell-37](#app-shell-37)], and that it refuses one at an origin the home neither lists nor is signing in to — the first's host at another port among them — one carrying a credential, and, once that sign-in is cancelled, one at the second, returning false and opening nothing [[app-shell-37](#app-shell-37)] [[app-shell-20](#app-shell-20)].
+
+#### app-shell-42
+
+When the desktop's test suite starts a real core through the shell's own option builder and drives the frame guard with that core's endpoint, the test suite shall assert that a sub-frame navigation to a capability path, to a path under `~/` there and to the endpoint's root is allowed, that one to another loopback port, to `localhost` at the endpoint's port, to an `https` origin, to a `file:` URL, to `about:blank`, to a `javascript:` or `data:` URL and to no URL is prevented, and that the main window hands every sub-frame navigation to that guard with the endpoint it loaded the page against [[app-shell-41](#app-shell-41)].
+
+### Release Coverage
+
+#### app-shell-36
+
+When the app release workflow's tag check and notes assembly run, as the workflow runs them, over a checkout holding a changelog and both shell manifests for an `app-vMAJOR.MINOR.PATCH` tag, the test suite shall assert the regular release's checks and instructions:
+
+- the notes end with the run-from-source instructions, which name Node.js 22.19 — the root manifest's engine floor — or later and check out that tag before `npm ci`, `npm start` and `npm run start:server` [[app-shell-14](#app-shell-14)];
+- the notes link both versioned native downloads and their checksums, identify unsigned and non-notarized status, and include native Windows in the source instructions [[app-shell-14](#app-shell-14)];
+- either shell's manifest off the tag's version refuses the release [[app-shell-14](#app-shell-14)];
+- a version with no changelog section is refused as empty notes [[app-shell-14](#app-shell-14)].
+
+## References
+
+[1]: https://www.electronjs.org/docs/latest/tutorial/security "Electron security tutorial"
+[2]: https://www.electronjs.org/docs/latest/tutorial/asar-archives "Electron ASAR archives"
+[3]: https://www.electron.build/ "electron-builder documentation"
+[4]: https://www.electronjs.org/docs/latest/api/app "Electron app API"
