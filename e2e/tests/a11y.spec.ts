@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// Accessibility as a journey (run-view-102): every surface scanned by
+// axe-core at WCAG 2.1 AA, in both themes; serious and critical
+// violations fail the run. The authoring workspace is scanned in each
+// of its states (playbook-library-77): empty, paste mode, a turn with
+// the source appearing, compiling, failed, compiled with each tab,
+// the editor, and the agent picker. Settings is scanned again at a
+// phone's width, where its shortcut sheet scrolls sideways and must
+// take a keyboard stop of its own (run-view-50).
+
+import AxeBuilder from "@axe-core/playwright";
+import type { Page } from "@playwright/test";
+
+import { test, expect, open, nav, packagesSection, projectTab, send, settled, slowAuthoringScript } from "../src/harness";
+
+test.use({
+  appOptions: {
+    project: true,
+    // The failing-then-passing stub, with the replies held long enough
+    // for a scan inside each state, and each compile run held in its
+    // first phase until the journey has scanned the compiling state.
+    authoring: { script: slowAuthoringScript(4000), slc: "fail:gears2fsm", hold: true },
+  },
+});
+
+async function scan(page: Page, surface: string): Promise<string[]> {
+  const results = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+    .analyze();
+  return results.violations
+    .filter((v) => v.impact === "serious" || v.impact === "critical")
+    .map(
+      (v) =>
+        `${surface}: [${v.impact}] ${v.id} — ${v.help} (${v.nodes.length} node${v.nodes.length === 1 ? "" : "s"}; e.g. ${v.nodes[0]?.target.join(" ")} :: ${v.nodes[0]?.html.slice(0, 160)})`,
+    );
+}
+
+for (const theme of ["light", "dark"] as const) {
+  test(`run-view-102: no serious or critical violation on any surface (${theme})`, async ({
+    page,
+    app,
+  }) => {
+    test.setTimeout(150_000);
+    await page.emulateMedia({ colorScheme: theme });
+    await open(page, app);
+    const found: string[] = [];
+
+    found.push(...(await scan(page, "Captain home")));
+
+    await send(page, "Fix the token refresh in auth.ts");
+    await expect(page.getByTestId("captain-pane")).toContainText("/code finished");
+    found.push(...(await scan(page, "Session")));
+
+    // One agent's settings for this conversation: three selects and
+    // their labels inside a dialog (run-view-138).
+    await page.getByTestId("agent-chip-dev.coder").click();
+    await expect(page.getByTestId("agent-settings-dev.coder")).toBeVisible();
+    found.push(...(await scan(page, "Session (agent settings)")));
+    await page.keyboard.press("Escape");
+
+    // A run parked in its recoverable failure state, where the notice
+    // and its one control stand (run-view-128, DR-060).
+    await page.getByTestId("boss-composer").fill("Fail the follow-up patch");
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await expect(page.getByTestId("failed-workflow")).toBeVisible();
+    found.push(...(await scan(page, "Session (failed workflow)")));
+
+    // The Dashboard with a summons standing (dashboard-54): a session
+    // the page never shows finishes a turn, so its unread-turn row is
+    // there whenever the scan runs — the journey's own session's turn
+    // may end before or after the reader leaves it, which decided
+    // whether a row stood here at all, and the row's dimmed 12 px text
+    // once read 4.1:1 on the light amber row.
+    await settled(app);
+    const unread = await app.core.command("session.create", { projectId: app.projectId! });
+    await app.core.command("turn.submit", { sessionId: unread.id, text: "Tidy the changelog" });
+    await nav(page, "Dashboard").click();
+    await expect(page.getByTestId(`project-group-${app.projectId}`)).toBeVisible();
+    await expect(page.getByTestId(`attention-${unread.id}-review`)).toBeVisible({ timeout: 30_000 });
+    found.push(...(await scan(page, "Dashboard")));
+
+    await nav(page, "Projects").click();
+    await page.getByRole("tab", { name: "Overview" }).click();
+    await expect(page.getByTestId("overview-tab")).toBeVisible();
+    found.push(...(await scan(page, "Overview")));
+
+    await page.getByRole("tab", { name: "Specs" }).click();
+    await expect(page.getByTestId("specv-live")).toBeVisible();
+    found.push(...(await scan(page, "Specs")));
+
+    await projectTab(page, "Packages");
+    await expect(packagesSection(page, "personal").getByTestId("environment-section")).toBeVisible();
+    found.push(...(await scan(page, "Packages tab")));
+
+    await projectTab(page, "Playbooks");
+    await expect(page.getByTestId("playbooks-enabled")).toBeVisible();
+    found.push(...(await scan(page, "Playbooks tab")));
+
+    // The authoring workspace, state by state (DR-058).
+    const idField = page.getByTestId("new-playbook-id");
+    // The project's defaults fill Org and License (playbook-library-51).
+    await expect(page.getByTestId("new-playbook-license")).toHaveValue("Apache-2.0");
+    await idField.fill("triage");
+    await idField.press("Enter");
+    await expect(page.getByTestId("authoring-workspace")).toBeVisible();
+    found.push(...(await scan(page, "Workspace (no source)")));
+    await page.getByRole("button", { name: "Paste", exact: true }).click();
+    await expect(page.getByTestId("paste-text")).toBeVisible();
+    found.push(...(await scan(page, "Workspace (paste mode)")));
+    await page.getByTestId("paste-cancel").click();
+    await page.getByTestId("draft-composer").fill("I want a playbook that triages new issues into labels.");
+    await page.getByTestId("draft-send").click();
+    await expect(page.getByTestId("source-markdown")).toContainText("Triager");
+    await expect(page.getByTestId("draft-working")).toBeVisible();
+    found.push(...(await scan(page, "Workspace (turn running, source appearing)")));
+    const band = page.getByTestId("compile-band");
+    await expect(band).toHaveAttribute("data-outcome", "running");
+    found.push(...(await scan(page, "Workspace (compiling)")));
+    // The held run moves on to its failure once the scan is done.
+    app.releaseCompile("triage");
+    await expect(band).toHaveAttribute("data-outcome", "failed");
+    await expect(page.getByTestId("compile-output")).toBeVisible();
+    found.push(...(await scan(page, "Workspace (failed)")));
+    // The relay's compile, held the same way, passes once released.
+    app.releaseCompile("triage");
+    await expect(
+      page.locator('[data-testid="directive-card"][data-kind="register"]'),
+    ).toBeVisible({ timeout: 45_000 });
+    await expect(page.getByTestId("draft-chip")).toContainText("Compiled");
+    await expect(page.getByTestId("draft-working")).toHaveCount(0);
+    found.push(...(await scan(page, "Workspace (compiled)")));
+    const tabs = page.getByRole("tablist", { name: "Draft artifacts" });
+    await tabs.getByRole("tab", { name: "Gears", exact: true }).click();
+    await expect(page.getByTestId("item-toggle-triage-1")).toBeVisible();
+    found.push(...(await scan(page, "Workspace (Gears)")));
+    await tabs.getByRole("tab", { name: "Machine", exact: true }).click();
+    await expect(page.getByTestId("stage-states-draft-triage")).toBeVisible();
+    found.push(...(await scan(page, "Workspace (Machine)")));
+    await tabs.getByRole("tab", { name: "Enable", exact: true }).click();
+    await expect(page.getByTestId("register-form")).toBeVisible();
+    found.push(...(await scan(page, "Workspace (Enable)")));
+    await tabs.getByRole("tab", { name: "Source", exact: true }).click();
+    await page.getByTestId("source-edit").click();
+    await expect(page.getByTestId("spec-editor")).toBeVisible();
+    found.push(...(await scan(page, "Workspace (editing)")));
+    await page.getByTestId("editor-cancel").click();
+    await page.getByTestId("draft-agent").click();
+    await expect(page.getByTestId("agent-picker")).toBeVisible();
+    found.push(...(await scan(page, "Workspace (agent picker)")));
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("agent-picker")).toHaveCount(0);
+    await page.getByTestId("workspace-back").click();
+    await expect(page.getByTestId("drafts-section")).toBeVisible();
+    found.push(...(await scan(page, "Playbooks tab (with a draft)")));
+
+    // Groups: your own group with its spex repositories (space-30);
+    // the picker and the tree are scanned by space-44.
+    await nav(page, "Space").click();
+    await expect(page.getByTestId("space-groups")).toBeVisible();
+    found.push(...(await scan(page, "Space")));
+
+    await nav(page, "Settings").click();
+    await expect(page.getByTestId("captain-section")).toBeVisible();
+    // The Captain's editor opens in place; scan the surface with it
+    // standing, so the shared editor's controls are covered too.
+    await page.getByTestId("captain-edit").click();
+    await expect(page.getByTestId("agent-editor")).toBeVisible();
+    found.push(...(await scan(page, "Settings")));
+
+    // The model field's list open: a trigger naming its value, a
+    // labelled listbox, and two-line rows with the runtime's own
+    // descriptions (settings-39, DR-091).
+    await page.getByTestId("agent-model-trigger").click();
+    await expect(page.getByTestId("agent-model-listbox")).toBeVisible();
+    found.push(...(await scan(page, "Settings (model list)")));
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("agent-model-listbox")).toHaveCount(0);
+
+    expect(found, found.join("\n")).toEqual([]);
+  });
+}
+
+// The narrow sweep (run-view-102): Settings at 360×640, where the
+// shortcut sheet overflows sideways. A box the reader can scroll that
+// holds nothing focusable must be a keyboard stop with a name
+// (run-view-50); axe reports one that is not as serious.
+test.describe("narrow", () => {
+  test.use({ appOptions: { project: true }, viewport: { width: 360, height: 640 } });
+
+  for (const theme of ["light", "dark"] as const) {
+    test(`run-view-102: no serious or critical violation on Settings at 360px (${theme})`, async ({
+      page,
+      app,
+    }) => {
+      await page.emulateMedia({ colorScheme: theme });
+      await open(page, app);
+      await nav(page, "Settings").click();
+      await expect(page.getByTestId("captain-section")).toBeVisible();
+      const sheet = page.getByRole("group", { name: "Keyboard shortcuts" });
+      await expect(sheet).toBeVisible();
+      // The sheet scrolls sideways here and is itself the stop.
+      expect(await sheet.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+      await expect(sheet).toHaveAttribute("tabindex", "0");
+      const found = await scan(page, `Settings 360px (${theme})`);
+      expect(found, found.join("\n")).toEqual([]);
+    });
+  }
+});

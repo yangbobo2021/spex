@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// The working line (run-view-90) above the Boss composer, naming the
+// open intent the lane serves, with Drop (run-view-113): behind the
+// inline confirm, since work is underway, the intent closes dropped
+// over the protocol while the turn keeps running. The outcome lands
+// in a status line where the working line stood, and focus never
+// strands — Keep returns it to the control, a drop hands it to the
+// composer once the line has left with its control.
+
+import { useEffect, useRef, useState } from "react";
+import type { IntentInfo } from "@sublang/spex-core/protocol";
+
+import { i18n } from "../i18n.js";
+import { intentTitle } from "./DeliveryCard.js";
+import { InlineConfirm } from "./InlineConfirm.js";
+
+/** How long the outcome line stays. */
+const NOTE_MS = 6_000;
+
+/** The outcome line and how it reads: the tone is a fact the drop
+ * reports, never something re-read from the note's words, which change
+ * with the language (localization-4). */
+interface Note {
+  text: string;
+  failed?: boolean;
+}
+
+export function WorkingLine({
+  intent,
+  inputAvailable,
+  onDrop,
+}: {
+  /** The newest open dispatched intent, or none: the line then yields
+   * to any outcome note still standing. */
+  intent?: IntentInfo;
+  /** Whether the conversation field is enabled; a temporary outcome
+   * focus returns there only while the notice still owns it. */
+  inputAvailable: boolean;
+  onDrop: (intent: IntentInfo) => Promise<void>;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [dropping, setDropping] = useState(false);
+  const [note, setNote] = useState<Note>();
+  const [refocus, setRefocus] = useState(false);
+  const dropRef = useRef<HTMLButtonElement>(null);
+  const noteRef = useRef<HTMLDivElement>(null);
+  const pendingInputFocus = useRef(false);
+  const noteTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => {
+    if (!refocus || confirming) return;
+    setRefocus(false);
+    if (dropRef.current) {
+      dropRef.current.focus();
+      return;
+    }
+    // The line left with its control: the composer below is the next
+    // sensible place (DR-010 §6).
+    const field = noteRef.current?.closest('[data-testid="captain-column"]')?.querySelector("textarea");
+    if (field && !field.disabled) field.focus();
+    else {
+      pendingInputFocus.current = true;
+      noteRef.current?.focus();
+    }
+  }, [refocus, confirming]);
+  useEffect(() => {
+    if (!note) pendingInputFocus.current = false;
+    if (!inputAvailable || !pendingInputFocus.current) return;
+    const notice = noteRef.current;
+    if (!notice || notice.ownerDocument.activeElement !== notice) {
+      pendingInputFocus.current = false;
+      return;
+    }
+    const field = notice.closest('[data-testid="captain-column"]')?.querySelector("textarea");
+    if (field && !field.disabled) {
+      pendingInputFocus.current = false;
+      field.focus();
+    }
+  }, [inputAvailable, note]);
+  useEffect(
+    () => () => {
+      if (noteTimer.current) clearTimeout(noteTimer.current);
+    },
+    [],
+  );
+
+  const drop = async (target: IntentInfo) => {
+    const title = intentTitle(target);
+    setConfirming(false);
+    setDropping(true);
+    try {
+      await onDrop(target);
+      setNote({
+        text: i18n._("Dropped “{title}” — the turn keeps running.", { title }),
+      });
+    } catch (cause) {
+      setNote({
+        text: i18n._("Couldn't drop “{title}”: {reason}", {
+          title,
+          reason: (cause as Error).message,
+        }),
+        failed: true,
+      });
+    } finally {
+      setDropping(false);
+      setRefocus(true);
+    }
+    if (noteTimer.current) clearTimeout(noteTimer.current);
+    noteTimer.current = setTimeout(() => {
+      // The temporary outcome owns only its own handoff, never a
+      // control the reader picked while work was settling.
+      const outcome = noteRef.current;
+      if (pendingInputFocus.current && outcome && outcome.ownerDocument.activeElement === outcome) {
+        const field = outcome.closest('[data-testid="captain-column"]')?.querySelector("textarea");
+        if (field && !field.disabled) field.focus();
+      }
+      pendingInputFocus.current = false;
+      setNote(undefined);
+    }, NOTE_MS);
+  };
+
+  return (
+    <>
+      {intent ? (
+        // Re-entry answered where the eye lands (run-view-90): the
+        // lane names what it is working on, raw text in the tooltip.
+        <div
+          data-testid="working-line"
+          title={intent.text}
+          className="flex items-center gap-1.5 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-1 text-xs text-neutral-600 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300"
+        >
+          <span className="shrink-0 font-medium">
+            {i18n._({
+              id: "Working:",
+              comment: "label before the intent the conversation is serving",
+            })}
+          </span>
+          <span className="min-w-0 flex-1 truncate">{intentTitle(intent)}</span>
+          {confirming ? (
+            <InlineConfirm
+              question={i18n._("Drop this intent? Work is underway.")}
+              confirmLabel={i18n._({
+                id: "Drop",
+                comment: "confirm: close the intent as dropped",
+              })}
+              cancelLabel={i18n._({
+                id: "Keep",
+                comment: "confirm: keep the intent open",
+              })}
+              onConfirm={() => void drop(intent)}
+              onCancel={() => {
+                setConfirming(false);
+                setRefocus(true);
+              }}
+            />
+          ) : (
+            <button
+              ref={dropRef}
+              type="button"
+              data-testid="working-drop"
+              disabled={dropping}
+              aria-label={i18n._("Drop {title}", { title: intentTitle(intent) })}
+              title={i18n._("Close this intent as dropped — the turn keeps running")}
+              onClick={() => setConfirming(true)}
+              className="min-h-6 shrink-0 rounded border border-neutral-300 px-1.5 py-0.5 text-neutral-600 hover:border-red-300 hover:text-red-600 disabled:animate-pulse dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-red-800 dark:hover:text-red-400"
+            >
+              {dropping
+                ? i18n._("Dropping…")
+                : i18n._({
+                    id: "Drop",
+                    comment: "confirm: close the intent as dropped",
+                  })}
+            </button>
+          )}
+        </div>
+      ) : null}
+      {note ? (
+        <div
+          ref={noteRef}
+          onBlur={() => {pendingInputFocus.current = false;}}
+          tabIndex={-1}
+          role="status"
+          data-testid="working-note"
+          className={`rounded-md border border-neutral-200 bg-neutral-50 px-3 py-1 text-xs dark:border-neutral-800 dark:bg-neutral-900 ${
+            note.failed ? "text-red-600 dark:text-red-400" : "text-neutral-500"
+          }`}
+        >
+          {note.text}
+        </div>
+      ) : null}
+    </>
+  );
+}

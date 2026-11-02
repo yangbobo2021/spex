@@ -1,0 +1,1005 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai> -->
+
+# playbook-library: Playbooks and Packages
+
+## Intent
+
+This spec covers a project's Playbooks and Packages tabs across their user-visible behavior, the implementation behind them, and the integration coverage that verifies them: the Packages tab managing the spec packages the environments of the project and your own group install — adding, updating, installing, removing and publishing them with the registry account they use — and the project's Playbooks tab and the global Playbooks surface listing the playbooks those spec packages place, which run with default players, mapping playbook roles to players and overriding a role for one project, and authoring new playbooks as spec packages under development in a chat-assisted workspace that compiles them in the environment's folder, requests them from that environment and adds them, backed by an authoring conversation runner, an authoring session store, compile execution, registry generation and config writes ([DR-104](../decisions/104-spec-package-format-and-client-environments.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md), [DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md)).
+Playbook entries live in the config files of the spex repositories a session runs with — the global config, your own group's, and the project's — which remain the source of truth under their fail-closed validation rules; a playbook's module comes from an environment's lock and never from a path in a shared file; compilation runs the app's own copy of the external `slc` toolchain, on the app's runtime or a Node.js meeting the compiler's floor, with its compiled outputs beside the playbook's text.
+Verification requires integration coverage of the surfaces' compile, request, add and config write paths, where correctness spans the external `slc` process, generated registry artifacts, the environments and the config files.
+
+## External Behavior
+
+### Playbook List
+
+#### playbook-library-1
+
+When a project's Playbooks tab is shown, the tab shall list every playbook that runs in the project [[core-service-2](core-service.md#core-service-2)] under two headings — ⟨project⟩, the playbooks the project's environment places [[environments-8](environments.md#environments-8)], and "Global", the playbooks the global environment places — showing for each its command, intent (a built-in's in the interface language [[localization-4](localization.md#localization-4)]), the spec package and version it comes from [[playbook-library-29](#playbook-library-29)], and each required role with the session player bound to it — its name beside its mark, its id in the tooltip [[run-view-177](run-view.md#run-view-177)] — and what that binding effectively runs ([DR-032](../decisions/032-session-players.md), [DR-104](../decisions/104-spec-package-format-and-client-environments.md), [DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md)):
+
+- a playbook both environments place, by one id, is listed once, under Global, with the bindings a session in the project runs it with — the project's entry where one stands, else the global [[core-service-2](core-service.md#core-service-2)];
+- a playbook standing aside for a command clash [[core-service-2](core-service.md#core-service-2)] is listed with "Stands aside · /⟨command⟩ is ⟨org/pkg⟩'s" in place of its roles;
+- roles one player plays stand on one line [[playbook-library-38](#playbook-library-38)], and a role whose project player differs from the global one carries a dot [[playbook-library-4](#playbook-library-4)];
+- a heading with no playbook is left out, and no row names a config or a scope — every act on the tab writes the project's config or the project's environment ([DR-069](../decisions/069-key-phrases-not-sentences.md));
+- the tab shows no spec package list, add control or registry account, only a link "Manage packages" opening the project's Packages tab [[playbook-library-92](#playbook-library-92)].
+
+#### playbook-library-122
+
+When the Playbooks surface is shown — the rail's Playbooks entry, for the selected place [[run-view-67](run-view.md#run-view-67)] — the surface shall list every spec package the global environment requests, each it requires beneath the one that required it [[environments-14](environments.md#environments-14)], each as the Packages tab's row reads it, with its overflow [[playbook-library-92](#playbook-library-92)] [[playbook-library-113](#playbook-library-113)], and beneath it the playbooks it places, each as the project tab lists it [[playbook-library-1](#playbook-library-1)], under a header carrying the global environment's registry and the account there [[playbook-library-119](#playbook-library-119)] and "Add…" as the Packages tab offers it [[playbook-library-92](#playbook-library-92)], followed by the Authoring section [[playbook-library-50](#playbook-library-50)] and "New playbook" [[playbook-library-51](#playbook-library-51)] ([DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md)):
+
+- ✎ on a role edits the global entry [[playbook-library-4](#playbook-library-4)], and every act on the surface writes the global config or the global environment;
+- the surface lists no project's playbook and names no project;
+- while the global environment requests no package, the list reads "No playbooks yet" above "Add…".
+
+#### playbook-library-2
+
+Where a written playbook entry fails the fail-closed config validation ([DR-004](../decisions/004-config-and-persistence.md)) — an unresolved required role, an option the entry may not carry — or names a playbook no environment of the session places [[environments-9](environments.md#environments-9)], the Playbooks tab shall list the entry marked with the specific failure and a Remove act deleting it [[playbook-library-3](#playbook-library-3)], rather than hiding it.
+
+### Packages Tab
+
+#### playbook-library-92
+
+While a project's Packages tab is shown, the tab shall present the project's environment under the heading "Packages", carrying the registry of its environment and the account there [[playbook-library-119](#playbook-library-119)], as one row per requested spec package with each spec package it requires under the one that required it [[environments-14](environments.md#environments-14)], these chips and these controls ([DR-104](../decisions/104-spec-package-format-and-client-environments.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md), [DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md)):
+
+| Part | Content |
+| --- | --- |
+| row | the spec package's name; its resolved version, or "—" with "no version yet" while unresolved; a source glyph whose tooltip reads "From the registry · ⟨range⟩" (⟨range⟩ as "any 1.x" for `^1.2.0`), "From folder ⟨path⟩", "From Git ⟨repository⟩ at ⟨rev⟩" [[environments-29](environments.md#environments-29)] or "Built in"; what it provides in one phrase, counting the artifacts its release provides [[environments-1](environments.md#environments-1)], as "1 spec · 2 skills · 1 playbook"; its standing: "Installed", "Not installed", "Files missing" with Install sending `environment.install`, a path source missing on this device, or "Not installed · private" with "Sign in" starting the registry sign-in [[playbook-library-119](#playbook-library-119)] where the state lists it among the packages the registry refused for want of a grant [[environments-14](environments.md#environments-14)]; on the built-in spec package's row, "Update to ⟨shipped⟩" sending `environment.resolve` where the environment's state names a newer shipped release [[environments-11](environments.md#environments-11)] |
+| an expanded row | one line per provided artifact [[environments-6](environments.md#environments-6)] with its one act, a fallback language marked, a support artifact unlisted: a playbook "/⟨command⟩", running with its package [[core-service-2](core-service.md#core-service-2)] and carrying no act; skills "skills: ⟨ids⟩ · placed for your agents", or "not placed"; the spec, "spec · in specs/packages/⟨pkg⟩.md", "spec · edited in specs/ — left as yours", "· ⟨version⟩ waiting" appended where a newer release waits, "spec · not placed — specs/ holds ⟨pkg⟩.md already" or "spec · needs specs/ — scaffold first" as the state reads its placement [[environments-14](environments.md#environments-14)], followed where links wait by "⟨n⟩ links wait for ⟨org/pkg⟩ · Add" requesting that package as "Add…" does; an applet "⟨id⟩ · its page", opening its tab [[applets-1](applets.md#applets-1)] |
+| a row's overflow | Remove, whose tooltip reads "Removes ⟨name⟩ from spex.yaml and uninstalls it", removing a direct request — the built-in spec package's as any other [[environments-11](environments.md#environments-11)] — behind an inline confirm reading "Remove" and "Keep" where another spec package requires it; Publish for a direct path request [[playbook-library-113](#playbook-library-113)] |
+| "spex.yaml, spex.lock not committed" | a chip on the project's environment while the code's `HEAD` lacks either file [[environments-26](environments.md#environments-26)], its tooltip reading "Commit them with the code so every member installs the same packages" |
+| "spex.yaml changed" | a chip with Update sending `environment.resolve` while the lock is stale or a conflict stands, the conflict report listed beneath it as "No version fits every package: ⟨conflicts⟩", the last installed files staying in use |
+| "Not in the agents' folders" | a chip while the last placement left anything out [[environments-14](environments.md#environments-14)], naming each skill "⟨folder⟩ holds a folder of yours by that name" and each spec package "Its files are not on this computer", with "Place skills again" sending `environment.install` |
+| "Add…" | one, opening one popover whose three tabs request through `environment.request` [[environments-15](environments.md#environments-15)]: Registry, a search over the registry of the environment listing each result with its versions, each read "1.2.0 exactly" or "1.2.0 and newer 1.x" for an exact or a caret requirement [[environments-4](environments.md#environments-4)], and a typed `org/name` the registry does not list reading as one row "⟨name⟩ · not listed publicly" with a version taking an exact, caret or tilde requirement and Add, requesting it as typed ([DR-152](../decisions/152-install-a-known-package.md)); Folder, a folder inside the path root the state names [[environments-14](environments.md#environments-14)], offered while it names one, picked or typed from the prefill `spex-packages/<org>/<pkg>` where a package under development lies [[environments-10](environments.md#environments-10)], its name and version read from its `meta.yaml` by a dry run [[environments-15](environments.md#environments-15)] and a name field shown only where none is found; Git, a repository at a branch or tag with the spec package's name |
+
+- after an Add, the receipt reads "Added ⟨name⟩ ⟨version⟩ · ⟨what it provides⟩", a playbook it provides running at once [[core-service-2](core-service.md#core-service-2)];
+- the heading names no spex repository ([DR-159](../decisions/159-projects-in-groups-opened-where-you-work.md));
+- a change the core refuses shows its cause in place; a sync of that spex repository, or an update or install the core runs, disables no control, the core's own work reading in place as progress ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)).
+
+#### playbook-library-119
+
+While a project's Packages tab or the Playbooks surface [[playbook-library-122](#playbook-library-122)] is shown, its heading shall carry the registry of its environment as "Registry: ⟨registry⟩", a chooser offering the public registry by its display name [[environments-39](environments.md#environments-39)], the registry that environment's `spex.yaml` names where that is another, and a last entry "Other…" revealing a field for a registry's address, the choice written as the `registry` of that environment's `spex.yaml`, and beside it the independent registry account there — "@⟨login⟩", or "Sign in" where none — with Sign out and cancellable browser or device sign-in progress, errors shown in place and Space account state unchanged [[core-service-143](core-service.md#core-service-143)] ([DR-168](../decisions/168-independent-package-registry.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md), [DR-173](../decisions/173-the-registry-is-no-face-of-a-space.md)).
+
+#### playbook-library-113
+
+While an environment's current requests include a direct path source and the environment has a path root on this device [[environments-14](environments.md#environments-14)], the Packages tab and the Playbooks surface [[playbook-library-122](#playbook-library-122)] shall offer Publish in that package's row overflow [[playbook-library-92](#playbook-library-92)], so the core publishes its current request folder [[environments-10](environments.md#environments-10)] by its name under the environment's publish target and release checks, with the preview, confirmation, "Sign in to publish" and outcome display of the authoring control [[playbook-library-93](#playbook-library-93)], without requiring an authoring session or compilation ([DR-151](../decisions/151-publish-local-spec-packages.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)):
+
+- registry and Git requests offer no publication of their installed copies;
+- the folder is the current request's path, not a path inferred from its displayed source or its older lock;
+- a stale lock or uncommitted source does not prevent previewing or publishing the current folder, whose validation failures remain visible;
+- until the account at the environment's registry is read, the entry reads Publish and choosing it shows "Checking…", the read then asking for the preview once where it finds a grant, and otherwise, a failed read included, leaving "Sign in to publish", whose sign-in starts only when chosen;
+- changing the repository, path or target discards an open preview before another confirmation is possible.
+
+### Writing Entries
+
+#### playbook-library-3
+
+When the user overrides a role for the project or sets one back to "Same as global" [[playbook-library-4](#playbook-library-4)], or removes a listed entry [[playbook-library-2](#playbook-library-2)], the Playbooks tab shall write the project's config: an override writes the `playbooks.<id>` entry with a player per required role — the chosen player for that role, and for each other the player the global binding names [[core-service-2](core-service.md#core-service-2)] — a role set back takes the global binding's player again, the entry removed once every role equals the global binding's, and a removal deletes the entry, each write modifying no other entry and reflecting the new state in the list ([DR-104](../decisions/104-spec-package-format-and-client-environments.md), [DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md)):
+
+- a project's entry names players by name alone; the global entry may carry each role's tuning [[playbook-library-4](#playbook-library-4)];
+- a teammate whose roster lacks a player the project's entry names sees it as a player to set up [[settings-46](settings.md#settings-46)], the playbook running meanwhile [[core-service-2](core-service.md#core-service-2)].
+
+### Role Binding
+
+#### playbook-library-4
+
+When the user edits a role's binding, the Playbooks surface — the global page writing the global entry, the project tab the project's [[playbook-library-3](#playbook-library-3)] — shall write which session player answers that role and, for the global entry, that role's own model, subagent model, effort, subagent effort, and fast mode ([DR-032](../decisions/032-session-players.md), [DR-093](../decisions/093-a-players-subagent-model.md), [DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md)), and shall reject an edit the config write path refuses, naming the affected role:
+
+- The players offered are your roster [[settings-26](settings.md#settings-26)]; the first edit of a playbook running on its default binding writes its entry whole — the edited role as chosen, each other as the default binds it [[core-service-2](core-service.md#core-service-2)]; the editor mints none and offers no adapter or permissions, which belong to the player's envelope.
+- On the project tab the editor offers the player alone and says in one phrase that tuning lives in your players, in Settings ([DR-103](../decisions/103-the-home-and-its-groups.md)); under Global it offers "Same as global" first, standing while the project names no other player for the role.
+- Model, effort and subagent effort are inherit-the-player, the provider's current default, or a pinned value, written as omission, `false`, and the value respectively, the subagent effort's provider default reading "Agent chooses"; the subagent model is inherit-the-player or a pinned value, with `false` offered as "Off" only while it stands [[settings-34](settings.md#settings-34)] ([DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md)).
+- Each inherit choice names the player's value: a model by the display rule [[settings-38](settings.md#settings-38)], one the player leaves unset as the provider's default ([DR-091](../decisions/091-models-named-by-the-runtime.md)), an unset subagent model as "Same as agent" [[settings-38](settings.md#settings-38)], an unset effort by the "Provider default" words, and an unset subagent effort as "Agent chooses" ([DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md)); pinned values use the player's runtime model, effort and subagent-effort choices [[settings-34](settings.md#settings-34)], a model or subagent model through the model field [[settings-39](settings.md#settings-39)].
+- Clearing a pinned value keeps it pinned and shows a validation message; only an explicit mode change selects inheritance or provider default.
+- Fast mode is inherit, on, or off for adapters accepting fast-mode requests, and the subagent model and the subagent effort are offered where the lane's adapter serves a subagent model or a value stands ([DR-093](../decisions/093-a-players-subagent-model.md), [DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md)); an unsupported adapter permits only clearing an existing override.
+- The model and the effort stand on one row and the subagent model and the subagent effort on the next, each pair stacking into one column where the editor's content box is narrower than 320 pixels, as it is at the 320-pixel viewport floor ([DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md), [DR-041](../decisions/041-chrome-that-fits.md)).
+- Saving preserves omitted tuning fields and clears only explicit resets.
+- Known model support is checked against effective tuning, including inherited effort and fast mode, with only Cligent's unreported adapter choices supplementing known efforts; unsupported values require explicit correction [[settings-34](settings.md#settings-34)].
+- Choosing a player another playbook's binding already names states which playbooks those are [[playbook-library-38](#playbook-library-38)], because equal ids deliberately share one conversation.
+- The editor is a popover anchored at the role's control, following the house popover idiom ([DR-010](../decisions/010-interface-craft.md) §6): focus enters it on open and returns to the control on close, and Escape, an outside click, and Cancel close it.
+
+#### playbook-library-43
+
+While the role-binding editor [[playbook-library-4](#playbook-library-4)] stands open, the Playbooks tab shall keep it inside the box that must show it — the tab's own scroll box — at every width down to the 320-pixel floor, refitting whenever the window or the editor's own box resizes ([DR-041](../decisions/041-chrome-that-fits.md)):
+
+- that box bounds the editor's width, and a control late in a wrapping roles row moves the editor along the box's edge rather than past it, so a form surface never scrolls sideways to reach it.
+
+#### playbook-library-38
+
+Where one player answers more than one role of a playbook, the Playbooks surface shall list those roles on one line, "⟨role⟩, ⟨role⟩: ⟨player⟩…", and shall say that a player also answers roles of another playbook only in the binding editor, naming the playbooks ([DR-032](../decisions/032-session-players.md), [DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md)), so a shared conversation is drawn once and never badged.
+
+### Compile Flow
+
+#### playbook-library-5
+
+When the Boss opens the Source tab's paste mode [[playbook-library-56](#playbook-library-56)], the Playbooks tab shall accept the playbook source as either a picked markdown file or in-app markdown text and write it as the playbook artifact's `<id>.md` in the spec package under development [[environments-10](environments.md#environments-10)]:
+
+- An empty text and no file is refused before anything is written.
+
+#### playbook-library-6
+
+While a compile is running, the Playbooks tab shall display each phase of the compile pipeline ([DR-005](../decisions/005-compilation-integration.md)) with its name and live status — running, succeeded, or failed — updating as phases complete.
+
+#### playbook-library-7
+
+When an authoring session's compile succeeds, the Playbooks surface shall present the Add tab [[playbook-library-61](#playbook-library-61)] as the form with fields for command and intent and a player per derived role, prefilled where derivable from the playbook source and compiled output, and shall resolve each submission of the form by the cases below:
+
+- Submission passes registry validation [[playbook-library-15](#playbook-library-15)]: the surface packages the entry [[playbook-library-14](#playbook-library-14)], requests the spec package by path from the environment the session belongs to — the project's at its working folder's root, or the global at its folder [[environments-26](environments.md#environments-26)] — where it is not yet requested [[environments-15](environments.md#environments-15)], and writes the playbook's entry — including a role binding per required role [[playbook-library-4](#playbook-library-4)], with any player the submission names but the roster lacks written first — into that config's `playbooks` map, after which the playbook runs there [[core-service-2](core-service.md#core-service-2)].
+- Submission rejected by registry validation or by the config's fail-closed rules for the whole Add [[playbook-library-15](#playbook-library-15)]: the rejection names the violated rule and causes no config or environment write.
+- Submission refused after some of its writes [[playbook-library-69](#playbook-library-69)]: the refusal names the writes made, which stand.
+
+#### playbook-library-8
+
+Where the compile toolchain cannot be resolved — the app's own `slc` missing, or no runtime meeting the version floor [[playbook-library-11](#playbook-library-11)] — the Playbooks tab shall mark the compile flow unavailable, shall show guidance naming each missing prerequisite and how to restore or configure it, and shall not start a compile.
+
+#### playbook-library-83
+
+When a shell starts the core naming a compile runtime — its own executable, whether that is Electron, and the module directories holding the compiler it declares — the Playbooks tab shall compile on that runtime with the compiler found there [[playbook-library-11](#playbook-library-11)], so the shell that declares the compiler names where it lives ([DR-081](../decisions/081-the-app-supplies-the-compiler.md)).
+
+#### playbook-library-9
+
+While a compile is running, when a pipeline phase fails, the Playbooks tab shall mark that phase failed, shall surface that phase's captured output, shall write nothing to any config or environment, and shall allow the user to retry the compile after editing the source.
+
+#### playbook-library-10
+
+When a compiled playbook is added, the Playbooks surface shall list it with its entry fields and its spec package among the playbooks that run, and shall indicate that sessions started before the Add must be restarted before the playbook is available in them.
+
+#### playbook-library-99
+
+When a compiler or packaging job is asked for a playbook artifact's folder while another such job of the core writes that folder, the core shall refuse the job asked `busy` before it writes there, naming the folder and the work running in it ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)):
+
+- the jobs are an authoring session's compile, the Boss's or its agent's directive's [[playbook-library-57](#playbook-library-57)], a one-shot compile's compiling and packaging, and an Add's repackaging [[playbook-library-69](#playbook-library-69)];
+- the folder is the job's own destination as its real path names it, so a job of the same id over another folder runs beside it, and one over a link to the folder does not;
+- a job holds its folder for its own run alone, until it ends — succeeded, failed or canceled, a canceled compiler's job ending only after its child exits — with nothing written to hold it, so an independent process writing the folder keeps ordinary filesystem behavior;
+- an Add's environment and config writes after its repackaging hold no folder, and a turn, a source write, a sync and every other command run beside a job [[playbook-library-56](#playbook-library-56)].
+
+### Authoring Workspace
+
+#### playbook-library-50
+
+When a project's Playbooks tab or the Playbooks surface is shown, it shall list every authoring session of that project, or of the global environment [[core-service-96](core-service.md#core-service-96)], [[playbook-library-70](#playbook-library-70)] in an "Authoring" section after the playbooks, each row carrying the playbook id, its state chip, the age of its last activity, and an "Open" control ([DR-058](../decisions/058-chat-assisted-playbook-authoring.md)):
+
+- the chip reads "No source", "Draft", "Compiling", "Failed", "Interrupted", "Compiled", "Changed", or "Added" — the failed phase and the compile's age in its title, never in the chip ([DR-041](../decisions/041-chrome-that-fits.md) §9);
+- a session whose spec package folder is gone from its environment's folder reads "Source missing" and offers only Delete;
+- a session compiling in the background keeps its row live, and opening it shows the running phases;
+- the section is absent while there is no authoring session, and the playbook list's empty state then points at "Add…" or "New playbook".
+
+#### playbook-library-51
+
+When the user activates "New playbook" — at the Authoring section's foot of the project tab or of the Playbooks surface, or, the project's, from the Captain home's slash menu ([DR-009](../decisions/009-at-hand-interaction.md)) — the surface shall ask for the playbook id in an inline field captioned "Lowercase, becomes /⟨id⟩", ⟨id⟩ as typed, beside the fields "Org" [[playbook-library-121](#playbook-library-121)] and "License" ([DR-069](../decisions/069-key-phrases-not-sentences.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)), create the authoring session and its spec package under development with that org and license [[playbook-library-70](#playbook-library-70)] — in the project's working folder, or in the global environment's folder [[core-service-96](core-service.md#core-service-96)] — on Enter, and open its workspace [[playbook-library-52](#playbook-library-52)]:
+
+- an id outside the Agent Skills name rule — `^[a-z0-9]+(-[a-z0-9]+)*$`, at most 64 characters — or one a playbook of the project's or the global environment holds, is refused in place naming the rule, and nothing is created;
+- "Org" and "License" stand filled with the defaults of the project or of the global environment [[playbook-library-103](#playbook-library-103)], read as the field is shown for it, and the person edits both freely — a default arriving after the person typed, or read again on a reconnect, fills only a field the person has not edited since the project was chosen;
+- an org outside the manifest's name rule — lowercase kebab-case of at most 64 characters [[environments-1](environments.md#environments-1)] — is refused in place naming the rule, and nothing is created; "New playbook" stays disabled while the id, the org or the license is empty;
+- an id naming an existing authoring session opens that session;
+- an existing spec package folder at `spex-packages/<org>/<id>/` in that folder with no authoring session, `<org>` the org the creation names, becomes the new session's package, so a folder brought in by Git can be worked on.
+
+#### playbook-library-121
+
+When the new-playbook form shows its "Org" field [[playbook-library-51](#playbook-library-51)], the form shall offer it as one field suggesting the orgs its selected registry account may publish to [[environments-27](environments.md#environments-27)], read only while that account is signed in, a typed org a read list omits wearing "not yours to publish to", showing loading, successful emptiness or an error with Retry in place, preserving manually entered names and ignoring responses for a former project, registry or account, with a project-group match only an initial suggestion rather than a filter or required Space association ([DR-168](../decisions/168-independent-package-registry.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)).
+
+#### playbook-library-52
+
+When an authoring session is opened, the Playbooks tab or surface shall replace its list with the authoring workspace: a header carrying a "Playbooks" control that returns to the list without ending anything, the playbook's id with its spec package's name, and its state chip [[playbook-library-50](#playbook-library-50)]; the conversation pane on the left [[playbook-library-53](#playbook-library-53)]; and on the right a pane whose tab strip reads Source / Gears / Machine / Add with the Compile control at the strip's right end [[playbook-library-57](#playbook-library-57)] ([DR-058](../decisions/058-chat-assisted-playbook-authoring.md)):
+
+- the panes stand side by side with the house divider between them from the `@2xl` container step ([DR-030](../decisions/030-workspace-chrome.md)) and stack — conversation above, artifacts below — beneath it, the divider then turning into the horizontal grip between the two boxes ([DR-041](../decisions/041-chrome-that-fits.md) §9); each pane scrolls inside its own box and the page scrolls in neither direction;
+- the side-by-side split and the stacked split are app preferences remembered across launches;
+- the tab strip wraps, and below `@xs` its tabs collapse to icon plus tooltip with their accessible names unchanged; every control in the header, the tab strip, the compile band, and the composer's action row reads at most 14 characters, its busy form included;
+- the workspace stays open in the core while the list is shown, so returning loses nothing.
+
+#### playbook-library-53
+
+While an authoring session's workspace is open, the conversation pane shall render its transcript in record order — the Boss's messages as Boss bubbles, the system's lines as ◇ system lines [[run-view-1](run-view.md#run-view-1)], the agent's text as streaming Markdown [[run-view-3](run-view.md#run-view-3)], its tool calls as collapsed cards labeled with the tool and its subject [[run-view-4](run-view.md#run-view-4)], its thinking collapsed, and its failures as failure lines — and shall render a directive block in the agent's reply as a card, never as fence text:
+
+- input attachments and native output media use the trusted record-driven conversation presentation [[run-view-160](run-view.md#run-view-160)];
+- the cards read "Asked to compile" and "Proposed /⟨command⟩", the latter listing command, intent, and role → player with "Open Add";
+- a malformed directive stays visible as code captioned "Spex could not read this block — ⟨reason⟩", ⟨reason⟩ being why it did not read [[playbook-library-66](#playbook-library-66)];
+- a reply owing an unreadable-block relay [[playbook-library-66](#playbook-library-66)] is followed by the system line "Could not read the agent's ⟨kind⟩ block — sent to the agent", or "Could not read the agent's ⟨kind⟩ block — three in a row; tell the agent how to proceed" when the relay stopped, or "Could not read the agent's ⟨kind⟩ block — waiting for your queued message" when a Boss message carries it instead, ⟨kind⟩ being the one kind those blocks name — `compile` or `register` — else `spex`;
+- while a turn runs the pane's header shows the running mark and "working · ⟨elapsed⟩" ticking each second ([DR-010](../decisions/010-interface-craft.md) §5);
+- the pane sticks to its bottom with the jump pill, and mounts only the entries near the viewport.
+
+#### playbook-library-54
+
+While an authoring session's workspace is open, the composer beneath the conversation — of the house shape [[run-view-106](run-view.md#run-view-106)] with the placeholder "Describe the playbook…" and the caption "Enter sends" — shall dispatch or queue each Boss submission by the session's published state [[core-service-96](core-service.md#core-service-96)]:
+
+- while the session is idle a submission dispatches, the primary reading "Send";
+- while a turn or a compile runs a submission queues with the queued indicator, the primary reading "Send next" and the placeholder "Sends after the reply…" or "Sends after the compile…", and the queue dispatches in order when the session is idle [[playbook-library-68](#playbook-library-68)];
+- "Abort" stands in the action row while a turn runs and ends it, leaving the transcript as far as it got; a canceled turn leaves the queue standing;
+- a refused dispatch keeps the text with the refusal shown; the composer's draft and the queue survive leaving and reopening the workspace while the app runs.
+
+#### playbook-library-84
+
+While an authoring session's workspace is open with an empty transcript, the conversation pane shall show one caption above the composer [[playbook-library-54](#playbook-library-54)] — "Tell the agent what the playbook does, who does what, and when it is done" — with two openers, each an act whose outcome its label names, neither sending ([DR-082](../decisions/082-the-first-move-in-a-draft-is-an-act.md)):
+
+| Opener | Act |
+| --- | --- |
+| "Use a SKILL.md…" | where the shell offers a file pick, runs it — a canceled pick changes nothing; a session with no source takes the picked file as its source [[playbook-library-5](#playbook-library-5)], and one with a source gets the path placed in the Source tab's paste mode [[playbook-library-56](#playbook-library-56)] for "Use as source" to confirm — else opens the paste mode; in every case places "Adapt this file into a playbook: keep what it does, name who does what, and say when it is done" in the field, focus landing on the paste text where that mode opened and on the field otherwise |
+| "Try the example" | places the example's six-line source prose [[playbook-library-35](#playbook-library-35)] in the field and focuses it |
+
+- a write the core refuses keeps the field's text and shows the refusal above the composer [[playbook-library-54](#playbook-library-54)].
+
+#### playbook-library-55
+
+While an authoring session's workspace is open, the conversation pane's header shall name the agent that answers as an agent chip — "Captain" with the Captain's block [[settings-1](settings.md#settings-1)] by default, else the chosen roster player's id with its block [[settings-26](settings.md#settings-26)] — wearing that adapter's readiness [[core-service-9](core-service.md#core-service-9)], the chip opening a picker of "Captain" and every roster player whose choice is stored as the preference `authoring:<instance>:player` [[storage-5](storage.md#storage-5)] ([DR-058](../decisions/058-chat-assisted-playbook-authoring.md)):
+
+- the picker follows the house popover idiom ([DR-010](../decisions/010-interface-craft.md) §6);
+- a roster player no role binds is offered too [[settings-26](settings.md#settings-26)], its chip reading unknown readiness, since only the Captain's and the bound lanes' adapters are probed [[core-service-9](core-service.md#core-service-9)];
+- a not-ready agent disables Send with the unmet requirement in the caption;
+- a switch applies to the next turn, which starts a fresh provider conversation from the transcript [[playbook-library-65](#playbook-library-65)], and a system line says so: "Now answering: dev.reviewer — the conversation so far was replayed to it".
+
+#### playbook-library-56
+
+While an authoring session's workspace is open, the Source tab shall render the playbook artifact's `<id>.md` as formatted markdown [[playbook-library-22](#playbook-library-22)] as it stands on disk — refreshed on every source message [[playbook-library-71](#playbook-library-71)], so text appears while the agent writes — captioned with its path in the working folder and who changed it last and when, and shall offer "Edit" and "Paste":
+
+- with no source the tab says the agent writes `<id>.md` here as you talk and offers "Paste";
+- "Edit" opens the whole file in the plain-text editor idiom — Cancel, Save, Edit/Preview [[spec-view-48](spec-view.md#spec-view-48)] — whose Save writes under the version token it read and treats a changed file as a conflict offering Reload or Overwrite [[spec-view-50](spec-view.md#spec-view-50)];
+- "Paste" opens the paste mode — a text field, a "Pick file" control, "Use as source", Cancel [[playbook-library-5](#playbook-library-5)];
+- Save and "Use as source" write whatever runs beside them — a turn whose agent may edit the same file, a compile — under the version token read, a file changed meanwhile being the conflict above;
+- a source whose digest differs from the last successful compile's marks the chip "Changed" and captions Gears and Machine "from the compile before this change"; the tab wears a dot while the source changed since the last compile.
+
+#### playbook-library-57
+
+While an authoring session has a source and no compile of it runs, when the Boss activates Compile or the agent's reply carries a compile directive [[playbook-library-66](#playbook-library-66)], the Playbooks tab shall start the session's compile [[playbook-library-67](#playbook-library-67)] and show it in the band under the tab strip: a phase row, the age of the compiler's last line, a folded log, and Cancel [[playbook-library-27](#playbook-library-27)]:
+
+- Compile is enabled with a source and a resolvable toolchain [[playbook-library-8](#playbook-library-8)] while no compile of the session runs, whatever turn runs beside it; disabled, its tooltip names the reason — "No source yet", "Compiling", or the toolchain guidance; it reads "Compiling…" while a compile runs; a compile the core refuses because another job writes the folder [[playbook-library-99](#playbook-library-99)] shows that refusal;
+- the phase row names the pipeline's phases in human words [[playbook-library-6](#playbook-library-6)] — Normalize, Spec items, Optimize, Prefix, Machine, Link, Package ([DR-088](../decisions/088-playbook-17-slc-0-12-cligent-0-27-adoption.md)) — the compiler's ids in the tooltips ([DR-010](../decisions/010-interface-craft.md) §2), each waiting, running with its elapsed time, done with its duration, or failed, and a phase the compiler names that the row lacks is appended;
+- "last output ⟨age⟩ ago" ticks beside the running phase from the compiler's last line, heartbeat included, so a silent agent-driven phase reads as alive rather than stuck ([DR-010](../decisions/010-interface-craft.md) §5);
+- the band's caption names who started it — "asked by you" or "asked by the agent" — and a system line in the thread says the same;
+- the row wraps under `@md` and the band keeps the Source, Gears, and Machine tabs readable beneath it.
+
+#### playbook-library-58
+
+While an authoring session's compile is running, when a phase fails or the compiler asks for clarification [[playbook-library-9](#playbook-library-9)], the Playbooks tab shall mark that phase failed in the band with its captured output — or the questions with their reasons, evidence, and choices — opened beneath, set the chip "Failed", and show in the thread what the agent was told [[playbook-library-68](#playbook-library-68)]:
+
+- the system line reads "Compile failed at ⟨phase⟩ — sent to the agent", or "Compile failed at ⟨phase⟩ — three in a row; tell the agent how to proceed" when the relay stopped, or "Compile failed at ⟨phase⟩ — waiting for your queued message" when a Boss message carries the output instead — ⟨phase⟩ in the row's human words [[playbook-library-57](#playbook-library-57)];
+- the band's caption names the same disposition — sent to the agent, three in a row, waiting for the queued message — read from the compile record the session publishes [[playbook-library-70](#playbook-library-70)], never from the line's words;
+- a compile the Boss canceled reads "Compile canceled" and sends nothing;
+- a failure before the compiler ran — the toolchain — shows its guidance in the band and sends nothing;
+- Gears and Machine show the outputs as the failed or canceled run left them in the folder, possibly partial, captioned "as the last run left them, not compiled", while a failed run's chip stays "Failed" and Add stays disabled [[playbook-library-61](#playbook-library-61)] ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)).
+
+#### playbook-library-59
+
+When an authoring session's workspace is opened after the core stopped while its compile was running, the Playbooks tab shall show the chip "Interrupted", the band reading "Compile interrupted when Spex closed" with Compile enabled, and shall relay nothing to the agent, so a compile cut by a restart is restarted by a person ([DR-010](../decisions/010-interface-craft.md) §5).
+
+#### playbook-library-60
+
+When an authoring session's compile succeeds, the Playbooks tab shall set the chip "Compiled", fill the Gears tab as the outline's read-only item rows over the parsed gears and the Machine tab as the FSM code under its pinned state list, each in the stage box idiom [[playbook-library-22](#playbook-library-22)] over the session's artifacts [[playbook-library-24](#playbook-library-24)], enable the Add tab with a dot, and append the system line "Compiled — roles: ⟨roles⟩":
+
+- before a compile leaves outputs in the folder the Gears and Machine tabs, and before a successful compile the Add tab, stand disabled with "Compiles first" in their tooltips;
+- the derived roles are the compiled entry's, never the prose's;
+- the dot on Add stays until the tab is opened after the agent's proposal lands [[playbook-library-68](#playbook-library-68)].
+
+#### playbook-library-61
+
+While an authoring session's last compile succeeded, the Add tab shall present the form [[playbook-library-7](#playbook-library-7)] — command, intent and one player per derived role, the environment it is added to being the one the session belongs to [[core-service-96](core-service.md#core-service-96)] and no field — prefilled in this precedence: the Boss's own edits, then the agent's latest proposal [[playbook-library-66](#playbook-library-66)], then derived defaults — and on "Add" shall add the playbook [[playbook-library-69](#playbook-library-69)] ([DR-058](../decisions/058-chat-assisted-playbook-authoring.md), [DR-104](../decisions/104-spec-package-format-and-client-environments.md), [DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md)):
+
+- the id is the session's and not editable; the command defaults to the id; the intent defaults to the source's first prose paragraph, or, where it has none, to its level-one title;
+- a role's player row offers the roster [[settings-26](settings.md#settings-26)] and a new player carrying the session's agent block, editable through the agent editor as a built-in's is [[playbook-library-34](#playbook-library-34)]; its derived `dev.⟨role⟩` id lowercases the role and replaces runs outside ASCII letters, digits, `_` and `-` with `-`, retaining a suffix that starts with a letter, otherwise trimming boundary `-` and `_` and prefixing `role-` to what remains or using `role` when nothing remains, so Unicode and digit-leading roles yield valid segmented ids ([DR-032](../decisions/032-session-players.md)); a proposed new player or the Boss's selected new player retains its explicit id;
+- a proposal's roles match the derived roles case-insensitively; a role whose normally derived, letter-leading own lane the roster already holds receives that lane as its default only when neither another role explicitly selects it nor an earlier role received that named default, while a fallback base names only a new-lane candidate; otherwise its default is its new option; assigning named defaults in compiled-role order remains independent of the Boss choosing a row's new option; automatic new players and offered new options take the first free `-2`, `-3`, … suffix against the roster, all explicit new selections and proposals, and earlier automatic allocations in that order, so defaults do not accidentally share a conversation and an Add never overwrites a player; explicit equal ids preserve the Boss's or proposal's intentional sharing, and a selected new id remains that row's offered new option;
+- a proposal naming a role the entry lacks, or missing a derived role, is shown beside the form as a mismatch with the derived roles authoritative;
+- Add is disabled, its tooltip reading "A player per role, a command and an intent", until every role has a player and command and intent are non-empty, and reads "Adding…" while it writes, whatever turn or compile runs beside it, the form carrying no caption explaining what Add writes;
+- a refusal names the violated rule inline and leaves the form standing; success lists the playbook among those that run [[playbook-library-10](#playbook-library-10)], the chip reads "Added", and the list opens with the new card in view;
+- for a project's session, the new card's success line adds the key phrase "Commit ⟨folder⟩ with your code", ⟨folder⟩ being the spec package's folder in the working folder [[playbook-library-70](#playbook-library-70)] set as code, and stands until the tab is left, the reader committing the package with the code as the environment requesting it, while a session of the global environment adds none, its folder syncing with the global records ([DR-069](../decisions/069-key-phrases-not-sentences.md), [DR-113](../decisions/113-a-projects-environment-lives-in-its-working-folder.md));
+- the authoring session stays, so the playbook can be worked on further and published [[playbook-library-93](#playbook-library-93)].
+
+#### playbook-library-62
+
+When an authoring session's workspace is opened — in the same run or after a restart — the Playbooks tab shall restore its transcript from the stored records, its source, its queue, its last compile's outcome with the phase output or questions, its compiled tabs where a successful compile is recorded, and its proposal [[playbook-library-70](#playbook-library-70)], so a failed compile is resumed where it stopped ([DR-058](../decisions/058-chat-assisted-playbook-authoring.md)):
+
+- the next message continues the conversation as one thread to the Boss, whatever the provider's own continuity did [[playbook-library-65](#playbook-library-65)];
+- each opening and each reconnect [[core-service-96](core-service.md#core-service-96)], and each `draft.history-replaced` announcement [[core-service-118](core-service.md#core-service-118)], reads the whole transcript, and a streamed record not following the thread's last reads it again, so a history replaced on disk replaces the thread while the composer's text, the Source tab's edits and the Add form's edits stand;
+- the compile band takes progress lines and sends Cancel naming the instance shown [[core-service-96](core-service.md#core-service-96)];
+- a session whose state names another instance than the one shown is another session: what the page kept for the former goes, and a late message or reply naming the former changes nothing;
+- a session whose transcript is unreadable opens with the source intact and a scoped diagnostic in place of the thread.
+
+#### playbook-library-63
+
+When the Boss activates an authoring session row's Delete, the Playbooks tab shall ask with the inline confirm — "Delete" and "Keep", the safe default focused [[playbook-library-26](#playbook-library-26)] — and on Delete remove the session: its record, transcript, assets and preference [[playbook-library-70](#playbook-library-70)], leaving the spec package folder in the working folder and saying so:
+
+- Delete while the session's turn or compile runs removes the files all the same, that work going on and writing nothing into them;
+- an added playbook keeps its entry and its request; deleting the session changes neither.
+
+#### playbook-library-93
+
+While an authoring session's last compile succeeded and the home holds a registry grant at its environment's package registry [[environments-38](environments.md#environments-38)] — the Add tab shall offer "Publish" beneath the form, beside a link "Its package" opening the package's row on the Packages tab once it has one [[playbook-library-92](#playbook-library-92)], which publishes the spec package under development, named `<org>/<pkg>` [[environments-10](environments.md#environments-10)], to that registry as its registry account after showing, inline, "Publish ⟨org⟩/⟨pkg⟩ ⟨version⟩ to ⟨registry⟩" — ⟨registry⟩ the actual destination registry's display name, its origin in the tooltip — over "⟨count⟩ files" listing the files it will upload and "as @⟨login⟩ in ⟨org⟩", with Publish and Cancel ([DR-104](../decisions/104-spec-package-format-and-client-environments.md), [DR-127](../decisions/127-a-home-signed-in-to-several-instances.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)):
+
+- a refusal from the core's checks or the registry shows its issues in place; success reads the published version with a link to its page at the registry;
+- a retained receipt from a previous publish does not establish success of a later attempt, and a later settled refusal remains visible even when its text repeats an earlier refusal ([DR-151](../decisions/151-publish-local-spec-packages.md));
+- a home without that registry grant shows one button "Sign in to publish" in place of Publish, starting the registry sign-in in place [[playbook-library-119](#playbook-library-119)], the grant judged only once the account there is read, "Loading registry…" standing until then and a failed read standing as no grant with its cause.
+
+### Pipeline Artifacts
+
+#### playbook-library-22
+
+While a playbook is listed, the Playbooks tab shall carry that playbook's compilation stages as a permanent row of toggles — Source (the workflow markdown the playbook was compiled from) → Gears (the GEARS spec items) → State machine (the compiled FSM) — whose pressed stage opens its artifact beneath the row:
+
+- Pressing a closed stage opens it and closes the stage that was open, so one stage at a time stands open for that playbook; pressing the open stage closes it.
+- The first open requests that playbook's artifacts [[playbook-library-24](#playbook-library-24)], which the card holds for its later opens; the open stage reads as loading until they arrive, and a failed request leaves its message in the open stage until a later press asks again.
+- A markdown stage renders as formatted text; the State machine stage renders the FSM as code, with the derived state list standing outside the box as its pinned header, chips wrapping ([DR-041](../decisions/041-chrome-that-fits.md) §9), so the states hold their place at every scroll position and every height.
+- The Gears stage stands instead as the outline's read-only item rows [[spec-view-3](spec-view.md#spec-view-3)] over the parse the playbook's artifacts carry [[playbook-library-24](#playbook-library-24)]: every row collapsed until pressed, an expanded row rendering the item's body, a citation of an item in the same artifact previewing it at hand [[spec-view-61](spec-view.md#spec-view-61)] and landing on that item within the box [[spec-view-6](spec-view.md#spec-view-6)], no control that edits, and the rendered markdown wherever that parse is absent.
+- The open stage's artifact sits in a box that caps its height and scrolls, whose bottom edge carries the house's grip turned horizontal ([DR-030](../decisions/030-workspace-chrome.md)): dragged, or moved a step per arrow key while focused, it sets the box between 8rem and 48rem, a double-click restores the default 24rem, and the height is remembered for that playbook across launches, one height serving its stages.
+- The grip stands only while the artifact runs past the box — a stage the box fits has nothing to page through, so the box takes the artifact's height and shows no edge to pull.
+
+#### playbook-library-23
+
+Where the artifacts a playbook served name a stage absent, the Playbooks tab shall render that stage struck out and inactive in the playbook's stage row [[playbook-library-22](#playbook-library-22)] — its tooltip saying the stage was not found beside that playbook's module — and shall name the absent stages inside the open stage, leaving every located stage open-able:
+
+- Until a playbook's artifacts arrive, the row marks no stage absent.
+
+### Pipeline Artifact Handling
+
+#### playbook-library-24
+
+When a client requests a playbook's artifacts, the core package shall resolve them from the playbook artifact's folder — the installed one under `packages/` [[environments-7](environments.md#environments-7)], or the path source's folder where its path resolves [[environments-2](environments.md#environments-2)] — in the compiled layout (`<id>.md`, `<id>.playbook/<id>.gears.md`, `<id>.playbook/<id>.fsm.ts`), serving each stage's content, the Gears stage also parsed into the item shape the outline's rows read [[spec-view-3](spec-view.md#spec-view-3)] — carried only where that parse yields an item, so a stage the parser cannot read serves its markdown alone — the state ids derived from the FSM, and the machine graph [[playbook-library-36](#playbook-library-36)] over the protocol, and naming absent stages without failing the request.
+
+#### playbook-library-36
+
+When the core package derives a playbook's artifacts from its FSM, the core package shall serve the machine graph beside the state ids, derived from the machine's own config rather than its source text ([DR-028](../decisions/028-run-machine-view.md)):
+
+- nodes carry the state id, its parent for a nested state, its kind (a final state named as such), the player role the state invokes when its meta names one, and its tags;
+- edges carry a stable identity of owner state, event, branch index, and target index — guarded sibling branches staying distinct — with the event name as the label and an empty event naming the always transition;
+- a target naming a state's declared id resolves to that state, wherever it sits in the tree — never assumed to be machine-id-prefixed ([DR-031](../decisions/031-machine-call-tree.md));
+- a compound state's own done transition is an edge out of that state ([DR-031](../decisions/031-machine-call-tree.md));
+- a machine-level transition, having no single source state, is no edge;
+- the graph names its initial state;
+- a machine that cannot be loaded serves a null graph, named among the absent stages without failing the request.
+
+### Naming and Copy
+
+#### playbook-library-26
+
+The project's Playbooks and Packages tabs and the Playbooks surface shall read "Playbooks" and "Packages" and name things and acts in the reader's words, never by the config or environment write behind them ([DR-010](../decisions/010-interface-craft.md) §2, [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)):
+
+- things: "playbook", "package" — "spec package" where its nature is explained — and `spex.yaml`, `spex.lock` and `meta.yaml` by their file names, never environment, manifest, request or lock as a noun, resolve or request as an act, nor a spex repository; "Global" for what applies to every project of yours, never Personal, your own group's or every project of yours;
+- acts: a role is overridden for the project or set back to "Same as global"; a package is added, removed, updated, installed or published, "Update" and "Install" the only two acts bringing packages up to date; an authoring session is deleted behind a confirm whose choices read "Delete" and "Keep"; the creation control reads "New playbook".
+
+#### playbook-library-29
+
+While a playbook is listed, the Playbooks tab shall label its spec package and version with a muted "from" prefix that stays visible outside any truncation — `from acme/triage 1.2.0`, with the source's kind for a path or Git request, the built-in spec package's as any other's — and shall expose the installed folder's full path in the entry's tooltip ([DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)).
+
+### Built-ins and Example
+
+#### playbook-library-34
+
+While the global environment places the built-in spec package [[environments-11](environments.md#environments-11)], when the Playbooks surface or a project's Playbooks tab is shown, it shall list each of its playbooks under Global with its command, its intent in the interface language [[localization-4](localization.md#localization-4)], its roles with the players bound to them [[core-service-2](core-service.md#core-service-2)] and browsable source markdown ([DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md)):
+
+- The built-in spec package carries `code`, `review`, `decide`, `dev`, `branch`, `pr`, and `inspect`, omitting an entry only when the installed artifact cannot load its module.
+- Browsing a built-in's source requires no config change.
+- Its players are the seed's [[core-service-2](core-service.md#core-service-2)]; a role no entry binds plays `dev.<role>`.
+
+#### playbook-library-48
+
+While `dev` runs and `branch` or `pr` does not, the Playbooks tab shall mark `dev`'s pull-request delivery unavailable on its card, naming each missing built-in ([DR-059](../decisions/059-issue-delivery-through-dev.md)):
+
+- the mark reads as a hint beside the card's roles, not as an invalid entry [[playbook-library-2](#playbook-library-2)], because a plain `/dev` request still runs;
+- the mark disappears once both run.
+
+#### playbook-library-89
+
+While the validated playbook catalog [[core-service-2](core-service.md#core-service-2)] lists the built-in spec package's `code` or `decide`, and lists no running `review`, the Playbooks tab shall place an unavailable hint beside that entry's roles, naming its effective command and pointing at `/review`'s row before running it:
+
+- The hint leaves the config valid and writes no playbook or player.
+- The hint disappears when the validated catalog includes `review`.
+- A playbook of another spec package with the same `code` or `decide` id receives no hint; this rule covers the built-in entries, whose `requires` the environment installs together ([DR-104](../decisions/104-spec-package-format-and-client-environments.md)), not dependency analysis of custom modules.
+- The runtime refuses the fresh engagement from Playbook 17.4.1 on, per [DR-102](../decisions/102-playbook-17-4-1-adoption.md).
+
+#### playbook-library-35
+
+When a project's Playbooks tab is shown, the tab shall present a two-agent workflow adapted from slc's demo as a read-only example ([DR-015](../decisions/015-reference-content.md)) in the same permanent stage row a playbook wears [[playbook-library-22](#playbook-library-22)], over four stages held in memory rather than requested — source, normalized text, gears, and state machine — and shall offer a prefill action that opens a new authoring session's workspace [[playbook-library-51](#playbook-library-51)] with the example's normalized text placed in the Source tab's paste mode [[playbook-library-56](#playbook-library-56)], without writing or compiling anything:
+
+- the example's six-line source is slc's demo with the two limits the bundled compiler asked about settled — the first agent's judgments count per loop, its last one in a loop being the conclusion, and the 2nd loop's commit ends the workflow without another review — and its normalized text says the same in slc's normalized form ([DR-089](../decisions/089-every-fresh-user-scenario-walked-for-real.md));
+- sources and gears served for display drop their leading maintainer comment headers;
+- the prefill creates the session with the org and license the New playbook field holds [[playbook-library-51](#playbook-library-51)], and stands disabled, reading "Org and License first", while that org breaks its rule or that license is empty.
+
+### Compile Cancellation
+
+#### playbook-library-27
+
+While a compile is running, the Playbooks tab shall render a secondary cancel control beside the streamed compile progress and shall keep the compile start control disabled for the whole time the compile runs:
+
+- Activating the cancel control requests that the core abort the compile ([DR-010](../decisions/010-interface-craft.md) §5), with the cancellation recorded in the compile progress log.
+
+### Config Gate
+
+#### playbook-library-28
+
+While your own group's config is missing or invalid, the Playbooks tab shall replace its content with a gate that (1) explains that the Captain can only run playbooks listed on this tab, (2) states that playbooks need a valid config and directs the user to fix it in Settings, and (3) renders "Settings" as a navigation control when the host app provides surface navigation, falling back to plain text otherwise.
+
+### Installed Playbooks
+
+#### playbook-library-46
+
+When an install places a spec package's files or finds them installed already [[environments-7](environments.md#environments-7)], the core shall prepare each of its playbook artifact folders to run on the app's engine, provisioning there the engine links a compile provisions [[playbook-library-12](#playbook-library-12)] and, where the folder's `<id>.registry.mjs` imports no `@sublang/playbook` specifier and so carries an engine of its own, bundling that module again from the `<id>.registry.ts` beside it as a compile bundles one [[playbook-library-14](#playbook-library-14)]:
+
+- the module bundled again replaces the installed one atomically under the bytes read, a module changed meanwhile standing, and leaves the store's copy and the lock's digests as they were ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md));
+- a `<id>.registry.ts` missing or failing to bundle leaves the module as it is, and the install goes on, its report naming the module and why;
+- a path source's playbook folders where its path resolves [[environments-2](environments.md#environments-2)] get the engine links alone, listed in the `.git/info/exclude` of the working folder, or of your own group's clone, holding them before any link is made, their files left as they are; where your own group's clone cannot list them, the install fails with its cause and makes no link;
+- an artifact folder gone by the time it is prepared — its clone moved by a sync meanwhile [[environments-7](environments.md#environments-7)] — takes no link and is not made again, nothing of the moved clone's old place recreated.
+
+## Internal Behavior
+
+### Toolchain Resolution
+
+#### playbook-library-11
+
+When toolchain resolution is requested, the toolchain resolver shall locate the compiler and the Node.js it runs on in this order, probing each Node.js candidate with `--version` in the caller's environment, and shall verify that the Node.js chosen satisfies the version floor `slc` requires ([DR-005](../decisions/005-compilation-integration.md), [DR-081](../decisions/081-the-app-supplies-the-compiler.md)):
+
+| Prerequisite | Order |
+| --- | --- |
+| Node.js | (1) the command `SPEX_NODE` names, the only candidate when set; else (2) the app's own runtime the shell handed the core [[playbook-library-83](#playbook-library-83)] — its Electron binary run as Node with `ELECTRON_RUN_AS_NODE=1`, or its Node — when it meets the floor; else (3) a `node` on the caller's `PATH` that meets it |
+| `slc` | (1) the command `SPEX_SLC` names; else (2) the app's own copy of `@sublang/slc` in the module directories the shell handed the core [[playbook-library-83](#playbook-library-83)], those above the core's own package when none were handed |
+
+- The resolved command for the app's copy is the Node.js chosen running the copy's CLI — on Electron with `--import` of the core's preload ahead of the CLI, and the variable travelling with that command alone — so the copy's nested `@sublang/cligent` resolves the agent SDKs the shells supply ([DR-024](../decisions/024-app-supplied-agent-runtimes.md), [DR-081](../decisions/081-the-app-supplies-the-compiler.md)).
+- The app's copy resolves as unavailable, the guidance naming both engines, when the playbook engine Node resolves from the copy's own package is not the app's and declares another runtime ABI or an artifact schema the app does not support, or cannot be read; the app's own engine resolved from the copy agrees by construction.
+- Any prerequisite unresolvable: the resolver returns an unavailability result naming that prerequisite — the version found when a Node.js answered below the floor, the restore command when the app's copy is missing — and spawns no compiler.
+
+### Compile Execution
+
+#### playbook-library-12
+
+When a compile is started for playbook id `<id>`, the compile runner shall run `slc` as an external child process in the playbook artifact's folder `<working folder>/<package path>/playbooks/<language>/<id>/` of the spec package under development [[environments-10](environments.md#environments-10)] — materializing in-app source text or a picked file's bytes as `<id>.md` there, linking the app-bundled runtime contract ([DR-005](../decisions/005-compilation-integration.md)), and provisioning that folder's `node_modules` with links to the app's own `xstate` and `@sublang/playbook`, listed in the working folder's `.git/info/exclude`, which the compiler's machine check and the entry it emits resolve from there ([DR-081](../decisions/081-the-app-supplies-the-compiler.md)) — and shall capture the process output per pipeline phase, reporting phase transitions for progress [[playbook-library-6](#playbook-library-6)] and the failing phase's output on failure [[playbook-library-9](#playbook-library-9)]:
+
+- `<language>` is the authoring session's [[playbook-library-70](#playbook-library-70)]; a one-shot compile decides it by the same rule as a session's creation.
+- The runner grants `slc` a stall budget of 2400 seconds through `SLC_STALL_TIMEOUT` unless the environment already sets that variable, because agent-driven phases stay silent longer than `slc`'s ten-minute default.
+- The compiler runs on the Node.js the resolver chose [[playbook-library-11](#playbook-library-11)], with the variable that runtime needs beside the caller's environment — `ELECTRON_RUN_AS_NODE=1` for Electron's, dropped again by the compiler's preload before it starts — so the compiler runs as Node while the agents it spawns inherit no such variable.
+- The materialized source replaces `<id>.md` in one atomic step, the picked file read once, only where `<id>.md` still holds the bytes it held when the job began, else the compile is refused as a conflict, changed meanwhile, before the compiler runs; the check is Spex's own write's, an independent writer keeping ordinary filesystem behavior ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)).
+- `slc` writes its outputs in the folder in place: a failed or canceled compile may leave them partial, and only a successful compile is recorded compiled or added ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md)).
+
+#### playbook-library-42
+
+When a compile is started, the compile runner shall hand `slc` the block the compile's agent is resolved from — the authoring session's answering agent [[playbook-library-64](#playbook-library-64)], the Captain's block for a compile from the one-shot command — as `SLC_AGENT` (`claude` as `claude-code`; `codex`, `gemini` and `opencode` as named), with `SLC_MODEL`, `SLC_EFFORT` and `SLC_FAST_MODE` where the block sets them and `--config` naming an empty configuration the core ships, so nothing `slc` would discover fills what the block leaves unset, unless the environment sets any of those four variables, in which case the runner sets none of them and names no configuration ([DR-081](../decisions/081-the-app-supplies-the-compiler.md), [DR-084](../decisions/084-the-block-is-the-whole-compiler-agent.md)):
+
+- a model, an effort or fast mode the block leaves unset stays unset for `slc`, which applies the adapter's own default;
+- an adapter `slc` does not drive (`kimi`), with none of those variables in the environment, refuses the compile before the compiler runs, the guidance naming the adapters `slc` drives and `SLC_AGENT`;
+- fast mode travels as the literal `true` or `false` the block holds;
+- the progress log names the agent and its source before the compiler runs — `agent: <id> from the block`, or `agent: <SLC_AGENT, else slc's configuration> from the environment`.
+
+### Registry Generation
+
+#### playbook-library-13
+
+When `slc` completes successfully, the registry generator shall derive `idleStateId`, `finalStateId`, and `parkStateIds` by introspecting the emitted machine definition ([DR-005](../decisions/005-compilation-integration.md)), each derived id naming a state present in that machine, and shall report them as compile metadata for display [[playbook-library-22](#playbook-library-22)] — never as registry-entry fields ([DR-014](../decisions/014-released-toolchain.md)):
+
+- Ambiguous derivation: the registry generator surfaces the candidate state ids for user selection in the Add form [[playbook-library-7](#playbook-library-7)] instead of choosing silently.
+
+#### playbook-library-14
+
+When the compile flow packages a compiled playbook, the registry generator shall emit a registry manifest module into the playbook artifact's folder as a thin wrapper over the `slc`-emitted registry entry ([DR-014](../decisions/014-released-toolchain.md)), returning the module's path for the environment's placement [[environments-9](environments.md#environments-9)] and the derived role ids:
+
+- the user's command and intent override the entry's;
+- every other member of the entry passes through unchanged, including the role ids in their authored casing and the artifact schema the entry advertises — under artifact schema 2 a role is a playbook-local slot a user binds to a player, not a host player id ([DR-032](../decisions/032-session-players.md));
+- the module carries the registry-contract marker;
+- packaging validates the registry’s structure without calling its runtime-option validator or constructing a runtime, so an entry may require options with no default;
+- the module holds the wrapper, the entry and the artifact the entry links, and imports the playbook engine — `xstate` and `@sublang/playbook`, each with its subpaths — rather than carrying it, resolving it at load through the engine links of its folder [[playbook-library-12](#playbook-library-12)], so it runs on the engine of the app that loads it;
+- two role ids colliding fails the compile naming the offending role.
+
+### Registry Validation
+
+#### playbook-library-15
+
+When a playbook's entry is about to be written to a config, the registry validator shall apply the same fail-closed rules the playbook loader applies at load ([DR-004](../decisions/004-config-and-persistence.md)) — including: the `playbooks` key equals the manifest id; the module the environment places for the launcher imports successfully; no duplicate id or command among the written entries of the composed config, a default binding a written command displaces standing aside [[core-service-2](core-service.md#core-service-2)]; no reserved captain role among role names; every required role resolved; every agent resolving a supported adapter — and shall reject a violating write naming the violated rule, leaving the config file unmodified.
+
+### Config Writes
+
+#### playbook-library-32
+
+When an Add writes the `playbooks.<id>` entry after a compile, the compile flow shall re-key the submitted role bindings onto the derived role ids [[playbook-library-14](#playbook-library-14)] by case-insensitive name match:
+
+- A derived role matching no binding: the compile flow fails naming the derived roles and the unmatched ones, writes no config change, and keeps the compiled artifacts so a corrected submission can be added without recompiling.
+
+#### playbook-library-33
+
+When playbook loading imports a module the environment places for the launcher from a file path, and the module does not carry the current registry-contract marker [[playbook-library-14](#playbook-library-14)], the registry validator shall treat the config as invalid with guidance naming the playbook, describing incompatibility with this version of Spex and directing source compilation in Playbooks as the remedy, without claiming when or by which toolchain the module was generated ([DR-014](../decisions/014-released-toolchain.md)):
+
+- A built-in spec package's module needs no marker.
+
+#### playbook-library-16
+
+When the config writer updates a config file — an override, a reset or a removal [[playbook-library-3](#playbook-library-3)], role-binding edits [[playbook-library-4](#playbook-library-4)], or an Add from the form [[playbook-library-7](#playbook-library-7)] — it shall preserve comments, key order, and formatting of untouched content byte-for-byte, shall modify only the targeted keys, and shall replace the file atomically so an interrupted write cannot leave a partially written config.
+
+### Authoring Conversation
+
+#### playbook-library-64
+
+When an authoring turn starts, the conversation runner shall run the session's agent block — the Captain's, or the preferred roster player's [[storage-5](storage.md#storage-5)] — through cligent directly, outside the Captain shell, loading the adapter class through the same adapter-import table the session runtime uses, with these options and no others ([DR-058](../decisions/058-chat-assisted-playbook-authoring.md)):
+
+| Option | Value |
+| --- | --- |
+| model, subagentModel, effort, subagentEffort, fastMode | the block's, an unset subagentModel taken as `inherit` on an adapter Cligent serves one for and a `false` one as absent, as Playbook's launcher resolves them ([DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md)) |
+| attachments | the current Boss turn's ordered verified authoring assets, supplied again on its resume-rejection retry [[media-5](media.md#media-5)] |
+| browser | the block's off-by-default setting [[media-9](media.md#media-9)] |
+| cwd | the spec package's folder in the working folder [[environments-10](environments.md#environments-10)] |
+| permissions | exactly `{ mode: "auto" }`, with no additional `writablePaths` — the block's own policy dropped ([DR-112](../decisions/112-authoring-permissions-use-the-package-working-directory.md)) |
+| allowedTools, disallowedTools, maxTurns | absent |
+| resume | the token the previous turn of this run returned, when the agent is unchanged and the transcript is exactly as this run's own records left it — when the token returned and as the next turn begins; else none |
+| abortSignal | the turn's, tripped by Abort |
+
+- the block's `instruction` is not carried; the prompt composition carries everything [[playbook-library-65](#playbook-library-65)];
+- no instance outlives the turn ([DR-051](../decisions/051-runtime-held-for-a-turn.md)); the token is held in memory for the app's run and never written;
+- native media and large tool results are externalized through the shared owned-asset ingestion [[media-17](media.md#media-17)] before recording [[media-6](media.md#media-6)]; earlier input files stay in the visible transcript and are not automatically resent on later turns;
+- a run ending in an error coded `SESSION_RESUME_REJECTED` is re-run once as a reseed;
+- legacy `permission_request` telemetry is recorded as a failure line and never answered, while a live `approval_request` on an authoring turn is answered only through the core's approval broker [[approvals-1](approvals.md#approvals-1)] and recorded as history;
+- the turn is recorded and streamed as `turn_started` carrying the Boss or system text, `player_prompt` with the exact prompt, one `player_event` per event, `player_finished`, and `turn_finished` or `turn_aborted`, every player record naming the player `author`, so the run view's transcript folds read them unchanged [[playbook-library-70](#playbook-library-70)].
+
+#### playbook-library-65
+
+When the conversation runner composes a turn's prompt, it shall compose it by the conversation's case, the file on disk always being the source of truth:
+
+| Case | Prompt |
+| --- | --- |
+| First turn of a provider conversation | the preamble, the shape of a source, the shipped documents by path, the example's six-line source [[playbook-library-35](#playbook-library-35)], the directive protocol, the working rules, the session state, then `Boss:` and the message |
+| Later turn of the same provider conversation | a `Since your last reply:` line when the session changed since the last prompt — the Boss edited or replaced the source, a compile settled — then `Boss:` and the message |
+| Reseed — a restart, a switched agent, a rejected resume, a transcript another writer changed | as the first turn, with `Conversation so far:` holding the Boss, system, and agent final texts in order, oldest dropped past 24 KB, before the message |
+| Relay | the failed phase, its elapsed time, the last 200 lines of its output — or the clarification questions with reason, evidence, and choices — then "Fix `<id>.md` and explain the cause; you may ask for another compile" as a system-origin message |
+| Success | "The compile succeeded; the roles are ⟨roles⟩. Propose its entry in a register block" as a system-origin message |
+| Unreadable-block relay | "Write the ⟨kind⟩ block again so Spex can read it" as a system-origin message, ⟨kind⟩ as the thread's line names it [[playbook-library-53](#playbook-library-53)] |
+
+- the preamble names the absolute source path inside the spec package, tells the agent to write and edit only that file and the package's `meta.yaml` description, never to run the compiler, git, or npm, and to ask at most one question per reply when the answer changes the roles or the ending, and says that a source the Boss placed may be a SKILL.md — YAML frontmatter `name` and `description`, then instructions — or other workflow markdown, to rewrite in place into a source with the description as the title and the intent, the instructions as the prompts, and the actors as the roles ([DR-082](../decisions/082-the-first-move-in-a-draft-is-an-act.md));
+- the preamble names the session's language [[playbook-library-70](#playbook-library-70)] as the one the source's title, prose and prompts are written in, and, for a language other than English, the words `slc` recognizes literally that stay in English: the `Roles:` and `Results:` headings, the `Captain shall prompt`, `Captain shall relay` and `Output shall include` clauses, role and result names, and the lead-in "in quotes (`>`)" before a blockquote relaying a runtime value, which a sentence in the session's language may surround;
+- the shape of a source is at most twenty lines: an H1, a `Roles:` list of capitalized unique names, each one word — a two-word role written as one CamelCase word, since `slc` reads one word after `Captain shall prompt` — behaviors as `When ⟨condition⟩, Captain shall prompt ⟨Role⟩:` with blockquoted prompts one point per line or a fenced `markdown` instruction block, runtime values relayed in quotes (`>`) as `<placeholders>`, `Results:` bullets only for several outcomes or a consumed value with `<field>: <verbatim final text>` for a relayed whole reply, each outcome with exactly one repository effect — an outcome that may either commit or leave the repository unchanged being two ([DR-088](../decisions/088-playbook-17-slc-0-12-cligent-0-27-adoption.md)) — nested calls as ``Captain shall call playbook `id`:``, at most two or three roles;
+- the shape also says that a step leaves the repository unchanged, with exactly one new commit, or waiting on a Boss question, never with uncommitted edits for a later step, so a draft reviewed before its commit travels as text in the player's reply and the final step writes the files and makes the one commit;
+- the shape also says that a role's prompt describes only that role's own step and ends by naming the result the step reports, the later rounds, the hand-over between roles and the ending belonging to the behaviors' prose, since a prompt saying "then wait for …" makes the player end its reply waiting, which the runtime reads as the step's result;
+- the shape also says that the runtime relays every Boss exchange — the question as asked and the answer verbatim — to every later role of the run, so a behavior need not say that a reviewing role receives an answer, and that a behavior names a later role as receiving the exchange only where that role's step must carry the answer in its own data, which the compiler keeps only where the source says so ([DR-121](../decisions/121-playbook-17-9-0-cligent-0-33-5-adoption.md));
+- the shape also says that a prompt's text stands where its instruction stands, in the source's order, so text two instructions need is written out at both, never stated once and referred to, since `slc` refuses a compile whose prompt carries text out of the source's order;
+- the documents are the installed package's `slc/text2gears.md`, `reference/sdlc/review.md`, `reference/sdlc/code.md`, and `reference/sdlc/review.playbook/review.gears.md`, resolved from the package the core depends on;
+- the session state names the id, the spec package's path, the source path or "none", the last compile's outcome, and the roster players with adapter and model; a malformed directive from the previous reply is named at the head of the prompt with why it did not read [[playbook-library-66](#playbook-library-66)], before anything else;
+- a queued Boss message dispatched after a compile settled, or after a reply owing an unreadable-block relay [[playbook-library-66](#playbook-library-66)], carries that relay or success text as its preface instead of a separate turn [[playbook-library-68](#playbook-library-68)].
+
+#### playbook-library-66
+
+When an authoring turn ends with status success, the conversation runner shall parse every top-level fenced ```` ```spex ```` block of the reply's final text — the done result, else the concatenated text — as YAML with a `kind` key, act on the last block of each kind, and record each block as a directive:
+
+| `kind` | Keys | Effect |
+| --- | --- | --- |
+| `compile` | none | starts the session's compile as the Boss's Compile starts it [[playbook-library-57](#playbook-library-57)], under the same admission [[playbook-library-99](#playbook-library-99)]; where it cannot start — no source, or another job writing its folder — records the system line "◇ Compile skipped: ⟨why⟩" |
+| `register` | `command`, `intent`, `players: {⟨Role⟩: ⟨player id⟩}` | replaces the session's proposal [[playbook-library-61](#playbook-library-61)]; a role the compiled entry lacks is kept as a mismatch |
+
+- a fence opened inside another fence is content, not a directive; a block missing a key, carrying an unknown key or kind, or failing to parse is left as code, recorded as malformed with why — the YAML error, or the key or kind missing, unknown or invalid — and named in the next prompt [[playbook-library-65](#playbook-library-65)];
+- a reply holding a malformed block that names no kind a readable block of the reply carries, and starting no compile, owes the agent an unreadable-block relay [[playbook-library-65](#playbook-library-65)], started as a compile's follow-up is [[playbook-library-68](#playbook-library-68)], a compile's follow-up owed meanwhile going in its place, unless it is the third reply to owe one with no Boss message between them; a Boss message resets that count, which, like the blocks named, lasts for the app's run;
+- a turn ended by Abort or an error acts on nothing.
+
+#### playbook-library-67
+
+When an authoring session's compile starts, the compile runner shall run the pipeline on the `<id>.md` already in the playbook artifact's folder [[playbook-library-12](#playbook-library-12)] — copying nothing, packaging and validating the entry with the session's id as command and a placeholder intent [[playbook-library-14](#playbook-library-14)] [[playbook-library-15](#playbook-library-15)] — as the one job over that folder [[playbook-library-99](#playbook-library-99)] with its instance's cancel handle [[core-service-96](core-service.md#core-service-96)], write no config, and record the outcome on the session [[playbook-library-70](#playbook-library-70)]:
+
+- progress lines broadcast as compile progress for the session id; the failed phase is the last `✗` line's phase, else the phase the compiler left open when it exited (`slc` when none was), "packaging" for a failure after the compiler finished, and the toolchain for a failure before it ran;
+- an exit status 2 with an `SLC_CLARIFICATION:` line records the report's questions;
+- the toolchain is probed before the running marker, so a compile canceled while it is probed records nothing, and one the probe's verdict refuses is recorded after the marker as failed at the toolchain;
+- the compile runs in the folder its project paired when it began, refused `conflict`, changed meanwhile, before the compiler runs where the project was paired with another working folder since — writing no running marker where the pairing has already changed when it would write that marker, so it never replaces the marker of a later compile in the new folder;
+- success records the derived roles and the SHA-256 of the source as it stood when the compiler started, from which the "Changed" state derives;
+- the outcome replaces only the compile's own running marker — its start time, later than any marker before it, on this device — so a compile settling after a sync brought another device's marker records nothing and owes no follow-up.
+
+#### playbook-library-68
+
+When an authoring session's compile settles, the conversation runner shall start the follow-up by outcome once no turn or compile of the session runs, a queued Boss message always dispatching first and carrying the follow-up text as its preface [[playbook-library-65](#playbook-library-65)], never a second turn beside a running one:
+
+| Outcome | Follow-up |
+| --- | --- |
+| Failed phase or clarification | a relay turn — unless the last three compiles failed with no Boss message between them, or the compile was canceled or failed before the compiler ran |
+| Success | one success turn asking for the entry proposal |
+| Canceled, interrupted, toolchain | none |
+
+- the latest outcome the session recorded decides the follow-up owed: one owing none clears what an earlier compile owed, and a follow-up whose outcome the session file no longer records when it would start — another writer replaced it — is dropped, a queued Boss message going without it;
+- a Boss message resets the consecutive-failure count; the count and the queue persist on the session.
+
+#### playbook-library-69
+
+When an authoring session's playbook is added, the Add path shall re-package the retained compiler outputs with the confirmed command and intent without rerunning the compiler [[playbook-library-14](#playbook-library-14)], request the spec package by path from the environment the session belongs to [[core-service-96](core-service.md#core-service-96)] [[environments-26](environments.md#environments-26)], unless it is already requested, and resolve and install it [[environments-15](environments.md#environments-15)], write any player the submission names but your own group's roster lacks first, then write the `playbooks.<id>` entry re-keyed onto the derived role ids [[playbook-library-32](#playbook-library-32)] through the config writer [[playbook-library-16](#playbook-library-16)], reload the config, and mark the session added [[playbook-library-70](#playbook-library-70)]:
+
+- the one-shot `compile.run` is an authoring-style compile followed by this same path in one reply, so both share one helper, its `meta.yaml`, where the folder holds none, made as a session's [[playbook-library-70](#playbook-library-70)] with the project's defaults for org and license [[playbook-library-103](#playbook-library-103)], no license where none is derived;
+- each write is an ordinary write of its own file under the version it read [[environments-15](environments.md#environments-15)] [[shared-config-roundtrip-1](shared-config-roundtrip.md#shared-config-roundtrip-1)]; any failure after one of the writes leaves them written, undoes nothing, and the refusal names the writes made — the request, the lock, the install, each player, the entry — with the failure's own code and words ([DR-111](../decisions/111-the-core-coordinates-as-git-does.md));
+- a refused write leaves the session standing with its artifacts, so a corrected submission adds without recompiling.
+
+### Authoring Store
+
+#### playbook-library-70
+
+When an authoring session is created, opened, written, recorded, listed, or deleted, the authoring store shall keep the spec package under development in the working folder [[environments-10](environments.md#environments-10)] and the session's state, queue, and transcript in the project's spex repository [[storage-23](storage.md#storage-23)], read from their files at each use and written atomically under the version read or appended under the home lease [[storage-14](storage.md#storage-14)]:
+
+| Case | Behavior |
+| --- | --- |
+| create | make `<working folder>/spex-packages/<org>/<id>/` [[environments-10](environments.md#environments-10)], `<org>` as the creation names it, with, where the folder holds none, `meta.yaml` — `format: 2`, `org` and `license` as the creation names them [[playbook-library-51](#playbook-library-51)], `name` `<id>`, version `0.1.0`, `description` "The `<id>` playbook", and one `playbook` artifact `<id>` in the session's language — and `authoring/<id>.json` in the clone with a fresh instance; the session's language is the one the `meta.yaml` of a folder brought in [[playbook-library-51](#playbook-library-51)] already gives the playbook, else the project's authoring language where the working folder's `specs/meta.md` declares one by its marker line [[meta-27](../meta.md#meta-27)], else the home's interface language [[core-service-108](core-service.md#core-service-108)], recorded in the session file [[storage-23](storage.md#storage-23)], and the playbook's folder, its source file and the compile's folder [[playbook-library-12](#playbook-library-12)] follow it; refuse an id a playbook of either environment or an authoring session of any project holds, and, leaving it in place, a transcript of that id standing in the clone without its session file |
+| open | serve the state, the source with its version token, and the stored records after a given sequence, then stream new ones |
+| write source | replace `<id>.md` atomically under the token, whatever runs beside it |
+| write | replace the session file only where, at the instant before the rename, it still holds the bytes read and records the instance the writer names; else refuse, changed meanwhile, writing nothing |
+| record | append each record as it is streamed, numbered after the last one the transcript holds, only while the session file records the writer's instance; keep the compile outcome — with what became of a failure: relayed, stopped, or carried by a queued message — the queue, the failure count, and the proposal in the session file; at core start, close as interrupted a compile running and a turn left open that this device recorded, leaving those another device or an earlier version recorded as they stand |
+| list | every `authoring/<id>.json` of the project, with the source's title — its first `#` heading's text, else its first non-empty line — and "source missing" when the package folder is gone |
+| delete | remove the session file, its records, its assets and the preference, leaving the package folder |
+
+- an id two clones hold is the session of the first clone the home lists, and a moved clone's sessions are found where it stands;
+- a player choice an earlier version kept as `authoring:<id>:player` moves, at its first read, under the instance of the one session whose instance its id and creation time derive [[storage-23](storage.md#storage-23)], and no other session of that id reads it;
+- no write recreates a session file or a clone gone since it was read, and work a session started finishes or fails on its own, writing nothing into another session of its id;
+- an unreadable record or transcript is a scoped diagnostic that blocks that session alone, read from the files at each report, gone once the file reads again or the session's file is gone.
+
+#### playbook-library-103
+
+When a client sends `draft.defaults` for a project, the authoring store shall reply with the `org` and `license` a new playbook of that project starts from, read at the reply, the registry asked at most once ([DR-127](../decisions/127-a-home-signed-in-to-several-instances.md)):
+
+| Field | Default |
+| --- | --- |
+| `org` | where the project's selected registry [[environments-38](environments.md#environments-38)] lists orgs its registry account may publish to [[environments-27](environments.md#environments-27)], the one whose path is the project's group — its spex repository key without any instance folder leading it [[storage-1](storage.md#storage-1)] and without the last segment — or an ancestor of it, else the first listed; where it lists none, the home holds no registry grant there, or the registry gives no answer, the first `/`-separated segment of that key past any instance folder — `slbeta1` for `@spex.sublang.ai/slbeta1/workshop/graph-crate-spex` |
+| `license` | `Apache-2.0` where the working folder's `LICENSE`, past a byte order mark and leading whitespace, begins with "Apache License"; `MIT` where it begins with "MIT License"; else none |
+
+#### playbook-library-71
+
+When the conversation runner observes a `tool_result` event or the turn ends, it shall read `<id>.md`, and when its digest differs from the last one streamed, broadcast the source with its version token to every client, so the Source tab follows the agent's writes at tool-call granularity [[playbook-library-56](#playbook-library-56)].
+
+## Verification
+
+#### playbook-library-120
+
+When browser interactions use a project's Packages tab and its new-playbook form, they shall verify independent registry sign-in and sign-out at a Space's origin and a registry chosen from the chooser or through "Other…" remaining separate from the project's Space [[playbook-library-119](#playbook-library-119)], and org suggestions waiting for that registry account, loading and failure remaining visible through retry, successful empty and complete authorized suggestions, a typed org outside them wearing "not yours to publish to", manual names preserved and former-account responses ignored [[playbook-library-121](#playbook-library-121)].
+
+### Compile Coverage
+
+#### playbook-library-118
+
+Where the app's published dependencies are installed, when the integration suite provisions and bundles a TypeScript artifact through the real core for each shell, the suite shall assert that the artifact resolves Playbook and xstate to the same physical installations as the core and compiler through the provisioned engine links [[playbook-library-12](#playbook-library-12)], that the bundled module imports those engines with their module identities preserved [[playbook-library-14](#playbook-library-14)], and that its machine executes successfully.
+
+#### playbook-library-17
+
+Where a stub `slc` executable that emits a valid compiled playbook output is named as the configured compiler [[playbook-library-11](#playbook-library-11)], when the compile flow is driven end to end — source provided [[playbook-library-5](#playbook-library-5)], role names entered, the Add tab's form submitted [[playbook-library-7](#playbook-library-7)] — the test suite shall assert that the stub ran as an external process in the playbook artifact's folder of the spec package in the working folder [[playbook-library-12](#playbook-library-12)], that a registry manifest was emitted beside it whose entry passes the fail-closed registry validation [[playbook-library-15](#playbook-library-15)], that the project's `spex.yaml` gained a path request for the package and its lock places the playbook [[playbook-library-7](#playbook-library-7)], that the project's config gained a `playbooks.<id>` entry with no `from` whose role bindings are keyed by the entry's derived role ids however the submission cased them [[playbook-library-32](#playbook-library-32)] [[playbook-library-14](#playbook-library-14)], that the Playbooks tab lists the new playbook [[playbook-library-10](#playbook-library-10)], and that the stub ran with the Captain's block as `SLC_AGENT` and `SLC_MODEL` [[playbook-library-42](#playbook-library-42)].
+
+#### playbook-library-47
+
+Where a stub `slc` named as the configured compiler places an artifact as `slc` links one — Playbook's own `review`, its machine importing `xstate` and its runtime the engine, with the entry `slc` emits beside them — when the test suite compiles it through the compile runner, the test suite shall assert that the registry module imports `xstate` and `@sublang/playbook/xstate-runtime`, declares no `RUNTIME_ABI` and inlines no engine source while it inlines the linked artifact, and that its imports, as the compile's fail-closed import loaded it, resolved to the very engine and machine library modules the app runs [[playbook-library-14](#playbook-library-14)].
+
+#### playbook-library-112
+
+Where a linked artifact's entry requires a runtime option without a default, when the integration suite compiles and repackages it with unchanged command and intent through the compile runner, the suite shall verify that both produce the same structurally valid registry module without calling its option validator or constructing its runtime, preserving the validator's refusal of missing or invalid options and acceptance of the supplied valid option [[playbook-library-14](#playbook-library-14)], and that selected-project composition refuses missing or invalid options and accepts the valid configured option without constructing a runtime [[playbook-library-15](#playbook-library-15)].
+
+#### playbook-library-108
+
+Where a registry release holds that compiled `review` with its module bundled carrying the engine, beside a playbook whose module ships without its `<id>.registry.ts`, and a Git working folder holds a path source whose module carries the engine, when the test suite installs both and then installs the same lock again over the release's module linked back from the store, the test suite shall assert after each install that the `review` module holds the very bytes the compile packaged, with the store's copy and the lock's digest still the release's and the engine links standing, and that the module without its wrapper is unchanged and named in the report with why [[playbook-library-46](#playbook-library-46)]; that loading the installed module through the core's module loader resolves its imports to the engine and machine library modules the app runs [[playbook-library-46](#playbook-library-46)]; and that the path source's playbook gained the engine links, ignored by its Git, its module unchanged [[playbook-library-46](#playbook-library-46)].
+
+#### playbook-library-109
+
+Where two scratch homes run real cores whose own groups' clones sync through the stand-in host, and the first home's clone holds a spec package with a playbook, when the test suite requests it by path in your own group's environment while the clone's `.git/info` is a file, installs it again once that is a folder, and syncs both homes, the test suite shall assert that the first install failed, the environment's state naming the `.git/info/exclude` that cannot list the engine links, with no engine link made in the playbook folder [[playbook-library-46](#playbook-library-46)]; that once installed again the playbook folder gained the engine links, the clone's `.git/info/exclude` listing them in its managed block beside a line the reader wrote there, and Git reporting none of them [[playbook-library-46](#playbook-library-46)]; that the first home's sync reaches done with the host's `spex` holding the folder's files and no link [[playbook-library-46](#playbook-library-46)]; and that on the second home the playbook folder gains the engine links once its sync installs the lock, ignored by its clone's Git, and its next sync reaches done [[playbook-library-46](#playbook-library-46)].
+
+#### playbook-library-98
+
+Where the core runs with the scripted fake adapter and a stub `slc`, when an authoring session's playbook is compiled and `draft.register` is submitted with a new player while the project's config folder is a file another writer placed, the test suite shall assert that the Add is refused after its request, lock and player were written, the refusal naming those writes and carrying the failure's own words, that those writes stand and the other writer's file is unchanged, and that a retry once the folder is back writes no request again and writes the playbook's entry [[playbook-library-7](#playbook-library-7)] [[playbook-library-69](#playbook-library-69)].
+
+#### playbook-library-110
+
+Where the core runs with the scripted fake adapter and a stub `slc` on a home holding a paired project, when an authoring session of the global environment is created, compiles its playbook and is added through `draft.register`, the test suite shall assert that the session's spec package folder stands at `spex-packages/<org>/<id>` inside your own group's clone, the global environment's folder [[playbook-library-51](#playbook-library-51)], and that the Add is accepted: the global `spex.yaml` requests the spec package by that path, its lock resolves it there, and the global config holds the playbook's entry keyed by the derived roles, the project's config and `spex.yaml` unchanged [[playbook-library-7](#playbook-library-7)] [[playbook-library-69](#playbook-library-69)].
+
+#### playbook-library-18
+
+Where the app's own `slc` is missing from the module trees the test names, its playbook engine disagrees with the app's, or every Node.js candidate fails the version floor [[playbook-library-11](#playbook-library-11)], the test suite shall assert that the compile flow is reported unavailable with guidance naming the missing prerequisite — the restore command, both engines, or the version found [[playbook-library-8](#playbook-library-8)] — and that no compiler process is spawned.
+
+#### playbook-library-19
+
+Where a stub `slc` fails at a known pipeline phase with error output, when a compile is run, the test suite shall assert that the failing phase is identified, that the phase's captured output is surfaced, and that no config or environment write occurs [[playbook-library-9](#playbook-library-9)].
+
+#### playbook-library-79
+
+Where the core runs from a checkout whose app shells declare `@sublang/slc`, when the test suite resolves the toolchain with neither `SPEX_SLC` nor `SPEX_NODE` set, the test suite shall assert that the compiler is the checkout's own copy, run on the Node.js chosen when one meets the floor [[playbook-library-11](#playbook-library-11)], and that from that copy's own `@sublang/cligent` the Claude agent SDK the shells declare loads — the import a compiler installed globally or through `npx` fails on a fresh machine [[playbook-library-11](#playbook-library-11)].
+
+#### playbook-library-80
+
+Where the desktop's Electron binary is at hand, when the test suite resolves the toolchain with that binary handed as the app's own runtime with the desktop's module directories, the test suite shall assert that it answers the probe as Node at or above the floor with `ELECTRON_RUN_AS_NODE=1` and that the compiler resolved is the app's copy from those directories [[playbook-library-83](#playbook-library-83)] [[playbook-library-11](#playbook-library-11)], that the supplied compiler's `--version` runs on it, and that a probe in the compiler's place sees that Node with the variable gone [[playbook-library-11](#playbook-library-11)].
+
+#### playbook-library-81
+
+When the test suite compiles through a stub `slc` named as the configured compiler, the test suite shall assert the compile's agent per case [[playbook-library-42](#playbook-library-42)]: a block naming `codex` at effort `medium` in an environment setting no `SLC_*` variable reaches the stub as `SLC_AGENT=codex` and `SLC_EFFORT=medium` with neither `SLC_MODEL` nor `SLC_FAST_MODE`, `--config` naming a file that holds no setting, the stall budget beside them and a progress line naming the agent from the block ahead of the compiler; with `SLC_AGENT` set in the environment nothing of the block and no `--config` reaches the stub and the line names the environment; a block naming `kimi` is refused before the stub runs, the guidance naming the adapters `slc` drives; and a block's fast mode reaches the stub as its literal.
+
+#### playbook-library-82
+
+When the test suite resolves the toolchain through a probe answering each command with its own version, the test suite shall assert the order of [[playbook-library-11](#playbook-library-11)]: an Electron runtime meeting the floor is chosen, probed with `ELECTRON_RUN_AS_NODE=1` in the caller's environment, and runs the compiler behind the preload ahead of any `PATH` Node, an own runtime below the floor yields to a `PATH` Node meeting it with both probed in that order, and a configured `SPEX_NODE` is the only candidate probed; and that a compile on the Electron runtime spawns the copy's CLI behind the preload with `ELECTRON_RUN_AS_NODE=1` beside the caller's environment [[playbook-library-12](#playbook-library-12)] [[playbook-library-83](#playbook-library-83)] while a compiler `SPEX_SLC` names runs without it [[playbook-library-11](#playbook-library-11)].
+
+### Entry and Config Coverage
+
+#### playbook-library-20
+
+When the Add tab's form [[playbook-library-7](#playbook-library-7)] is submitted with an entry violating a fail-closed rule, covering at least a command duplicating an existing playbook's and an id failing the character rule ([DR-004](../decisions/004-config-and-persistence.md)), the test suite shall assert that each submission is rejected naming the violated rule [[playbook-library-15](#playbook-library-15)] and that the config file bytes and `spex.yaml` are unchanged.
+
+#### playbook-library-21
+
+Where a project's config file contains comments and entries unrelated to a global playbook whose global entry binds its roles `coder` and `reviewer` to two players, when the user overrides `coder` and then `reviewer` for the project through ✎ under Global and sets `coder` and then `reviewer` back to "Same as global" [[playbook-library-3](#playbook-library-3)], the test suite shall assert after each write that comments and unrelated entries are byte-identical to the original [[playbook-library-16](#playbook-library-16)] and that the list reflects the new state, an overridden role carrying a dot and a role set back none [[playbook-library-1](#playbook-library-1)]; that the first override writes the project's `playbooks.<id>` entry with the chosen player for `coder` and the global binding's player for `reviewer`, each by name alone, the global config unchanged [[playbook-library-3](#playbook-library-3)]; that setting `coder` back writes the global binding's player for it with the entry standing, and setting `reviewer` back removes the entry [[playbook-library-3](#playbook-library-3)]; and that a project's entry naming a playbook no environment places lists marked with that failure and a Remove act, whose activation deletes that entry alone [[playbook-library-2](#playbook-library-2)] [[playbook-library-3](#playbook-library-3)].
+
+#### playbook-library-25
+
+Where a playbook was compiled into a spec package in the working folder and installed as a path source, when its artifacts are requested over the protocol, the test suite shall assert the response carries the source markdown, the gears markdown, the FSM code [[playbook-library-22](#playbook-library-22)], the derived state ids, and that gears markdown parsed into items in document order, each with its first line, body, and citations [[playbook-library-24](#playbook-library-24)]:
+
+- A stage file removed: the test suite asserts the response names the missing stage while still serving the others [[playbook-library-24](#playbook-library-24)].
+- Gears the parser reads no item from: the test suite asserts the markdown still serves, with no parsed items beside it [[playbook-library-24](#playbook-library-24)].
+- The same playbook installed from the stand-in registry serves the same stages from `packages/` [[playbook-library-24](#playbook-library-24)].
+
+#### playbook-library-44
+
+When each built-in playbook's artifacts are requested from the built-in spec package, the test suite shall assert that built-in's shipped gears file is served parsed [[playbook-library-24](#playbook-library-24)]: at least one item, every item carrying an ID of the authored casing, a non-empty first line, and a body, with the markdown the rows fall back to still served beside them.
+
+#### playbook-library-37
+
+When each built-in playbook's artifacts are requested, the test suite shall assert the served graph is whole [[playbook-library-36](#playbook-library-36)]: every edge's ends name served nodes, the edge set is non-empty for every built-in, declared-id targets resolve — the review machine's opening transition and a boss-reply resume transition among the resolved — and a compound state's done transition appears as an edge.
+
+#### playbook-library-91
+
+Where fresh file modules use the current artifact schema with absent or noncurrent markers, a file module has the current marker and the built-in spec package's module has none, when real config composition loads each entry in English and Chinese, the integration suite shall assert incompatible files are refused with the existing typed registry fault and truthful source-compilation guidance, while the current-marker and built-in entries remain accepted [[playbook-library-33](#playbook-library-33)].
+
+#### playbook-library-94
+
+Where a scratch home holds a project whose environment requests two spec packages from the stand-in registry — the first requiring the second and providing the playbooks `triage` and `check`, the latter's command `/inspect`, the second providing a spec that cites a third package by address — its working folder holding a scaffolded `specs/`, and the global environment requests the built-in spec package, when the project's Packages and Playbooks tabs render and the suite drives their controls, the test suite shall assert:
+
+- the Packages tab heads the project's spec packages "Packages", carrying the registry chooser, naming no spex repository, with one "Add…", and lists no package of the global environment under any heading [[playbook-library-92](#playbook-library-92)] [[playbook-library-119](#playbook-library-119)];
+- each row reads its name, version, source glyph with its tooltip, what it provides and its standing, the required spec package standing under the one requiring it, a state naming a package's files missing reads "Files missing" with Install sending `environment.install`, and one listing a package the registry refused for want of a grant reads "Not installed · private" with "Sign in" starting the registry sign-in while a failure listing none reads "Not installed" [[playbook-library-92](#playbook-library-92)];
+- the project's environment wears "spex.yaml, spex.lock not committed" while its two files are untracked in the working folder, still after `git add` alone, and not once a commit holds both [[playbook-library-92](#playbook-library-92)];
+- Add…'s Registry tab searches the stand-in and requests the chosen version at the requirement its reading names, a typed name the stand-in does not list reading "⟨name⟩ · not listed publicly"; its Folder tab asks for a folder inside the path root the state names, reads the spec package's name and version from its `meta.yaml`, asking for a name only where that names none, and requests the path there, and stands disabled while the state names none [[playbook-library-92](#playbook-library-92)];
+- after an Add the receipt reads "Added ⟨name⟩ ⟨version⟩ · ⟨what it provides⟩" with no further act, a playbook the package provides listing at once on the Playbooks tab under the project's name [[playbook-library-92](#playbook-library-92)] [[playbook-library-1](#playbook-library-1)], and an expanded row lists its provided artifacts with one act each, a support artifact unlisted, a playbook's line reading "/⟨command⟩" with no act, the spec's line reading "spec · in specs/packages/⟨pkg⟩.md" with "⟨n⟩ links wait for ⟨org/pkg⟩ · Add" requesting that package, "spec · edited in specs/ — left as yours" once the copy is hand-edited, "spec · not placed — specs/ holds ⟨pkg⟩.md already" over a project file of that name and "spec · needs specs/ — scaffold first" in a folder without `specs/` [[playbook-library-92](#playbook-library-92)];
+- "spex.yaml changed" stands with Update while the lock is stale; a state naming a skill and a spec package the last placement left out wears "Not in the agents' folders" naming each with its reason, "Place skills again" sending `environment.install`, and no such chip once a state names nothing left out; Remove carries its consequence as its tooltip, asking Remove or Keep for the required spec package and removing the other at once; and every control stays enabled during that spex repository's sync and while the core installs, its install reading as progress [[playbook-library-92](#playbook-library-92)];
+- with the account at the registry not yet read, a folder package's overflow reads Publish, choosing it shows "Checking…" with nothing previewed and no sign-in started, and the read landing signed in asks for the preview once, its summary in the button's place, while landing signed out or failing leaves "Sign in to publish", its sign-in starting only when chosen, and a registry chosen after a failed read stands as "Loading registry…" until its own read lands [[playbook-library-113](#playbook-library-113)];
+- on the Playbooks tab, with no switch and no spec package list, the first package's playbooks list under the project's name and the built-ins under "Global", each row reading `from ⟨org/pkg⟩ ⟨version⟩` beside its roles and their players, naming no config or scope and reading none of "Enabled", "Available", "Personal", "in ⟨project⟩" or "built in" [[playbook-library-1](#playbook-library-1)] [[playbook-library-29](#playbook-library-29)]; the built-in `inspect` reads "Stands aside · /inspect is ⟨org/pkg⟩'s", naming the first package, in place of its roles, while the project's `check` lists with its roles [[playbook-library-1](#playbook-library-1)]; "Manage packages" opens the Packages tab [[playbook-library-1](#playbook-library-1)]; and once the first package is removed, the tab reads the Global heading alone, the built-in `inspect` listing with its roles [[playbook-library-1](#playbook-library-1)].
+
+#### playbook-library-123
+
+Where a scratch home's global environment requests the built-in spec package, at an older release than the app ships, a stand-in registry spec package providing a playbook, and by path a spec package in your own group's clone, and a project's environment requests another spec package providing a playbook, an authoring session standing in each environment, when the Playbooks surface renders and the suite drives its controls, the test suite shall assert:
+
+- the surface lists each spec package the global environment requests as the Packages tab's row reads it, each with the playbooks it places beneath it, under a header carrying the registry chooser, the account at the global environment's registry and one "Add…" [[playbook-library-122](#playbook-library-122)] [[playbook-library-119](#playbook-library-119)], and lists no playbook of the project's and names no project [[playbook-library-122](#playbook-library-122)];
+- the built-in spec package stands as an ordinary row with its version, "Update to ⟨shipped⟩" sending `environment.resolve`, and Remove in its overflow, while the path request's overflow offers Publish and the registry request's none [[playbook-library-92](#playbook-library-92)] [[playbook-library-113](#playbook-library-113)];
+- ✎ on a role writes the global config's entry with the chosen player and its tuning, the project's config unchanged, and the project's Playbooks tab lists that role's new player under Global with no dot [[playbook-library-122](#playbook-library-122)] [[playbook-library-4](#playbook-library-4)] [[playbook-library-1](#playbook-library-1)];
+- a spec package added through "Add…" is requested in the global `spex.yaml`, the project's unchanged, and its playbook lists beneath its row at once and under Global on the project's tab [[playbook-library-122](#playbook-library-122)] [[playbook-library-92](#playbook-library-92)] [[playbook-library-1](#playbook-library-1)];
+- the Authoring section lists the global environment's authoring sessions and none of the project's, the project tab's listing none of the global's, and "New playbook" there creates its session and its spec package at `spex-packages/⟨org⟩/⟨id⟩/` in your own group's clone, opening its workspace [[playbook-library-50](#playbook-library-50)] [[playbook-library-51](#playbook-library-51)];
+- with every spec package removed through its row's Remove, the built-in spec package's among them, the surface reads "No playbooks yet" above "Add…" and the project's tab lists no Global heading [[playbook-library-122](#playbook-library-122)] [[playbook-library-92](#playbook-library-92)] [[playbook-library-1](#playbook-library-1)].
+
+### Binding Coverage
+
+#### playbook-library-39
+
+Where a global playbook's entry binds three roles, two to one player and the third to a player another playbook's binding also names, the test suite shall assert the Playbooks surface prints the two roles one player plays on one line, "⟨role⟩, ⟨role⟩: ⟨player⟩", and each player by name and mark, its id in the tooltip, with what that binding effectively runs [[playbook-library-1](#playbook-library-1)] [[playbook-library-38](#playbook-library-38)], no row badging a player another playbook names [[playbook-library-38](#playbook-library-38)]; that the binding editor opened on the third role names that other playbook, and choosing in a role's editor a player another playbook's binding names states which playbooks those are [[playbook-library-38](#playbook-library-38)] [[playbook-library-4](#playbook-library-4)]; that rebinding through the editor on the surface offers exactly the roster, writes the global entry's chosen player with pinned effort, a pinned subagent model, a pinned subagent effort from a list holding no orchestration value and inherit/on/off fast mode while preserving untouched tuning and comments, offers no subagent-model or subagent-effort field on a lane whose adapter serves no subagent model [[playbook-library-4](#playbook-library-4)], checks effective inherited tuning against known model support, names in its inherit choice the player's model by the display rule and a player's unset one as the provider's default followed by the catalog's default model where it reports one, names a player's unset effort in the effort's inherit choice by the "Provider default" words, a player's unset subagent model as "Same as agent" and unset subagent effort as "Agent chooses", keeps a cleared pin in pin mode with an inline error and no write, and surfaces a refusal inline while keeping the editor open [[playbook-library-4](#playbook-library-4)]; that the first edit of a playbook running on its default binding writes its entry whole, the edited role as chosen and each other role on its `dev.⟨role⟩` [[playbook-library-4](#playbook-library-4)]; that on a project's Playbooks tab the editor of a role under the project's name offers the player alone with the phrase that tuning lives in your players, in Settings, and writes the name alone, and under Global offers "Same as global" first [[playbook-library-4](#playbook-library-4)]; and that the editor opens with focus inside and closes on Escape, on an outside click, and on Cancel with focus back on the role's control [[playbook-library-4](#playbook-library-4)].
+
+#### playbook-library-40
+
+Where the global environment places the built-in spec package, the global config binding one built-in's roles as the seed wrote them while another built-in has no entry and the roster lacks its roles' `dev.⟨role⟩` players, when the Playbooks surface and a project's Playbooks tab render, the test suite shall assert that each built-in lists under Global with its command, its intent and its roles, the first with the seed's players and the second with each role on `dev.⟨role⟩` [[playbook-library-34](#playbook-library-34)], and that browsing either's source writes nothing to the roster or the config [[playbook-library-34](#playbook-library-34)].
+
+#### playbook-library-49
+
+Where the validated catalog lists the built-in `dev` running without `branch` or `pr`, the test suite shall assert that the `dev` card carries the pull-request delivery hint naming each missing built-in, and that a catalog listing all three running renders no hint [[playbook-library-48](#playbook-library-48)].
+
+#### playbook-library-90
+
+Where the validated catalog lists the built-in `code` and `decide` running without `review`, when the Playbooks tab renders and then receives a catalog listing `review` running, the integration suite shall assert both hints name their effective commands, point at `/review`'s row, cause no configuration write and disappear on the update [[playbook-library-89](#playbook-library-89)]; it shall also render playbooks of another spec package with those same ids and unrelated built-in entries, asserting no hint for them, in English and Chinese.
+
+### Cancellation and Gate Coverage
+
+#### playbook-library-45
+
+Where a playbook's artifacts carry a parsed Gears stage of two items, one citing the other, when the Gears stage is opened, the test suite shall assert the card draws the outline's rows [[playbook-library-22](#playbook-library-22)]: each row collapsed on its ID, group, and first line with no edit control, a pressed row rendering its body, a settled hover on the citation previewing the cited item and its jump dismissing that preview, the citation landing on the cited row expanded and highlighted without leaving the card, and — where the parse is absent — the gears markdown rendered instead.
+
+#### playbook-library-30
+
+While a compile driven through the app store is running, the test suite shall assert that a cancel control is rendered beside the compile progress output, that activating it issues the compile abort command for the running playbook id [[playbook-library-27](#playbook-library-27)], that the recorded cancellation appears in the progress log, and that the compile start control stays disabled until the compile settles.
+
+#### playbook-library-31
+
+Where your own group's config state is missing or invalid, the test suite shall assert that the Playbooks tab renders the config gate — the Captain-scope explanation and the fix-it-in-Settings direction [[playbook-library-28](#playbook-library-28)] — with "Settings" as an activatable navigation control when a navigation callback is supplied and as plain text when it is not, and that no playbook list or compile form is rendered.
+
+### Authoring Coverage
+
+#### playbook-library-72
+
+Where the core runs with the scripted fake adapter — its first reply writing a `Roles:`-led `<id>.md` into its working directory and ending in a compile block, its next reply a register block — and a stub `slc` named as the configured compiler emitting a two-role entry, when an authoring session is created in a project and one message sent over the protocol, the test suite shall assert that the fake ran with the spec package's folder as `cwd`, exactly `{ mode: "auto" }` as its permissions, no tool lists, and no resume, and that the chat and proposal calls pass the supported hosts' real Claude, Codex, Gemini and OpenCode permission mappers without additional write grants [[playbook-library-64](#playbook-library-64)]; that the prompt carried the source path, the four document paths, the one-effect rule for outcomes, and both directive kinds [[playbook-library-65](#playbook-library-65)]; that the records streamed as `author` player records and a Boss turn into the project's clone [[playbook-library-64](#playbook-library-64)] [[playbook-library-70](#playbook-library-70)]; that the source broadcast after the write [[playbook-library-71](#playbook-library-71)]; that a compile started without a further command, its progress lines streamed, and no config write occurred [[playbook-library-66](#playbook-library-66)] [[playbook-library-67](#playbook-library-67)]; that the stub `slc` ran with the session's answering agent as `SLC_AGENT` and `SLC_MODEL` [[playbook-library-42](#playbook-library-42)]; that the success turn's prompt named the roles and the proposal landed with the block's fields [[playbook-library-68](#playbook-library-68)] [[playbook-library-66](#playbook-library-66)]; that `draft.register` requested the package by path from the project's environment, wrote the new player first, then `playbooks.<id>` keyed by the derived roles into the project's config with the confirmed command and intent in the wrapper, the global `spex.yaml` and the global config's entries unchanged, after which the session reads added and the playbook is listed among those that run [[playbook-library-69](#playbook-library-69)] [[playbook-library-70](#playbook-library-70)] [[playbook-library-7](#playbook-library-7)]; and that the session is listed titled by its source's first `#` heading's text, a license comment above that heading passed over, and, for a source with no such heading, by its first non-empty line [[playbook-library-70](#playbook-library-70)].
+
+#### playbook-library-73
+
+Where the stub `slc` fails at `gears2fsm` on its first two runs and exits 2 with a `SLC_CLARIFICATION:` report on the third, and the fake replies with a compile block on every relay, when an authoring session's compile is started, the test suite shall assert that each failure recorded the phase and output [[playbook-library-67](#playbook-library-67)]; that a relay turn followed each of the first two with permissions accepted by the real adapter mappers [[playbook-library-64](#playbook-library-64)], the phase, elapsed time, and output tail in its prompt, and the third carried the questions with reasons and choices [[playbook-library-65](#playbook-library-65)] [[playbook-library-68](#playbook-library-68)]; that after the third failure no turn started and the session's state says so [[playbook-library-68](#playbook-library-68)]; that the session's compile record names what became of each failure — sent, sent, stopped, and queued for the one a queued message carried [[playbook-library-70](#playbook-library-70)]; that a Boss message reset the count and the next failure relayed again [[playbook-library-68](#playbook-library-68)]; that a `draft.send` queued during a compile dispatched before any relay with the failure as its preface [[playbook-library-65](#playbook-library-65)]; and that no config write occurred throughout [[playbook-library-67](#playbook-library-67)].
+
+#### playbook-library-74
+
+Where the fake's run stays in flight until aborted and the compile spawner blocks until canceled, the test suite shall assert as an explicit matrix that `draft.send` during a turn and during a compile reply queued; that `draft.source.write`, `draft.player.set` and `draft.compile` during a turn are admitted, the compile running beside the turn; that a second `draft.compile` during a compile is refused `busy` naming the folder, the first running on [[playbook-library-99](#playbook-library-99)]; that `draft.abort` ends the turn with an aborted record and leaves the queue standing; that one `compile.abort` naming the instance cancels the compile with the canceled line last and no relay; and that the queued messages dispatched in order once the session was idle [[playbook-library-64](#playbook-library-64)] [[playbook-library-67](#playbook-library-67)] [[playbook-library-68](#playbook-library-68)] [[playbook-library-70](#playbook-library-70)].
+
+#### playbook-library-75
+
+Where an authoring session holds two turns and a compile was running, when the core is stopped and restarted and the session reopened, the test suite shall assert that the records replay in sequence and the compile reads interrupted with no relay [[playbook-library-70](#playbook-library-70)]; that the next turn's prompt is a reseed carrying the conversation so far and no resume [[playbook-library-65](#playbook-library-65)] [[playbook-library-64](#playbook-library-64)]; that the initial, resumed, resume-rejection retry, restored and switched-agent calls pass the real adapter permission mappers and within one run the second turn passed the first's token as `resume` [[playbook-library-64](#playbook-library-64)]; that `draft.player.set` wrote `authoring:<instance>:player` to the preferences and the next run used that player's block with a reseed [[playbook-library-64](#playbook-library-64)] [[playbook-library-65](#playbook-library-65)]; that a session whose transcript is damaged opens after a restart with its source and a diagnostic in place of its records and refuses a message [[playbook-library-70](#playbook-library-70)]; and that `draft.delete` removed the session file, records, assets and preference and left the package folder [[playbook-library-70](#playbook-library-70)].
+
+#### playbook-library-76
+
+Where the fake's reply carries, as an explicit case matrix, a block inside a fenced example, two register blocks, a block with an unknown key, a block that fails to parse, and a register block naming a role the entry lacks, the test suite shall assert that only the second register block became the proposal, the nested block acted as nothing, the malformed blocks were recorded malformed each with why, the block that fails to parse, naming no kind, owed a relay that started at once, its line naming a `spex` block [[playbook-library-53](#playbook-library-53)], and its prompt named both malformed blocks with why at its head, and the unknown role stood as a mismatch beside the derived roles [[playbook-library-66](#playbook-library-66)] [[playbook-library-65](#playbook-library-65)].
+
+#### playbook-library-106
+
+Where the core runs with the scripted fake adapter and a stub `slc` emitting a two-role entry, when an authoring session's compile succeeds and the Boss then sends five messages in order, queuing a sixth behind the last, the test suite shall assert:
+
+- the success turn's register block, whose unquoted intent holds ": ", was recorded with its YAML error as why; a relay turn followed at once whose prompt named the block with that error at its head and closed asking for the register block again, the thread reading "Could not read the agent's register block — sent to the agent"; and the relay's readable register block became the proposal [[playbook-library-66](#playbook-library-66)] [[playbook-library-65](#playbook-library-65)] [[playbook-library-53](#playbook-library-53)];
+- a reply holding a readable register block beside a malformed one replaced the proposal and owed no relay, and a reply holding a malformed register block beside a compile block started the compile and owed none, the compile's success turn naming the block with why at its head [[playbook-library-66](#playbook-library-66)] [[playbook-library-65](#playbook-library-65)];
+- a reply whose every relay is answered with another unreadable block was relayed twice and its third such reply was not, no turn starting after it, the thread reading "Could not read the agent's register block — three in a row; tell the agent how to proceed" [[playbook-library-66](#playbook-library-66)] [[playbook-library-53](#playbook-library-53)];
+- a Boss message after that stop reset the count, its reply's unreadable block relayed again [[playbook-library-66](#playbook-library-66)];
+- with the sixth message queued behind a slow reply, that reply's unreadable block had the thread read "Could not read the agent's register block — waiting for your queued message", and the queued message dispatched next with the block named at its head and the relay text as its preface [[playbook-library-66](#playbook-library-66)] [[playbook-library-65](#playbook-library-65)] [[playbook-library-53](#playbook-library-53)].
+
+#### playbook-library-102
+
+Where the core runs with the scripted fake adapter, when authoring sessions are created and one message sent to each, the test suite shall assert as an explicit case matrix the session's language — its playbook folder `playbooks/<language>/<id>/`, its source path, its manifest's artifact language and its session file's `language` [[playbook-library-70](#playbook-library-70)] — and the first prompt naming it, with the words kept in English, the lead-in "in quotes (`>`)" among them, for a language other than English alone, and the one-word role name rule, a step's three repository effects, a prompt carrying only its role's own step and a prompt's text standing in the source's order in every case [[playbook-library-65](#playbook-library-65)]:
+
+| Project | Home | Language |
+| --- | --- | --- |
+| `specs/meta.md` declaring `Authoring language: zh` | `en` | `zh`, Chinese |
+| no marker | `zh` | `zh`, Chinese |
+| no marker | `en` | `en`, English, no words kept |
+| a folder brought in whose `meta.yaml` gives the playbook `zh` | `en` | `zh`, the `meta.yaml` unchanged |
+
+- a session created on a `zh` home keeps its folder after the home's language changes.
+
+#### playbook-library-104
+
+Where the core runs with the scripted fake adapter on a home signed in to two stand-in instances whose folders are `@<first>` and `@<second>`, each with its stand-in registry, the first the home's default instance, when `draft.defaults` is sent for a local-only project whose working folder's `LICENSE` stands as each case of the first table, and for it and a project of `acme/workshop/team` at each instance while the first instance's registry stands as each case of the second and the second's lists `alpha-two` at `alpha` and `team-two` at `acme/workshop/team`, and an authoring session and a one-shot compile then make their spec packages, the test suite shall assert the `license` and `org` replied per case, each reply asking once its explicitly selected registry — the first's for the local-only project — where the home holds that registry's grant, and no other registry [[playbook-library-103](#playbook-library-103)]:
+
+| `LICENSE` | `license` replied |
+| --- | --- |
+| the Apache License 2.0 text | `Apache-2.0` |
+| an MIT License text | `MIT` |
+| another license's text | none |
+| absent | none |
+
+| The first instance's registry | `org` for `tester/project-spex` | `org` for `@<first>/acme/workshop/team/graph-spex` | `org` for `@<second>/acme/workshop/team/graph-spex` |
+| --- | --- | --- | --- |
+| refusing the first registry's app token (`401`) | `tester` | `acme` | `team-two` |
+| out of service (`500`) | `tester` | `acme` | `team-two` |
+| listing no org | `tester` | `acme` | `team-two` |
+| listing `workshop-261011` alone | `workshop-261011` | `workshop-261011` | `team-two` |
+| listing `acme-work` at `acme/work`, `alpha` at `alpha`, and `workshop` at `acme/workshop` | `acme-work` | `workshop` | `team-two` |
+| not asked, the home signed out of the first registry | `tester` | `acme` | `team-two` |
+| not asked, the home signed out of both registries | `tester` | `acme` | `acme` |
+
+- the session's `meta.yaml` names the org and the license `draft.create` gave, its package named under that org [[playbook-library-70](#playbook-library-70)];
+- the one-shot compile's `meta.yaml` names the project's defaults [[playbook-library-69](#playbook-library-69)].
+
+#### playbook-library-105
+
+Where the Playbooks tab renders over a project through a client whose `draft.defaults` replies are scripted, when the New playbook field is shown and worked and a session's Add succeeds, the test suite shall assert:
+
+- the id field reads the caption "Lowercase, becomes /triage" once `triage` is typed [[playbook-library-51](#playbook-library-51)];
+- "Org" and "License" read the defaults replied for the project, and a reply with no license leaves "License" empty, "New playbook" and the example's prefill standing disabled until it is filled [[playbook-library-51](#playbook-library-51)] [[playbook-library-35](#playbook-library-35)];
+- an org of `Acme`, `acme_co`, `-acme` or 65 characters is refused in place naming the rule with nothing created, and Enter with an edited org and license creates the session with them [[playbook-library-51](#playbook-library-51)];
+- the example's prefill creates its session with the field's org and license [[playbook-library-35](#playbook-library-35)];
+- the added card's success line reads "Commit spex-packages/acme/triage with your code" in English and "把 spex-packages/acme/triage 和代码一起提交" in Chinese, the folder set as code, and still stands once the card's highlight is gone, while on the Playbooks surface a global session's added card carries no such line [[playbook-library-61](#playbook-library-61)].
+
+#### playbook-library-111
+
+Where the Add tab renders a compiled authoring session with an explicit registry and independently scripted registry account state, when its registry grant stands as each case, the test suite shall assert the control beneath the form [[playbook-library-93](#playbook-library-93)]:
+
+| Registry account | Space account | Beneath the form |
+| --- | --- | --- |
+| signed in | signed in or signed out | Publish |
+| signed out | signed in or signed out | "Sign in to publish", starting the registry sign-in in place without navigating to Space |
+| registry state absent | any | Loading registry…, with no publication authority borrowed from Space |
+| not yet read | any | Loading registry…, with neither Publish nor "Sign in to publish", until the read lands |
+| read failed | any | "Sign in to publish" with the read's cause |
+
+- with Publish standing for a session already added, "Its package" beside it opens the package's row on the Packages tab [[playbook-library-93](#playbook-library-93)].
+
+#### playbook-library-88
+
+Where the Add tab renders a compiled authoring session over a roster holding `dev.coder` and `dev.reviewer`, the test suite shall assert, as an explicit case matrix, each role row's default [[playbook-library-61](#playbook-library-61)]:
+
+- a proposal naming `Coder` and `Verifier` fills the derived roles `coder` and `verifier` with the proposed players and shows no mismatch;
+- with or without a proposal, the role `coder`, whose uncontested own lane `dev.coder` the roster holds, selects that lane as it stands;
+- that role's new player is `dev.coder-2`, and `dev.coder-3` once the roster also holds `dev.coder-2`;
+- Chinese roles and digit-leading or punctuation-only roles receive valid segmented ids, retaining ordinary ASCII defaults; submitting the rendered form passes the actual typed-command validator with one new lane per unproposed role, including when the roster already holds the fallback base;
+- distinct roles whose normalization collides receive distinct automatic lanes and offered new options, including when the roster holds the normalized base; an implicit roster choice never shares another role's explicit existing-lane choice, while explicitly shared proposals or Boss selections retain one lane;
+- an automatic lane avoids a later role's explicitly proposed or selected new id, and selecting an already offered new option or a roster lane leaves unaffected defaults and offered new options stable;
+- the form holds no field naming where the playbook is added, and a role left without a player disables Add with the tooltip "A player per role, a command and an intent" [[playbook-library-61](#playbook-library-61)].
+
+#### playbook-library-96
+
+Where the core runs with the scripted fake adapter and a stub `slc`, when the test suite changes an authoring session's files beside the core as another writer would, the test suite shall assert, as an explicit case matrix:
+
+- a transcript replaced under the same instance: the next open serves the replacement whole, the next record follows its last, and the next turn reseeds with no resume [[playbook-library-70](#playbook-library-70)] [[playbook-library-64](#playbook-library-64)] [[playbook-library-65](#playbook-library-65)];
+- a session deleted and recreated under its id: a command naming the former instance is refused, the successor reads idle and takes a message while the former's compile runs, the successor's compile refused `busy` meanwhile [[playbook-library-99](#playbook-library-99)], the former session's late compile settlement writes nothing into the successor, and no file of the former session is recreated [[playbook-library-70](#playbook-library-70)];
+- a session deleted and recreated under its id while a turn of the former instance runs: none of that turn's records reach the successor, whose transcript is never made [[playbook-library-70](#playbook-library-70)];
+- a session deleted with `draft.delete` while its compile runs: the deletion is admitted and the compile, ending, makes no file of the session again [[playbook-library-70](#playbook-library-70)];
+- a compile whose running marker a sync replaced with another device's: the settlement records nothing [[playbook-library-67](#playbook-library-67)];
+- a compile settling while a turn runs: its follow-up waits for that turn, never running beside it; a newer compile canceled before the turn ends leaves none owed; and a compile record another writer replaced before the turn ends leaves none, the queued Boss message going without its preface [[playbook-library-68](#playbook-library-68)];
+- a transcript replaced, or extended by another writer, while the provider ran, and one extended between turns: the next turn reseeds with no resume, while a turn over a transcript only this run wrote resumes [[playbook-library-64](#playbook-library-64)] [[playbook-library-65](#playbook-library-65)];
+- a clone moved under the home: the session's next record lands in the moved clone and nothing is recreated at the former path [[playbook-library-70](#playbook-library-70)];
+- a session file rewritten with a newer queue and proposal during a compile: its settlement keeps both, the queued message dispatching first, and a write against the bytes read before the rewrite is refused [[playbook-library-70](#playbook-library-70)] [[playbook-library-68](#playbook-library-68)];
+- a damaged transcript repaired while the core runs, and a damaged session deleted beside the core: the session takes a message with no restart, and in both the diagnostic leaves the next report; a transcript that will not read at all is one scoped row naming it, the report and another session standing, gone once the file is back [[playbook-library-70](#playbook-library-70)];
+- a compile running and a turn open that another device recorded, and an earlier version's unmarked turn, stand after a restart, while this device's own are closed as interrupted [[playbook-library-70](#playbook-library-70)];
+- a player choice an earlier version kept by id: the session written without an instance answers with it and holds it under its derived instance after, while a new session of that id made after the former's deletion beside the core answers with the Captain [[playbook-library-70](#playbook-library-70)];
+- a transcript standing without its session file: create refuses and leaves its bytes [[playbook-library-70](#playbook-library-70)];
+- a source edited while the compiler runs: the success reads "Changed" [[playbook-library-67](#playbook-library-67)].
+
+#### playbook-library-100
+
+Where the core runs with the scripted fake adapter and a stub `slc` holding each compile until the test releases it, when the test suite asks for compiles and Adds over one playbook artifact's folder and over another, the test suite shall assert, as an explicit case matrix:
+
+- an authoring session's second Compile, and its agent's compile directive, while its first compile runs on a source since edited: each refused `busy` naming the folder, the directive recording "◇ Compile skipped: ⟨why⟩" [[playbook-library-66](#playbook-library-66)], and the folder and the session holding the first compile's outputs and outcome [[playbook-library-99](#playbook-library-99)];
+- a one-shot compile of the session's id in its working folder while its compile runs, and, once its compile succeeded, its Compile and its Add while such a one-shot compile runs: each refused `busy`, the running one finishing [[playbook-library-99](#playbook-library-99)];
+- a one-shot compile of that id in another project's working folder: it runs beside the session's compile, both succeeding [[playbook-library-99](#playbook-library-99)];
+- a one-shot compile of that id through a project registered at a link to the session's working folder, and, where the scratch filesystem folds case, through one registered at that folder's path in other case, while its compile runs: each refused `busy` naming the folder [[playbook-library-99](#playbook-library-99)];
+- a Compile asked after `compile.abort` while the canceled compiler, ignoring its termination signal, still runs: refused `busy` with no compiler run, and admitted once that compiler has exited [[playbook-library-99](#playbook-library-99)]; and a Compile whose `compile.abort` naming its instance arrives while its toolchain probe is held, or while its config is prepared: each replying `aborted` once released, with no compiler run, and the folder's listing and source unchanged — the probe's recording no marker and leaving the session file's bytes unchanged, the config's running marker, seen while held, settling `canceled` under its own start time [[playbook-library-67](#playbook-library-67)];
+- a session's compile whose project is rebound while the compile prepares its config, and one rebound while its toolchain probe is held: each refused `conflict`, changed meanwhile, with no compiler run, neither the folder paired at its start nor the one paired now written [[playbook-library-67](#playbook-library-67)];
+- a session's compile whose toolchain probe is held while its project is rebound, and a second compile admitted to the new folder whose compiler is then held with its running marker recorded: releasing the first's probe replies `conflict` with the second's running marker unchanged, releasing the second records its success and roles under its own start time, and the folder paired at the first's start stays untouched [[playbook-library-67](#playbook-library-67)];
+- a Compile whose toolchain probe answers a Node.js below the compiler's floor: the reply carrying the guidance, the session recording the compile failed at `toolchain` with that guidance as its output, and no compiler run [[playbook-library-67](#playbook-library-67)];
+- a one-shot compile whose picked source file is read while another writer changes `<id>.md`: refused as a conflict before the compiler runs, `<id>.md` keeping the other writer's bytes [[playbook-library-12](#playbook-library-12)].
+
+#### playbook-library-97
+
+Where the authoring workspace renders over a simulated core, when that core replaces an open session's transcript under the same instance and then replaces the session under its id, the test suite shall assert that a reconnect, a `draft.history-replaced` announcement and a record not following the thread's last each reload the whole transcript while the composer's text, the Source tab's edits and the Add form stand, that Cancel names the instance shown, that once another instance is announced a late record, source, progress line or reply — a source refresh, artifacts, an Add's close, a send's error — naming the former changes nothing of the successor's while the Add's config stands, that with the successor's thread open a former instance's record numbered right after the thread's last changes nothing while the successor's own extends it, that a former instance's record arriving while the successor's transcript is read changes nothing however it is numbered, and that a record arriving after the session's removal makes no thread [[playbook-library-62](#playbook-library-62)].
+
+#### playbook-library-101
+
+Where the authoring workspace renders over a simulated core that refuses `draft.compile` `busy` because another job writes the session's artifact folder, when the Boss activates Compile, the test suite shall assert that the refusal shows and Compile stays enabled, reading "Compile" [[playbook-library-57](#playbook-library-57)].
+
+#### playbook-library-107
+
+Where the authoring workspace renders a transcript whose agent reply holds a spex block of an unknown kind, the test suite shall assert that the block stands as code whose visible caption reads "Spex could not read this block — unknown kind deploy" [[playbook-library-53](#playbook-library-53)].
+
+### Browser Journeys
+
+#### playbook-library-41
+
+Where the browser journey harness ([DR-039](../decisions/039-browser-acceptance-journeys.md)) boots the served shell on the demo config, the demo project's environment requesting the built-in spec package beside the global environment, when the journey works the project's Playbooks and Packages tabs and the Playbooks surface through the page, the test suite shall assert:
+
+- every playbook that runs lists once on the project's Playbooks tab, under the project's name or "Global", the built-ins once under Global though both environments place them, each with its command, intent, `from ⟨org/pkg⟩ ⟨version⟩` and role bindings, with no switch, no Enable or Disable, and none of "Personal", "in ⟨project⟩" or "built in" [[playbook-library-1](#playbook-library-1)] [[playbook-library-29](#playbook-library-29)] [[playbook-library-34](#playbook-library-34)];
+- the Playbooks tab shows no spec package list, add control or registry account, and its "Manage packages" opens the Packages tab, whose one heading, "Packages", carries one "Add…" [[playbook-library-1](#playbook-library-1)] [[playbook-library-92](#playbook-library-92)];
+- a built-in's role overridden for the project through ✎ under Global carries a dot and writes the project's config, and set back to "Same as global" loses the dot and leaves the project's config without that entry, neither write asking for a confirm [[playbook-library-1](#playbook-library-1)] [[playbook-library-4](#playbook-library-4)] [[playbook-library-3](#playbook-library-3)];
+- a playbook's stage row opens the stage pressed, swaps to another pressed beside it, and closes on a second press of the open one [[playbook-library-22](#playbook-library-22)];
+- the Gears stage stands as item rows carrying the artifact's own IDs, one of which expands to its body [[playbook-library-22](#playbook-library-22)];
+- the State machine stage's state list stays in view with its box scrolled to the bottom [[playbook-library-22](#playbook-library-22)];
+- the open stage's box carries a grip that names the stage, and a drag of it leaves the box taller with the height still standing after a reload [[playbook-library-22](#playbook-library-22)];
+- the rail's Playbooks entry opens the Playbooks surface, listing the global spec packages, each with the playbooks it places beneath it, "Add…", the Authoring section and "New playbook", and no project's playbook, a role's ✎ there writing the global config [[playbook-library-122](#playbook-library-122)] [[playbook-library-4](#playbook-library-4)], while Remove in a spec package's row overflow carries its consequence as its tooltip [[playbook-library-92](#playbook-library-92)];
+- the tabs and the surface name things and acts in the reader's words — "Global", "Same as global", Add, Remove, Update — and none reads Enable, Disable, "Enabled", "Available" or "Personal" [[playbook-library-26](#playbook-library-26)];
+- a role's binding editor opened at the 320-pixel viewport floor stands wholly inside the tab's box both on opening and after discovery followed by pinning a custom model, with the tab scrolling in neither direction [[playbook-library-43](#playbook-library-43)], its model and effort stacked there and side by side at 1280 pixels [[playbook-library-4](#playbook-library-4)].
+
+#### playbook-library-77
+
+Where the browser journey harness ([DR-039](../decisions/039-browser-acceptance-journeys.md)) boots the served shell with the authoring fake script and the stub `slc` named as the configured compiler, when the journey works a new playbook through the page, the test suite shall assert:
+
+- "New playbook" asks for the id inline beside "Org" and "License" filled with the project's defaults, refuses `Triage` naming the rule, and opens `triage` as the workspace with the divider, the tab strip reading Source, Gears, Machine and Add, the two openers, and an Authoring row on returning [[playbook-library-51](#playbook-library-51)] [[playbook-library-52](#playbook-library-52)] [[playbook-library-84](#playbook-library-84)] [[playbook-library-50](#playbook-library-50)];
+- "Try the example" places the example's prose in the composer and sends nothing; "Use a SKILL.md…" with no file pick on the page opens the Source tab's paste mode with its text focused and places the adapt sentence, and with a page-supplied pick on a session with no source writes the picked file as the source, shown in the Source tab with its path, with the adapt sentence placed [[playbook-library-84](#playbook-library-84)];
+- a sent message stands as a Boss bubble, the agent's write as a tool card, its compile block as the "Asked to compile" card, and the Source tab shows the written markdown before the turn ends [[playbook-library-53](#playbook-library-53)] [[playbook-library-56](#playbook-library-56)];
+- the band lists the phases in human words with the running one's output age, "asked by the agent", and Cancel [[playbook-library-57](#playbook-library-57)];
+- a failing stub leaves a red phase with its output open, a "sent to the agent" system line, and the compiled tabs still disabled, then a second compile turns the chip "Compiled" with Gears rows and the Machine state list [[playbook-library-58](#playbook-library-58)] [[playbook-library-60](#playbook-library-60)];
+- a message sent during the compile queues with "Send next" and dispatches afterwards [[playbook-library-54](#playbook-library-54)];
+- Edit, Save, and a forced conflict behave as specified, and Paste's "Use as source" writes the file [[playbook-library-56](#playbook-library-56)];
+- the proposal stands as the card "Proposed /triage", whose "Open Add" opens the Add tab prefilled from the proposal with no field naming where it is added [[playbook-library-53](#playbook-library-53)] [[playbook-library-61](#playbook-library-61)], and Add lists `/triage` under the project's name among the playbooks that run with the chip reading "Added", the card's success line reading "Commit spex-packages/acme/triage with your code", and the spec package listed under "Packages" on the Packages tab, its source glyph's tooltip reading "From folder spex-packages/acme/triage" [[playbook-library-61](#playbook-library-61)] [[playbook-library-92](#playbook-library-92)];
+- the agent picker offers "Captain" and each roster player, and a switch survives a reload with its system line [[playbook-library-55](#playbook-library-55)];
+- a reload restores the transcript, the source, and the compiled tabs [[playbook-library-62](#playbook-library-62)];
+- a session seeded with a compile still marked running when the shell booted opens with the chip "Interrupted", the band's interrupted line, Compile enabled, and no relay line in the thread [[playbook-library-59](#playbook-library-59)];
+- Delete asks Delete or Keep and removes the row, the package folder staying [[playbook-library-63](#playbook-library-63)];
+- the example card's Prefill opens the example's authoring workspace in the Source tab's paste mode with the normalized text placed and nothing written or compiled [[playbook-library-35](#playbook-library-35)];
+- at the 320-pixel viewport with the rail collapsed the panes stack under a horizontal grip with the chip in view, every control keeps its accessible name, and the page scrolls in neither direction [[playbook-library-52](#playbook-library-52)].
+
+#### playbook-library-78
+
+Where the live journey lane is opted in ([DR-039](../decisions/039-browser-acceptance-journeys.md)) with the machine's real sign-in and the released `slc`, when the journey asks for "a two-role changelog playbook: Coder drafts release notes from the commits since the last tag and commits them; Reviewer checks them against the commits", follows the agent's compile request and its proposal, and answers any player's question in the run through the Captain ([DR-089](../decisions/089-every-fresh-user-scenario-walked-for-real.md)), the test suite shall assert that a source declaring Coder and Reviewer was written [[playbook-library-56](#playbook-library-56)], that the agent's compile ran to Link [[playbook-library-57](#playbook-library-57)], that the derived roles are those two [[playbook-library-60](#playbook-library-60)], that `/changelog` was added with a player per role [[playbook-library-61](#playbook-library-61)], that a new session's slash menu offers it, and that a session's `/changelog` turn then runs the added playbook to a finished turn with both role players engaged and the repository carrying a commit of its notes [[playbook-library-14](#playbook-library-14)] ([DR-086](../decisions/086-tests-in-tiers.md)):
+
+- the journey picks a roster player bound to `gpt-6-astra` at `xhigh` as the session's agent before its first message, so the conversation and the compile run on that block [[playbook-library-55](#playbook-library-55)] [[playbook-library-42](#playbook-library-42)].
+
+#### playbook-library-85
+
+Where the browser journey harness ([DR-039](../decisions/039-browser-acceptance-journeys.md)) boots the served shell with the demo project registered and the passing stub `slc` on the toolchain path, when the journey opens the example's Prefill, uses the placed text as the source, compiles from the workspace's own control, and adds the result, the test suite shall assert through the page that the session's source is the pasted text [[playbook-library-35](#playbook-library-35)] [[playbook-library-56](#playbook-library-56)], that the compile band reads asked by you and runs to Link [[playbook-library-57](#playbook-library-57)], that with the agent proposing nothing the Add tab's form stands on its derived defaults — the session's id as the command and, the example holding no prose paragraph, its title as the intent — with a player per derived role, adding the example's `/workflow` with no intent typed [[playbook-library-61](#playbook-library-61)] [[playbook-library-7](#playbook-library-7)], that the Playbooks tab lists it [[playbook-library-10](#playbook-library-10)], and that a new session's slash menu offers it.
+
+#### playbook-library-86
+
+Where the live journey lane runs with the machine's signed-in agents and the app's own `slc` ([DR-089](../decisions/089-every-fresh-user-scenario-walked-for-real.md)), when the journey opens the example's Prefill, uses the placed text as the source, compiles it from the workspace's own control, adds it on the Add tab's prefill, sends the added command with a task in a new session, and answers any player's question through the Captain, the test suite shall assert through the page:
+
+- the session's source is the pasted text [[playbook-library-35](#playbook-library-35)] [[playbook-library-56](#playbook-library-56)], and the compile band reads asked by you and its first compile runs to Link [[playbook-library-57](#playbook-library-57)], the chip reading "Compiled" with the example's two roles derived [[playbook-library-60](#playbook-library-60)];
+- the Add tab adds the example on its prefill with nothing typed [[playbook-library-61](#playbook-library-61)], and the Playbooks tab lists it [[playbook-library-10](#playbook-library-10)]: where the agent's turn after the compile proposed nothing, the derived defaults — the session's id, `workflow`, as the command, the example's title as the intent, and each role on the roster's own lane for it as that lane stands — with nothing chosen; where it proposed, the proposal with its command, a role it leaves on a lane off `claude` moved to the roster's own lane for it;
+- a new session's slash menu offers the added command, and its turn runs the added playbook to a finished turn with both role players engaged [[playbook-library-14](#playbook-library-14)];
+- the journey picks a roster player bound to `gpt-6-astra` at `xhigh` as the session's agent before compiling, so the compile runs on that block [[playbook-library-55](#playbook-library-55)] [[playbook-library-42](#playbook-library-42)], while the roles' lanes run on `claude`.
+
+#### playbook-library-87
+
+Where the browser journey harness ([DR-039](../decisions/039-browser-acceptance-journeys.md)) boots the served shell with the demo project registered, substitute agents, and a stub `slc` whose compile places a committed fixture — the example as the real `slc` compiled it for the playbook engine generation the repository installs ([DR-089](../decisions/089-every-fresh-user-scenario-walked-for-real.md)) — when the journey compiles the example from its Prefill, adds it on the Add tab's defaults, and sends `/workflow` with a task in a new session, the test suite shall assert through the page that the Playbooks tab lists `/workflow` among the playbooks that run [[playbook-library-10](#playbook-library-10)], and that the session's turn runs the fixture's compiled machine, through the registry module wrapping its entry, to a finished turn with both role players engaged [[playbook-library-14](#playbook-library-14)].
+
+#### playbook-library-95
+
+Where the browser journey harness ([DR-039](../decisions/039-browser-acceptance-journeys.md)) boots the served shell signed in to two stand-in instances, each with its stand-in host and a registry of its own display name, the first the home's default instance, with a compiled authoring session added in a project whose independently chosen registry is the second and whose registry grant is signed in, when the journey activates Publish on the Add tab, confirms the inline summary, and then, on a second scratch home whose environment selects the second registry, adds the published spec package through the Packages tab's Add…, the test suite shall assert through the page that the summary names the second registry by its display name, its origin in the tooltip, before confirmation and the published version reads with its link to that instance's registry, the first's registry holding no such release [[playbook-library-93](#playbook-library-93)], that the second home's search finds it and Add requests it, its receipt offering no further act, and that its playbook lists at once on the Playbooks tab under the project's name from the registry source [[playbook-library-92](#playbook-library-92)] [[playbook-library-1](#playbook-library-1)] [[playbook-library-29](#playbook-library-29)], and that the first home retains publication after signing out of the second Space, then offers "Sign in to publish" after signing out of that registry [[playbook-library-93](#playbook-library-93)].
+
+#### playbook-library-114
+
+Where the browser journey harness boots real cores with a stand-in instance and registry and a project directly requests a local package containing a spec and an ordinary skill but no playbook, when the journey publishes that package from its row on the Packages tab and installs it into a second project through the registry, the test suite shall assert:
+
+- the folder package's row overflow offers Publish without an authoring session or compilation, while registry rows offer none [[playbook-library-113](#playbook-library-113)];
+- preview names the destination registry by its display name, the package, version, file count and org, Cancel uploads nothing, and confirmation publishes at the environment's instance with the resulting version and link visible [[playbook-library-113](#playbook-library-113)];
+- two subsequent attempts at the same immutable version each show the registry's refusal without presenting the earlier receipt as a new success [[playbook-library-93](#playbook-library-93)];
+- the second project's row lists the exact resolved version and, expanded, the installed spec and skill [[playbook-library-92](#playbook-library-92)];
+- signing out of the publishing registry replaces its row's Publish with "Sign in to publish", and changing the displayed repository or request path dismisses an open preview [[playbook-library-113](#playbook-library-113)].
+
+#### playbook-library-117
+
+Where the browser journey harness boots real cores against an authenticated stand-in registry with a private release omitted from search, when the journey types that known release's name in the Registry tab of the Packages tab's Add… and exercises the not-listed row's refusal cases, the test suite shall assert:
+
+- the typed name reads as the one row "⟨name⟩ · not listed publicly", whose name and version suffice to request and install the permitted private release with the selected instance's ordinary credential, while the package remains absent from public search [[playbook-library-92](#playbook-library-92)];
+- exact, caret and tilde versions retain their respective request semantics, an empty or invalid version is refused, and Add makes no further search call [[playbook-library-92](#playbook-library-92)];
+- a registry access refusal is visible and never presented as successful installation, while a public search result can still be added from its own row [[playbook-library-92](#playbook-library-92)].
+

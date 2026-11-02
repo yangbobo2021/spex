@@ -1,0 +1,42 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai> -->
+
+# DR-010: Interface Craft Principles
+
+## Status
+
+Question presentation and active-turn input are amended by [DR-085](085-boss-talks-through-captain.md).
+
+Accepted.
+§5 is amended by [DR-181](181-owned-session-start-wait.md) for a session start that owns runtime initialization; ordinary reply deadlines remain unchanged.
+The conversation-first principle begins after project registration under [DR-135](135-a-welcome-page-before-the-first-project.md).
+§8's interaction hue is amended by [DR-013](013-sublang-brand.md): brand purple replaces indigo.
+A ninth principle, chrome that fits, is added by [DR-041](041-chrome-that-fits.md).
+§8's type scale is sharpened on the owner's audience review (2026-09-02): the small step is 12px, and an arbitrary 10–11px size lives only inside a tooltip.
+A tenth principle, key phrases rather than sentences, is added by [DR-069](069-key-phrases-not-sentences.md).
+An eleventh principle, the interface speaks the reader's language, is added by [DR-078](078-the-interface-speaks-the-readers-language.md).
+§5's concurrent duplicates are amended by [DR-111](111-the-core-coordinates-as-git-does.md) for Space operations, a duplicate joining the one running and a Sync following its clone's Check, and for environment commands, which start beside one another.
+
+## Context
+
+- The owner asked for a design pass not limited to the at-hand rule ([DR-009](009-at-hand-interaction.md)): apply the best practices a design expert would.
+- An eight-lens audit (Nielsen heuristics, first-run/empty states, IM conventions, information architecture, visual system, keyboard/accessibility, async feedback, microcopy) produced 51 adversarially-verified findings. Individually small, they share root causes worth writing down so future work doesn't regress them.
+
+## Decision
+
+Eight principles govern the interface; every audit finding cluster traces to one of them.
+
+1. **The conversation is the primary surface.** Events that matter to the Boss — a player's question, work in progress, queued input — appear as first-class chat citizens (bubbles in the thread), not as log lines, side chips, or form banners.
+2. **Status speaks human.** Internal identifiers (state-machine ids, wire event names, package paths) never serve as primary copy. Known states map to plain phrases; unknown ids are humanized; the raw id survives in a tooltip for debugging.
+3. **Every action acknowledges within a frame.** A click that cannot complete instantly shows its in-flight state in place (disabled + progress label). No fire-and-forget controls.
+4. **Guardrails match consequence.** Destructive actions get the one inline confirm pattern (safe default focused, Escape cancels); emergency controls (abort) stay one-click but self-announce. Confirms name what will be lost (queued messages).
+5. **Truthful async.** Long operations never falsely fail (timeouts sized per command class), report progress, are cancelable, and reject concurrent duplicates fail-closed. Failures always land somewhere visible with a retry.
+6. **Keyboard-first.** Every critical path is operable without a mouse; menus follow one keyboard idiom (arrows/Enter/Escape, focus stays in the composer); closing or confirming never strands focus; standard app shortcuts exist. Implemented renderer-side so the UI runs unmodified in a browser [[app-shell-10](../packages/app-shell.md#app-shell-10)].
+7. **Accessible by construction.** Icon-only buttons carry aria-labels and ≥24px hit targets; one persistent polite live region announces the moments the product is built around; text and indicator colors meet WCAG contrast in both themes.
+8. **One visual grammar.** A single status palette — emerald running, amber needs-you, red failed, neutral idle, indigo reserved for interaction — one icon language (inline SVG, currentColor), a small type scale whose smallest step is 12px — readable text, a chip, an age, a caption, or a badge, never wears an arbitrary 10–11px size, which only a tooltip may — and one button taxonomy (solid primary / bordered secondary / text link, sentence-case verbs).
+
+## Consequences
+
+- Spec items under each surface package are amended so tests pin the behaviors as the principles land across the code.
+- New strings and controls are held to principles 2, 4, 8, and 9 ([DR-041](041-chrome-that-fits.md)) at review time; deviations need a recorded decision.
+- The compile pipeline gains cancel/busy semantics in the core (principle 5) — a protocol addition, not just UI.

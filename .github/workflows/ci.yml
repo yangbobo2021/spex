@@ -5,21 +5,124 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # The full matrix nightly, so a macOS-only difference is found on
+    # main within a day while pull requests run the reduced one (DR-145).
+    - cron: '17 3 * * *'
+
+# One run per pull-request head: a push cancels the run it supersedes;
+# a push to main cancels nothing (release-30).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
+env:
+  # Most jobs build without downloading Electron; desktop-browser installs it explicitly.
+  ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+
 jobs:
+  # What a pull request changed (release-34, DR-166): documentation
+  # alone -- docs/, specs/ and Markdown -- keeps the spec gates here,
+  # the CLI's own tests and the spec lint, and the suites below are
+  # skipped, a stand-in reporting their required names (DR-169); any
+  # other change runs them. A push to main and the nightly schedule run
+  # everything. This job is a required check, so a failure here blocks
+  # the merge rather than skipping the suites past it.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docs-only: ${{ steps.classify.outputs.docs-only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: classify
+        shell: bash
+        run: |
+          docs_only=false
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            changed="$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")"
+            if [ -n "$changed" ]; then
+              docs_only=true
+              while IFS= read -r file; do
+                case "$file" in
+                  docs/*|specs/*|*.md) ;;
+                  *) docs_only=false ;;
+                esac
+              done <<< "$changed"
+            fi
+          fi
+          echo "docs-only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "docs-only=$docs_only"
+
+      - uses: actions/setup-node@v4
+        if: steps.classify.outputs.docs-only == 'true'
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Documentation alone keeps the spec gates
+        if: steps.classify.outputs.docs-only == 'true'
+        run: |
+          npm ci
+          npm run build -w packages/cli
+          npm test -w packages/cli
+          node packages/cli/dist/cli.js lint
+
+  # Documentation alone, continued (release-34, DR-169): a suite skipped
+  # by its job-level condition is skipped before its matrix expands, so
+  # it reports under its bare job id and never under the name main
+  # requires. This stand-in reports success under each suite's required
+  # name instead, so the merge rule sees every required check. It runs
+  # nothing of the suites; the classifier's gates stand for them.
+  documentation-alone:
+    needs: changes
+    if: needs.changes.result == 'success' && needs.changes.outputs.docs-only == 'true'
+    strategy:
+      matrix:
+        # The names the suites report on a pull request, kept equal to
+        # them by the workflow audit.
+        check:
+          - test (ubuntu-latest, 22)
+          - test (ubuntu-latest, 24)
+          - test (windows-latest, 22)
+          - journeys (ubuntu-latest)
+          - desktop-browser (ubuntu-latest)
+    name: ${{ matrix.check }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "Documentation alone: ${{ matrix.check }} does not run; the classifier ran the CLI's tests and the spec lint (DR-166)."
+
   test:
+    needs: changes
+    if: needs.changes.result == 'success' && needs.changes.outputs.docs-only != 'true'
     strategy:
       fail-fast: false
       matrix:
+        # The catalog tooling's floor is Node 22 (DR-078); Node 20
+        # reached end of life in April 2026.
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node-version: [20, 22]
+        node-version: [22, 24]
+        # Windows keeps the single Node whose better-sqlite3 win32 prebuild
+        # the lockfile is known to resolve: a source build there trips
+        # node-gyp's VS detection. A pull request runs Linux and Windows
+        # alone -- the macOS test job took an hour, twice the Linux one;
+        # main and the nightly run take the full matrix (release-34,
+        # DR-145, DR-166).
+        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{"os":"windows-latest","node-version":24},{"os":"macos-latest","node-version":22},{"os":"macos-latest","node-version":24}]') || fromJSON('[{"os":"windows-latest","node-version":24}]') }}
     runs-on: ${{ matrix.os }}
 
     steps:
+      # Full history: the file-history append-only guard audits every
+      # committed manifest version, which a shallow clone would skip.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -29,5 +132,167 @@ jobs:
       - run: npm ci
       - run: npm run build
 
-      - name: Tests
+      - name: Require Git LFS for real transport and local Apply coverage
+        if: runner.os != 'Windows'
+        run: git lfs version
+
+      - name: Complete app and scaffold tests
+        if: runner.os != 'Windows'
         run: npm test
+
+      - name: Windows scaffold tests
+        if: runner.os == 'Windows'
+        run: npm test -w packages/cli
+
+      - name: Windows UI tests
+        if: runner.os == 'Windows'
+        run: npm test -w packages/ui
+
+      - name: Windows native storage and unsupported-host refusal
+        if: runner.os == 'Windows'
+        run: node --test packages/core/dist/platform.integration.test.js packages/core/dist/windows-storage.integration.test.js
+
+  # The browser journeys (DR-039): the served UI driven in Chromium
+  # against a real core with substitute agents, on Linux and on macOS,
+  # the desktop's platform — the fit journeys measure real fonts, which
+  # differ between the two (DR-086).
+  journeys:
+    needs: changes
+    if: needs.changes.result == 'success' && needs.changes.outputs.docs-only != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux alone on a pull request; the full matrix on main and nightly (release-34).
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the owned served browser cache
+        shell: bash
+        run: printf '%s\n' "SPEX_E2E_BROWSER_CACHE=$RUNNER_TEMP/spex served managed browser cache" >> "$GITHUB_ENV"
+
+      # The authoring journeys compile with a stub slc under this Node,
+      # which stands in for the system Node the compile floor checks
+      # (DR-005: >= 23.6); an older Node fails every compile "at
+      # toolchain" before the compiler runs.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      # Chromium's system libraries are an apt install on Linux; macOS
+      # needs none.
+      - name: Chromium and its system libraries
+        if: runner.os == 'Linux'
+        run: npx playwright install --with-deps chromium
+
+      - name: Chromium
+        if: runner.os != 'Linux'
+        run: npx playwright install chromium
+
+      - name: Managed Chromium sandbox prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Resolve the exact Playwright copy that Cligent's pinned MCP uses.
+          managed_chromium=$(PLAYWRIGHT_BROWSERS_PATH="$SPEX_E2E_BROWSER_CACHE" node --input-type=module -e "import {createRequire} from 'node:module'; const c=createRequire(import.meta.resolve('@sublang/cligent')); const m=createRequire(c.resolve('@playwright/mcp/package.json')); console.log(m('playwright').chromium.executablePath())")
+          cat > "$RUNNER_TEMP/spex-browser-apparmor" <<EOF
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile spex-ci-managed-chromium "$managed_chromium" flags=(unconfined) {
+            userns,
+          }
+          EOF
+          # https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md
+          sudo apparmor_parser -r "$RUNNER_TEMP/spex-browser-apparmor"
+
+      - name: Browser journeys
+        run: npm run e2e
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: journey-report-${{ matrix.os }}
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 7
+
+  desktop-browser:
+    needs: changes
+    if: needs.changes.result == 'success' && needs.changes.outputs.docs-only != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux alone on a pull request; the full matrix on main and nightly (release-34).
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select separate owned source and packaged browser caches
+        shell: bash
+        run: |
+          printf '%s\n' "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/spex managed browser cache" >> "$GITHUB_ENV"
+          printf '%s\n' "SPEX_PACKAGED_BROWSER_CACHE=$RUNNER_TEMP/spex packaged managed browser cache" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Install Electron and native browser libraries
+        shell: bash
+        run: |
+          env -u ELECTRON_SKIP_BINARY_DOWNLOAD node node_modules/electron/install.js
+          if [ "$RUNNER_OS" = Linux ]; then
+            managed_cli=$(node --input-type=module -e "import {createRequire} from 'node:module'; import {join,dirname} from 'node:path'; const c=createRequire(import.meta.resolve('@sublang/cligent')); const m=createRequire(c.resolve('@playwright/mcp/package.json')); console.log(join(dirname(m.resolve('playwright/package.json')), 'cli.js'))")
+            node "$managed_cli" install-deps chromium
+          fi
+      - run: npm run rebuild:electron -w apps/desktop
+      - name: Build local packaged app with a physical child dependency tree
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then target=mac; else target=linux; fi
+          node_modules/.bin/electron-builder --projectDir apps/desktop --dir "--$target" --config.executableName=spex-browser-acceptance --config.directories.output="$RUNNER_TEMP/spex browser packaged"
+      - name: Permit only the native CI executables to use sandbox namespaces
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          managed_chromium=$(node --input-type=module -e "import {createRequire} from 'node:module'; const c=createRequire(import.meta.resolve('@sublang/cligent')); const m=createRequire(c.resolve('@playwright/mcp/package.json')); console.log(m('playwright').chromium.executablePath())")
+          packaged_chromium=$(PLAYWRIGHT_BROWSERS_PATH="$SPEX_PACKAGED_BROWSER_CACHE" node --input-type=module -e "import {createRequire} from 'node:module'; const c=createRequire(import.meta.resolve('@sublang/cligent')); const m=createRequire(c.resolve('@playwright/mcp/package.json')); console.log(m('playwright').chromium.executablePath())")
+          source_electron=$(node -p "require('electron')")
+          packaged_app="$RUNNER_TEMP/spex browser packaged/linux-unpacked/spex-browser-acceptance"
+          cat > "$RUNNER_TEMP/spex-desktop-apparmor" <<EOF
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile spex-ci-desktop-chromium "$managed_chromium" flags=(unconfined) {
+            userns,
+          }
+          profile spex-ci-packaged-chromium "$packaged_chromium" flags=(unconfined) {
+            userns,
+          }
+          profile spex-ci-source-electron "$source_electron" flags=(unconfined) {
+            userns,
+          }
+          profile spex-ci-packaged-electron "$packaged_app" flags=(unconfined) {
+            userns,
+          }
+          EOF
+          sudo apparmor_parser -r "$RUNNER_TEMP/spex-desktop-apparmor"
+      - name: Verify native source and packaged UI browser setup without credentials
+        shell: bash
+        run: |
+          packaged_app=$(find "$RUNNER_TEMP/spex browser packaged" -type f -name spex-browser-acceptance)
+          test -n "$packaged_app"
+          if [ "$RUNNER_OS" = Linux ]; then
+            SPEX_BROWSER_REQUIRE_EMPTY_CACHE=1 xvfb-run -a npm run test:browser-host
+            PLAYWRIGHT_BROWSERS_PATH="$SPEX_PACKAGED_BROWSER_CACHE" SPEX_BROWSER_REQUIRE_EMPTY_CACHE=1 SPEX_BROWSER_APP_EXECUTABLE="$packaged_app" xvfb-run -a npm run test:browser-host
+          else
+            SPEX_BROWSER_REQUIRE_EMPTY_CACHE=1 npm run test:browser-host
+            PLAYWRIGHT_BROWSERS_PATH="$SPEX_PACKAGED_BROWSER_CACHE" SPEX_BROWSER_REQUIRE_EMPTY_CACHE=1 SPEX_BROWSER_APP_EXECUTABLE="$packaged_app" npm run test:browser-host
+          fi

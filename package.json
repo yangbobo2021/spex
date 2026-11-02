@@ -1,43 +1,49 @@
 {
-  "name": "@sublang/spex",
-  "version": "0.2.3",
-  "description": "The essential spec layer AI agents need to build software reliably",
-  "type": "module",
+  "name": "spex-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Spex: the desktop app for running playbooks, and the @sublang/spex scaffold CLI",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/sublang-ai/spex.git"
   },
-  "keywords": [
-    "spex",
-    "ai-agents",
-    "specs",
-    "specification",
-    "spec-driven-development",
-    "scaffold",
-    "cli"
-  ],
-  "bin": {
-    "spex": "dist/cli.js"
-  },
-  "files": [
-    "dist/**/*.js",
-    "!dist/**/*.test.js",
-    "dist/**/*.d.ts",
-    "!dist/**/*.test.d.ts",
-    "scaffold/"
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "e2e"
   ],
   "scripts": {
-    "build": "tsc",
-    "prepublishOnly": "npm run build && npm test",
-    "test": "node scripts/run-tests.cjs",
-    "test:integration": "node scripts/run-tests.cjs \"\\.integration\\.test\\.js$\""
+    "start": "node scripts/start-desktop.mjs",
+    "start:server": "node scripts/start-server.mjs",
+    "build": "npm run check:dependencies && npm run build --workspaces --if-present",
+    "check:dependencies": "node scripts/dependency-closure.mjs",
+    "test": "npm run test:scripts && npm test --workspaces --if-present",
+    "test:scripts": "node --test scripts/desktop-runner.test.mjs scripts/source-launch.integration.test.mjs scripts/live-output.test.mjs scripts/release-notes.test.mjs scripts/smoke.test.mjs scripts/inspection-browser-cache.test.mjs scripts/inspection-evidence.test.mjs scripts/app-release-workflow.test.mjs scripts/ci-workflow.test.mjs scripts/team-server-local.test.mjs scripts/dependency-closure.test.mjs scripts/dependency-closure.integration.test.mjs",
+    "test:dependencies": "node --test scripts/dependency-closure.test.mjs scripts/dependency-closure.integration.test.mjs",
+    "test:integration": "npm run test:integration --workspaces --if-present",
+    "e2e": "npm run journeys -w e2e",
+    "regression": "npm run journeys:live -w e2e",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:desktop": "node scripts/desktop-smoke.mjs",
+    "smoke:migration": "node scripts/migration-smoke.mjs",
+    "test:browser-host": "node scripts/browser-host-acceptance.mjs",
+    "test:inspect-host": "node scripts/inspect-host-acceptance.mjs",
+    "prepush": "bash scripts/prepush.sh",
+    "test:linux": "bash scripts/test-linux.sh",
+    "merge-on-green": "bash scripts/merge-on-green.sh"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19"
   },
   "devDependencies": {
-    "typescript": "^5.8.0",
-    "@types/node": "^22.0.0"
+    "@lingui/conf": "^6.7.0",
+    "@sublang/playbook": "^18.1.1",
+    "node-gyp": "^12.4.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true,
+    "electron@44.0.0": true,
+    "esbuild@0.28.2": true
   }
 }

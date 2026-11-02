@@ -1,3 +1,20 @@
 **/.DS_Store
 dist/
-node_modules/
+node_modules
+apps/desktop/ui-dist/
+apps/desktop/release/
+apps/server/ui-dist/
+packages/cli/scaffold/
+packages/core/assets/academy/
+packages/core/assets/builtins/
+
+# Recording output (scripts/record-demo.mjs).
+demo*.mp4
+
+# Browser journey output (e2e/), and a run started from the root.
+test-results/
+playwright-report/
+
+# Isolated homes, repositories, and raw evidence for workshop simulations.
+.workshop-*/
+/.acceptance-local/

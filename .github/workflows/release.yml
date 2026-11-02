@@ -3,18 +3,62 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "cli-v*"
 
-permissions:
-  contents: write
-  id-token: write
+permissions: {}
+
+env:
+  # The cli-v* release channel ships only the CLI; skip Electron binaries.
+  ELECTRON_SKIP_BINARY_DOWNLOAD: 1
 
 jobs:
-  release:
+  require-ci-green:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Require CI to be green for the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for CI (ci.yml) to succeed for commit $SHA"
+          for attempt in $(seq 1 60); do
+            line="$(gh api \
+              "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=1" \
+              --jq '(.workflow_runs[0].status // "missing") + " " + (.workflow_runs[0].conclusion // "none")')"
+            status="${line%% *}"
+            conclusion="${line##* }"
+            echo "attempt $attempt/60: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CI is green for $SHA."
+                exit 0
+              fi
+              echo "::error::CI for $SHA concluded '$conclusion'; refusing to publish."
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "::error::Timed out waiting for CI to complete for $SHA; refusing to publish."
+          exit 1
+
+  release:
+    needs: require-ci-green
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
 
     steps:
+      # Full history + tags: the file-history audit (SCAF-21) checks
+      # the manifest against every released tag; a shallow tag
+      # checkout would make historical entries look unreleased.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -33,37 +77,40 @@ jobs:
 
       - name: Validate tarball
         run: |
-          npm pack --dry-run 2>&1 | tee /tmp/pack-output.txt
+          npm pack --dry-run -w packages/cli 2>&1 | tee /tmp/pack-output.txt
           if grep -E '\.test\.(js|d\.ts)' /tmp/pack-output.txt; then
             echo "::error::Tarball contains test files"
             exit 1
           fi
 
       - name: Verify version matches tag
+        id: version
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PKG_VERSION="$(node -p 'require("./package.json").version')"
+          TAG_VERSION="${GITHUB_REF_NAME#cli-v}"
+          PKG_VERSION="$(node -p 'require("./packages/cli/package.json").version')"
           if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-            echo "::error::Tag $TAG_VERSION does not match package.json $PKG_VERSION"
+            echo "::error::Tag $TAG_VERSION does not match packages/cli/package.json $PKG_VERSION"
             exit 1
           fi
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Extract release notes
         id: notes
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${GITHUB_REF_NAME#cli-v}"
           # Extract section between ## [VERSION] and next ## [
-          sed -n "/^## \[${VERSION}\]/,/^## \[/{/^## \[${VERSION}\]/d;/^## \[/d;p}" CHANGELOG.md > /tmp/release-notes.md
+          sed -n "/^## \[${VERSION}\]/,/^## \[/{/^## \[${VERSION}\]/d;/^## \[/d;p}" packages/cli/CHANGELOG.md > /tmp/release-notes.md
           cat /tmp/release-notes.md
           if [ ! -s /tmp/release-notes.md ]; then
-            echo "::error::No release notes found for version ${VERSION} in CHANGELOG.md"
+            echo "::error::No release notes found for version ${VERSION} in packages/cli/CHANGELOG.md"
             exit 1
           fi
 
       - name: Publish to npm
-        run: npm publish --provenance --access public
+        run: npm publish -w packages/cli --provenance --access public
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          name: Spex CLI v${{ steps.version.outputs.version }}
           body_path: /tmp/release-notes.md

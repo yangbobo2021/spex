@@ -1,0 +1,3298 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// App store: wires the protocol client into view state, one store per
+// core, each at its place (run-view-168). Composer
+// submissions queue client-side while a turn is active and dispatch
+// when it ends (RUN-8); the core enforces one turn at a time.
+// Reconnects re-subscribe every live session and backfill missed
+// records via history afterSeq, so panes never silently freeze.
+
+import { create, type StateCreator, type StoreApi, type UseBoundStore } from "zustand";
+import { hasPresentationHeader } from "@sublang/spex-core/protocol";
+import { isLanguage, resolveLanguage, type Language } from "@sublang/spex-core/language";
+import type {
+  AgentBlockInput,
+  AdapterName,
+  AgentOptions,
+  ClosedIntent,
+  CommandResults,
+  ConfigState,
+  DraftInfo,
+  DraftRecord,
+  EnvironmentRequest,
+  EnvironmentState,
+  PublishPreview,
+  RequestPreview,
+  ForgeState,
+  IntentInfo,
+  IntentSource,
+  LedgerState,
+  ApprovalState,
+  MediaAsset,
+  MediaUploadOwner,
+  MessageContent,
+  PlaybookArtifacts,
+  ProjectInfo,
+  ReadinessEntry,
+  RepoStatusInfo,
+  SeatState,
+  ServerMessage,
+  SessionInfo,
+  SpaceChoice,
+  SpaceEntry,
+  SpaceReadResult,
+  GroupsState,
+  HostMemberInfo,
+  SpecTreeState,
+  MachineGraph,
+  TmuxPlayRecord,
+} from "@sublang/spex-core/protocol";
+
+import {
+  SpexClient,
+  defaultCoreUrl,
+  type ConnectionStatus,
+  type SpexCommandError,
+} from "../lib/client.js";
+import { activateLanguage, i18n } from "../i18n.js";
+import { currentSessionOf } from "../lib/sessions.js";
+import { allRepositories, anySignedIn } from "../lib/instances.js";
+import type { SpecEditorState } from "../lib/spec-view-model.js";
+import {
+  applyRecord,
+  initialSessionView,
+  type SessionView,
+} from "./reducer.js";
+import { contentTitle } from "../lib/message-content.js";
+import { createAttachmentState, type AttachmentState } from "./attachments.js";
+import { deliverBrowserProgress } from "../lib/browser-progress.js";
+
+/** A draft's transcript (DR-058, playbook-library-53): the stored
+ * records folded by the run view's own reducer over a session-shaped
+ * view whose one player is the authoring agent, `author`. The thread
+ * interleaves the Boss and system lines with the agent's segments in
+ * record order, so beside the view stands the sequence number of the
+ * record that pushed each Captain line — the segments carry their own. */
+export interface DraftView {
+  view: SessionView;
+  /** `lineSeqs[i]` is the seq of the record behind `view.captain[i]`. */
+  lineSeqs: number[];
+  /** True while the stored records are being replayed after open. */
+  loading?: boolean;
+  /** An unreadable transcript: the scoped diagnostic shown in place
+   * of the thread (playbook-library-62). */
+  loadError?: string;
+}
+
+/** The draft's `<id>.md` as last streamed, with who changed it when
+ * the app saw the change happen: the agent while its turn ran, else
+ * the Boss; a restored source says only when. */
+export interface DraftSourceState {
+  markdown: string;
+  version: string;
+  mtime: number;
+  by?: "agent" | "you";
+}
+
+/** The Source tab's mode and the paste form's fields, kept while the
+ * app runs so leaving the workspace loses nothing (DR-043). */
+export interface DraftSourceMode {
+  mode: "view" | "edit" | "paste";
+  pasteText: string;
+  pastePath: string;
+}
+
+/** The Boss's own edits to the Enable tab (playbook-library-61):
+ * they take precedence over the agent's proposal and the derived
+ * defaults, so a proposal landing later never overwrites them. */
+export interface DraftRegisterForm {
+  command?: string;
+  intent?: string;
+  /** Role → the chosen player id, or `new:<id>` for a lane to mint. */
+  players: Record<string, string>;
+  /** The agent block each new lane carries, once edited. */
+  newPlayers: Record<string, AgentBlockInput>;
+  /** The spex repository chosen to enable in; absent, the project
+   * (playbook-library-61). */
+  repository?: string;
+}
+
+/** What `environment.playbooks` answered, and for which project. */
+export type PlaybookLists = CommandResults["environment.playbooks"] & {
+  projectId: string | null;
+};
+
+/** One spec package the registry's search found (playbook-library-92). */
+export type RegistryResult = CommandResults["environment.search"]["packages"][number];
+
+/** Whose members a Groups command names (space-62, space-29, DR-114,
+ * DR-128): a group by its host id at its instance, by its origin, or a
+ * spex repository by its key — one placement of it by its instance's
+ * origin, its key placement where none is named. */
+export type SpaceMembersTarget = { instance: string; group: string } | { repository: string; instance?: string };
+
+/** Where a pick or a Place puts a spex repository at an instance
+ * (space-58, space-88, space-29): a spex repository that instance lists,
+ * by its host id, or a new `<name>-spex` in a group there by its host
+ * id, your namespace there by none. */
+export type SpaceGroupChoice =
+  | { kind: "join"; instance: string; hostId: string }
+  | { kind: "create"; instance: string; groupId: string | null; name: string };
+
+/** What the page last asked of a clone's machine beyond a plain sync
+ * (space-29, space-30): the placement a join named — its instance's
+ * origin, null for the path placement (space-13) — the instance an
+ * Attach, a Place or a Leave named, a Place's choice and whether a Leave
+ * was confirmed. */
+export type SpaceLastAct =
+  | { op: "join"; instance: string | null }
+  | { op: "attach"; instance: string }
+  | { op: "place"; instance: string; choice: SpaceGroupChoice }
+  | { op: "leave"; instance: string; confirmed: boolean };
+
+/** The members of a group or a spex repository as the host lists them
+ * (space-62): no page of the host (DR-120). */
+export type SpaceMembersReply = { members: HostMemberInfo[] };
+
+export interface ComposerState {
+  /** Submissions waiting for the turn to end (RUN-8). A staged
+   * intent's id rides its entry, so the chip follows the pending
+   * bubble and the dispatch stamps when the turn starts (DR-035). */
+  queued: (MessageContent & { intentId?: string })[];
+  /** Unsent composer text — survives tab and surface switches. */
+  draft?: string;
+}
+
+export interface ProjectMeta {
+  status?: RepoStatusInfo;
+  forge?: ForgeState;
+  statusError?: string;
+  forgeError?: string;
+  loading?: boolean;
+}
+
+export interface CompileTracker {
+  playbookId: string;
+  running: boolean;
+  ok?: boolean;
+}
+
+/** One project's History page state (DR-035): closed intents newest
+ * first, extended in place as the reader scrolls. */
+export interface HistoryState {
+  intents: ClosedIntent[];
+  more: boolean;
+  loading?: boolean;
+}
+
+/** A staged dispatch's chip (DR-035): the composer wears the intent
+ * until the text is sent or the chip is detached. Keyed by session id,
+ * or "home" for the Captain home composer. */
+export interface StagedIntent {
+  intentId: string;
+  title: string;
+}
+
+export interface AppState extends AttachmentState {
+  connection: ConnectionStatus;
+  approvals?: ApprovalState;
+  approvalInboxOpen: boolean;
+  approvalError?: string;
+  approvalFocusId?: string;
+  showApprovals(requestId?: string): void;
+  hideApprovals(): void;
+  /** True once a connection has ever opened (first-paint banner). */
+  everConnected: boolean;
+  /** The seats this core holds open, as its last `server.state` named
+   * them (core-service-128): the local core's are the page's remote
+   * places (run-view-168). */
+  seats: SeatState[];
+  /** The core endpoint the client dials, named when it cannot be
+   * reached (run-view-50). */
+  coreUrl?: string;
+  configState?: ConfigState;
+  /** Each project's composed configuration, by project id
+   * (core-service-2): your own group's with the project's file on top,
+   * the catalog a session of that project offers (playbook-library-34). */
+  projectConfigs: Record<string, ConfigState>;
+  /** Read one project's composed configuration (`config.get` with its
+   * id); a broadcast that overtook the read wins. */
+  loadProjectConfig(projectId: string): Promise<void>;
+  /** Served machine definitions by playbook id (run-view-64); null
+   * records a fetch that found no machine. */
+  machineGraphs: Record<string, MachineGraph | null>;
+  readiness: ReadinessEntry[];
+  projects: ProjectInfo[];
+  /** The core's project list has been read once since the page loaded,
+   * so an empty `projects` means none. */
+  projectsRead?: boolean;
+  projectMeta: Record<string, ProjectMeta>;
+  compileProgress: Record<string, string[]>;
+  activeCompile?: CompileTracker;
+  sessions: SessionInfo[];
+  views: Record<string, SessionView>;
+  composers: Record<string, ComposerState>;
+  /** Per-session command failures shown above the composer. */
+  runErrors: Record<string, string>;
+  activeSessionId?: string;
+  /** The workspace's project context (DR-011): set only by the
+   * palette, focusSession, or boot restoration. */
+  currentProjectId?: string;
+  /** Per-project last-active workspace tab: a session id, "start",
+   * "specs", or "repo" (DR-011 workspace memory). */
+  workspaceTabs: Record<string, string>;
+  /** Per-project working set (run-view-57): the sessions open as
+   * tabs, in the order they were opened. This launch's, not durable —
+   * the sidebar is what carries history across launches. */
+  openTabs: Record<string, string[]>;
+  /** Sidebar chrome (DR-030), persisted app-wide. */
+  railCollapsed: boolean;
+  /** The interface language (localization-2, localization-3): the
+   * home's stored choice — null meaning the reader's system — and the
+   * language this page therefore renders in. The choice is mirrored in
+   * this page's own storage so the first paint already speaks it,
+   * before the core has answered. `savedAt` is when this page's own
+   * write last landed (settings-37): the mark the language section
+   * ticks, which the re-rendering in the new language would otherwise
+   * take with the section it replaces. */
+  language: { choice: Language | null; resolved: Language; savedAt?: number };
+  /** The Captain pane's share of the run view, as a percentage. A
+   * machine drawing has a natural width that text does not, so the
+   * split is the reader's to set (DR-030). */
+  captainSplit: number;
+  /** Capped frames' heights in their own steps, by frame id (DR-030):
+   * a frame the reader pulled taller stays that way across launches. */
+  frameHeights: Record<string, number>;
+  /** Per-project sidebar disclosure (run-view-67), persisted; a
+   * project with no entry follows the current-project default. */
+  expandedProjects: Record<string, boolean>;
+  /** Parsed specs trees per project (specs.get). */
+  specTrees: Record<string, SpecTreeState>;
+  /** Spec-view load failures per project. */
+  specErrors: Record<string, string>;
+  /** Draft for the Captain-home start composer. */
+  homeDraft: string;
+  /** The one ledger fold, as ledger.get last served it (DR-035). */
+  ledger?: LedgerState;
+  ledgerError?: string;
+  /** Per-project History pages (DR-035). */
+  history: Record<string, HistoryState>;
+  /** Staged dispatches by composer key (session id or "home"). */
+  stagedIntents: Record<string, StagedIntent>;
+  /** Per-session collapsed player lanes (run-view-116): this launch's,
+   * never on disk — a lane's rail is a reading posture, not a
+   * preference. */
+  collapsedLanes: Record<string, string[]>;
+  /** Per-project folded Sources bands (dashboard-20): the band opens
+   * expanded, and a fold lasts this launch — the Dashboard's group and
+   * the project's Overview read the same one. */
+  foldedSources: Record<string, boolean>;
+  /** Per-project Dashboard group disclosure (dashboard-45): chrome
+   * preference persisted across launches. The Overview never reads it. */
+  dashboardGroupsCollapsed: Record<string, boolean>;
+  /** Bootstrap refresh failure — connected but app state missing. */
+  refreshError?: string;
+  /** The home, its groups and their spex repositories as the core last
+   * described them (space-30, DR-103): replaced wholesale by every
+   * `space.state` and `space.get`. */
+  space?: GroupsState;
+  registryAccounts?: Record<string, import("@sublang/spex-core/protocol").RegistryState>;
+  /** The last `space.get` failure, shown on the surface. */
+  spaceError?: string;
+  /** When the surface last read the core's state (space-2). */
+  spaceReadAt?: number;
+  /** Counts the session, ledger and configuration announcements the
+   * Space surface re-reads on, debounced, while it is shown
+   * (space-2, space-29): a counter, so the surface owns the debounce
+   * and the store never runs a timer of its own. */
+  spaceChangeSeq: number;
+  /** The explorer's tree share of the tree/preview split, as a
+   * percentage — a divider position, so chrome preference (DR-030). */
+  spaceSplit: number;
+  /** Whether the "Stays on this device" panel is folded (space-25),
+   * remembered as chrome preference (DR-030). */
+  spacePrivacyCollapsed: boolean;
+
+  /** Re-pull `space.get` (space-2); the newest read wins. */
+  loadSpace(): Promise<void>;
+  setSpaceSplit(percent: number): void;
+  setSpacePrivacyCollapsed(collapsed: boolean): void;
+  /** Ask the core to read every signed-in instance, then re-read the
+   * state (space-2): the reader's Refresh. Signed in nowhere, no
+   * instance is contacted and the state alone is re-read (space-3). */
+  spaceRefresh(): Promise<void>;
+  /** Start signing in to the instance at `url` (space-3, space-29): the
+   * browser flow's URL or the device flow's code, the outcome arriving
+   * as state. */
+  spaceSignIn(url: string): Promise<CommandResults["space.signin.start"]>;
+  /** Stop a sign-in in flight (space-3). */
+  spaceSignInCancel(): Promise<boolean>;
+  /** Sign this device out of the instance at `instance`, its origin
+   * (space-6); the reply is the new state. */
+  spaceSignOut(instance: string): Promise<void>;
+  /** Forget the signed-out instance at `instance`, its origin (space-82,
+   * space-29): the instance leaves the home, nothing at it changing and
+   * every record kept; the reply is the new state. Refused, the core's
+   * words name what is still kept under it. */
+  spaceForget(instance: string): Promise<void>;
+  /** Give a local-only spex repository a home at an instance (space-58):
+   * a listed spex repository by its host id, or a new one in a group,
+   * the choice naming the instance it is at (space-29). `noticed` once
+   * the sharing notice was seen for a join (space-57). Accepted at
+   * once, outcome as state. */
+  spacePick(repository: string, choice: SpaceGroupChoice, noticed?: boolean): Promise<void>;
+  /** Clone a spex repository an instance lists and this device lacks
+   * (space-63), `instance` the one its row stands under, pairing it with
+   * a folder. Accepted at once. */
+  spaceJoin(instance: string, hostId: string, folder?: string): Promise<void>;
+  /** What the page last asked of a spex repository's clone beyond a
+   * plain sync — a join, an Attach, a Place or a Leave, and where —
+   * which a stopped phase does not name (space-30); none after a
+   * reload. */
+  spaceLastAct(repository: string): SpaceLastAct | undefined;
+  /** A group's or a spex repository placement's members as its
+   * instance reports them, read on every call and held nowhere
+   * (space-62). */
+  spaceMembers(target: SpaceMembersTarget): Promise<SpaceMembersReply>;
+  /** Create a group at the instance `instance` at the path `path`, at
+   * its root or inside the group whose host id is `parent` (space-68);
+   * the state listing it arrives before the reply. */
+  spaceGroupCreate(instance: string, name: string, path: string, parent: string | null): Promise<CommandResults["space.group.create"]>;
+  /** Add the account of `login` to a group or a spex repository's
+   * placement at one of its instance's roles, by its id (space-69); the
+   * reply lists the members after the addition. */
+  spaceShare(target: SpaceMembersTarget, login: string, role: string): Promise<SpaceMembersReply>;
+  /** Remove a member the group or the spex repository's placement holds
+   * of its own (space-72); the reply lists the members afterwards. */
+  spaceUnshare(target: SpaceMembersTarget, login: string): Promise<SpaceMembersReply>;
+  /** Decline a repair, or undo that (space-54): the reader's own act,
+   * never rendering; the reply is the new state. */
+  spaceRepairDecline(repair: string, declined: boolean): Promise<void>;
+  /** Point a project the space carries at a folder on this device
+   * (space-47), preserving its identity: the recorded directories ride
+   * as aliases so every session under them resolves. */
+  rebindProject(projectId: string, path: string, aliases: string[]): Promise<ProjectInfo>;
+  /** Check the host for one spex repository (space-8): accepted at
+   * once, outcome as state. */
+  spaceFetch(repository: string): Promise<void>;
+  /** Sync one spex repository (space-11, space-12), with choices
+   * (space-18), as a join (space-13), or with its first-push notice
+   * seen (space-57), each for the placement `placement` names — its
+   * instance's origin, null for the path placement (space-29): accepted
+   * at once, outcome as state. */
+  spaceSync(
+    repository: string,
+    input: { placement?: string | null; choices?: Record<string, SpaceChoice>; join?: boolean; noticed?: boolean },
+  ): Promise<void>;
+  /** Stop the running transport step (space-16). */
+  spaceCancel(repository: string): Promise<boolean>;
+  /** One unit's line diff (space-10): this device's side, or the host's
+   * side of the placement `placement` names — its instance's origin,
+   * null for the path placement, its first where omitted (space-29). */
+  spaceDiff(
+    repository: string,
+    unit: string,
+    path: string,
+    side: SpaceChoice,
+    placement?: string | null,
+  ): Promise<{ patch: string; truncated: boolean }>;
+  spaceTree(repository: string, path?: string): Promise<{ path: string; entries: SpaceEntry[] }>;
+  spaceRead(repository: string, path: string): Promise<SpaceReadResult>;
+
+  // Playbook drafts (DR-058). Drafts never enter the session folds:
+  // they are the Library's, keyed by the draft's id throughout.
+  /** Every draft the core lists, by id, as draft.state last said. */
+  drafts: Record<string, DraftInfo>;
+  /** True once draft.list has answered, so the Library can tell an
+   * empty section from one not yet loaded. */
+  draftsLoaded: boolean;
+  /** Transcripts of the drafts opened this launch. */
+  draftViews: Record<string, DraftView>;
+  /** Sources as last streamed; null records a draft known to have
+   * no source yet. */
+  draftSources: Record<string, DraftSourceState | null>;
+  /** The compiled artifacts of a draft, once asked for. */
+  draftArtifacts: Record<string, PlaybookArtifacts>;
+  /** The draft whose workspace replaces the list (playbook-library-52). */
+  openDraftId?: string;
+  /** Unsent composer text per draft (playbook-library-54). */
+  draftComposers: Record<string, { draft: string }>;
+  /** The Source tab's mode and paste fields per draft. */
+  draftSourceModes: Record<string, DraftSourceMode>;
+  /** The whole-file editor's lifted state per draft (spec-view-51's
+   * idiom): the draft survives the workspace's own navigation. */
+  draftEditors: Record<string, SpecEditorState>;
+  /** The Boss's Register-tab edits per draft. */
+  draftForms: Record<string, DraftRegisterForm>;
+  /** Per-draft command refusals shown above the composer. */
+  draftErrors: Record<string, string>;
+  /** The conversation pane's share of the side-by-side workspace, as a
+   * percentage — an app preference (playbook-library-52, DR-030). */
+  draftSplit: number;
+  /** The conversation pane's share of the stacked workspace's height. */
+  draftStackSplit: number;
+  /** Arrival time of each compile.progress line, parallel to
+   * compileProgress, so the band can tick "last output ⟨age⟩ ago". */
+  compileProgressAt: Record<string, number[]>;
+  /** The Captain home's slash menu asked for a new playbook: the
+   * project's Playbooks tab focuses its id field on arrival
+   * (playbook-library-51). */
+  newPlaybookRequested: boolean;
+  /** The id of a playbook the Playbooks tab should bring into view on
+   * its next render — the one an enabling just made, listed once
+   * whichever config it was enabled in (playbook-library-1,
+   * playbook-library-61). */
+  revealPlaybook?: string;
+  /** Each spex repository's environment as last read or broadcast
+   * (playbook-library-92), by the repository's key. */
+  environments: Record<string, EnvironmentState>;
+  /** A failed environment read, by repository. */
+  environmentErrors: Record<string, string>;
+  /** The playbooks the chosen project's and your own group's
+   * environments export (playbook-library-1); undefined until read. */
+  playbookLists?: PlaybookLists;
+  /** Read what each environment exports, the project's and your own
+   * group's; the newest read wins. */
+  loadPlaybookLists(projectId: string | undefined): Promise<void>;
+  loadEnvironment(repository: string): Promise<void>;
+  /** Write a request into a spex repository's `spex.yaml`; resolving
+   * and installing report through `environment.state`. */
+  requestSpecPackage(repository: string, name: string, request: EnvironmentRequest): Promise<void>;
+  /** What a request by path would take, nothing written: the name and
+   * version its folder's `meta.yaml` gives, each null where none reads
+   * (environments-15). */
+  previewFolderPackage(repository: string, path: string): Promise<RequestPreview>;
+  removeSpecPackage(repository: string, name: string): Promise<void>;
+  resolveEnvironment(repository: string): Promise<void>;
+  installEnvironment(repository: string): Promise<void>;
+  /** Search the registry of a spex repository's environment, the one
+   * a result is added to. */
+  searchRegistry(repository: string, query: string): Promise<RegistryResult[]>;
+  /** The inline summary Publish shows before it uploads anything. */
+  /** Publish by name (environments-10): the core reads the package's
+   * folder, its request's path or `spex-packages/<org>/<pkg>/`. */
+  previewPublish(repository: string, name: string): Promise<PublishPreview>;
+  publishSpecPackage(repository: string, name: string): Promise<void>;
+
+  listDrafts(): Promise<void>;
+  /** What New playbook fills its Org and License with for a project
+   * (playbook-library-51, playbook-library-103). */
+  loadDraftDefaults(projectId: string): Promise<CommandResults["draft.defaults"]>;
+  /** Create a draft in the spex repository of the workspace's current
+   * project, else the first registered one, its spec package naming
+   * the org and license given, and open its workspace; the core
+   * refuses an id a configured playbook or built-in holds. With no
+   * project registered there is nowhere to keep it. */
+  createDraft(draftId: string, fields: { org: string; license: string }): Promise<DraftInfo>;
+  /** Open a draft's workspace: subscribe, replay its records and
+   * source, then stream (playbook-library-62). */
+  openDraft(draftId: string): Promise<void>;
+  /** Show the list again; the draft stays open in the core. */
+  closeDraft(): void;
+  /** Send a Boss message; the core dispatches or queues it. */
+  sendDraft(draftId: string, text: string, attachments?: readonly MediaAsset[]): Promise<{ queued: boolean }>;
+  abortDraft(draftId: string): Promise<void>;
+  writeDraftSource(
+    draftId: string,
+    input: { content?: string; sourcePath?: string; baseVersion?: string },
+  ): Promise<{ version: string; mtime: number }>;
+  /** Re-read the source from the core, for a conflict's Reload. */
+  refreshDraftSource(draftId: string): Promise<DraftSourceState | null>;
+  compileDraft(draftId: string): Promise<void>;
+  abortDraftCompile(draftId: string): Promise<void>;
+  /** Enable the compiled playbook in a spex repository's config — the
+   * project's by default — keeping the authoring session
+   * (playbook-library-61). */
+  registerDraft(
+    draftId: string,
+    input: {
+      command: string;
+      intent: string;
+      bindings: Record<string, string>;
+      newPlayers?: Record<string, AgentBlockInput>;
+      repository?: string;
+    },
+  ): Promise<void>;
+  setDraftPlayer(draftId: string, playerId: string | null): Promise<void>;
+  deleteDraft(draftId: string): Promise<void>;
+  loadDraftArtifacts(draftId: string): Promise<PlaybookArtifacts>;
+  setDraftComposer(draftId: string, draft: string): void;
+  setDraftSourceMode(draftId: string, mode: Partial<DraftSourceMode>): void;
+  setDraftEditor(draftId: string, editor: SpecEditorState | undefined): void;
+  setDraftForm(draftId: string, form: DraftRegisterForm): void;
+  clearDraftError(draftId: string): void;
+  /** A refused draft command the page ran itself, shown above the
+   * composer as any refused dispatch is (playbook-library-84). */
+  reportDraftError(draftId: string, message: string): void;
+  setDraftSplit(percent: number): void;
+  setDraftStackSplit(percent: number): void;
+  requestNewPlaybook(): void;
+  /** Take the pending request, if any; true once per request. */
+  consumeNewPlaybookRequest(): boolean;
+  consumeRevealPlaybook(): string | undefined;
+
+  loadAgentOptions(adapter: AdapterName): Promise<AgentOptions>;
+  /** One agent's settings for one conversation (DR-067, DR-068). It
+   * writes no configuration: the defaults in Settings are untouched. */
+  setAgentSettings(sessionId: string, agentId: string, change: {model?: string | false | null; subagentModel?: string | false | null; effort?: string | false | null; subagentEffort?: string | false | null; fastMode?: boolean | null; browser?: boolean | null}): Promise<void>;
+  connect(url?: string): void;
+  refresh(): Promise<void>;
+  /** Re-read the core's prose after the home's choice of language
+   * changed (localization-11): the config, readiness, the projects and
+   * the sessions, the ledger, each project's forge guidance, the
+   * drafts, and every loaded conversation folded again in place —
+   * never cleared, so the conversation shown keeps its mount and every
+   * editor open in it keeps its state. */
+  rereadProse(): Promise<void>;
+  setCurrentProject(projectId: string | undefined): void;
+  setWorkspaceTab(projectId: string, tab: string): void;
+  /** Add a session to a project's working set (idempotent). */
+  openTab(projectId: string, sessionId: string): void;
+  /** File a session out of the working set — never ends it. */
+  closeTab(projectId: string, sessionId: string): void;
+  setRailCollapsed(collapsed: boolean): void;
+  /** Write the home's interface language (localization-3): an offered
+   * code, or null for the reader's system. Resolves once the core has
+   * taken it; rejects with the core's reason, which the control shows. */
+  setLanguage(choice: Language | null): Promise<void>;
+  setCaptainSplit(percent: number): void;
+  /** Set a capped frame's height, in that frame's own steps. */
+  setFrameHeight(frameId: string, steps: number): void;
+  toggleProjectExpanded(projectId: string, expanded: boolean): void;
+  setLaneCollapsed(sessionId: string, playerId: string, collapsed: boolean): void;
+  setSourcesFolded(projectId: string, folded: boolean): void;
+  setDashboardGroupCollapsed(projectId: string, collapsed: boolean): void;
+  /** Register a folder, silently git-initializing non-repos
+   * (RUN-27); the palette and any surface share this one action. */
+  addProjectByPath(path: string): Promise<ProjectInfo>;
+  /** Seed the Academy example project (DR-015) and make it current.
+   * Paths pass through as typed — the core expands a leading ~. */
+  openAcademyExample(path?: string): Promise<ProjectInfo>;
+  loadSpecs(projectId: string): Promise<void>;
+  /** Fetch every configured playbook's machine graph, once per
+   * config (run-view-64, playbook-library-36). */
+  loadMachineGraphs(): Promise<void>;
+  /** One file's text with the token its save must carry
+   * (spec-view-16). */
+  readSpecRecord(
+    projectId: string,
+    path: string,
+  ): Promise<{ markdown: string; version: string }>;
+  /** Replace one file under the token its read handed out — none
+   * overwrites (spec-view-47). */
+  writeSpec(
+    projectId: string,
+    path: string,
+    content: string,
+    baseVersion?: string,
+  ): Promise<{ version: string }>;
+  refreshReadiness(): Promise<void>;
+  registerProject(path: string): Promise<ProjectInfo>;
+  createProject(path: string, scaffold: boolean): Promise<ProjectInfo>;
+  /** Forget the working folder and delete its spex repository's clone
+   * (projects-9); a clone holding what has not reached the host is
+   * refused `conflict` naming the count until `confirm` is set. */
+  removeProject(projectId: string, confirm?: boolean): Promise<void>;
+  loadProjectMeta(projectId: string, refresh?: boolean): Promise<void>;
+  openSession(projectId: string): Promise<SessionInfo>;
+  focusSession(sessionId: string): Promise<void>;
+  /** Load an idle session's transcript without focusing tabs.
+   * `force` retries after a failed load (clears the stale view). */
+  loadPastSession(sessionId: string, force?: boolean): Promise<void>;
+  /** Delete an idle session's files and every trace (DR-038,
+   * core-service-70); the core refuses a working or foreign one. */
+  deleteSession(sessionId: string): Promise<void>;
+  /** Restore interrupted work, or Discard an attempt that recorded
+   * nothing (run-view-110, DR-088). */
+  recoverSession(sessionId: string, action: "restore" | "discard"): Promise<void>;
+  /** Forget a deleted session everywhere — the listing, its tab, its
+   * transcript, composer, and staged chip. The removal broadcast and
+   * the delete reply both land here, idempotently. */
+  forgetSession(sessionId: string, projectId: string): void;
+  submitBossText(sessionId: string, text: string, attachments?: readonly MediaAsset[]): Promise<void>;
+  /** run-view-129 / run-view-112: run one control the session already
+   * advertises as its next turn. */
+  /** One advertised control run as the session's next turn
+   * (core-service-98): `actionId` names which one the summary
+   * published, the core re-validating it against what the opened
+   * shell advertises; without a name the core takes the first
+   * (DR-074, DR-075). */
+  submitSessionControl(
+    sessionId: string,
+    kind: "recovery" | "ending",
+    actionId?: string,
+  ): Promise<void>;
+  /** Re-pull the one ledger fold (DR-035). */
+  loadLedger(): Promise<void>;
+  /** Load (or extend, with `more`) a project's History page. */
+  loadHistory(projectId: string, more?: boolean): Promise<void>;
+  /** Capture an intent (DR-035): one gesture, any source. */
+  queueIntent(input: {
+    projectId: string;
+    text: string;
+    attachments?: readonly MediaAsset[];
+    source?: IntentSource;
+  }): Promise<IntentInfo>;
+  /** Edit a queued intent's text (DR-035: from dispatch on, history). */
+  editIntent(intentId: string, text: string, attachments?: readonly MediaAsset[]): Promise<void>;
+  closeIntent(intentId: string, as: "done" | "dropped"): Promise<void>;
+  /** Mark a session's unread finished turn read, without opening it
+   * (dashboard-55): the act reports its own refusal, so the caller
+   * awaits it. */
+  reviewTurn(sessionId: string, turnId: number): Promise<void>;
+  /** Retire a closed intent from History (core-service-79, DR-038):
+   * the row leaves every loaded page at once. */
+  removeIntent(intentId: string): Promise<void>;
+  /** Stage an intent's text into its project's composer (DR-035):
+   * the current conversation's, else the Captain home's. Returns the
+   * staged composer key ("home" or the session id). */
+  stageDispatch(intent: IntentInfo): Promise<string>;
+  /** Detach a staged chip without sending (DR-035). */
+  clearStagedIntent(key: string): void;
+  /** Persist the viewed marker so the review summons clears (DR-035). */
+  markViewed(sessionId: string): void;
+  removeQueued(sessionId: string, index: number): void;
+  abortTurn(sessionId: string): Promise<void>;
+  clearRunError(sessionId: string): void;
+  setDraft(sessionId: string, draft: string): void;
+  setHomeDraft(draft: string): void;
+  abortCompile(): Promise<void>;
+  runCompile(input: {
+    playbookId: string;
+    sourceText?: string;
+    sourcePath?: string;
+    roles: string[];
+    command: string;
+    intent: string;
+    /** role -> the session player that answers it (DR-032). */
+    bindings: Record<string, string>;
+    /** Lanes to create for bindings the roster does not yet hold. */
+    newPlayers?: Record<string, AgentBlockInput>;
+    /** The project whose working folder holds the spec package; the
+     * current project by default (environments-10). */
+    projectId?: string;
+  }): Promise<void>;
+}
+
+/** The local core's place key (run-view-168). */
+export const LOCAL_PLACE_KEY = "local";
+
+/** Where a core runs (run-view-168, DR-133): the local core's place,
+ * keyed "local", or a seat's, keyed by its `<instance origin>#<server
+ * id>` as `server.state` names it and shown by its server's name. Each
+ * place keeps its core's state in a store of its own, holding every
+ * protocol id as its core sent it. */
+export interface Place {
+  key: string;
+  /** A seat's server name; the local place has none. */
+  name?: string;
+}
+
+export const LOCAL_PLACE: Place = { key: LOCAL_PLACE_KEY };
+
+export function isLocalPlace(place: Place): boolean {
+  return place.key === LOCAL_PLACE_KEY;
+}
+
+/** What a place is shown by (run-view-168): "This computer", or the
+ * server's name. */
+export function placeLabel(place: Place): string {
+  return isLocalPlace(place)
+    ? i18n._({ id: "This computer", comment: "the place of the local core, beside each team server's name" })
+    : (place.name ?? place.key);
+}
+
+/** The key a place keeps a preference under in this page's storage
+ * (run-view-168): the local place's is today's key, so an existing
+ * home's preferences stand; a seat's is that key qualified by its
+ * place, so a project held at two places keeps two sets. */
+export function placeKey(place: Place, key: string): string {
+  return isLocalPlace(place) ? key : `${key}@${place.key}`;
+}
+
+/** Where a stored intent's attachments live: the intent's own
+ * directory beside its file (media-4). */
+export function intentMediaOwner(intent: IntentInfo): MediaUploadOwner {
+  return { kind: "intent", projectId: intent.projectId, intentId: intent.id };
+}
+
+/** Why a draft cannot be made: an authoring session lives in a
+ * project's spex repository, and none is registered. */
+export function draftNeedsProject(): string {
+  return i18n._("Add a project first");
+}
+
+/** The project an authoring session or a compile writes in: the
+ * current one while it is registered, else the first. */
+export function workingProject(state: {
+  currentProjectId?: string;
+  projects: readonly { id: string }[];
+}): string | undefined {
+  const { currentProjectId, projects } = state;
+  return (
+    (currentProjectId && projects.some((project) => project.id === currentProjectId)
+      ? currentProjectId
+      : undefined) ?? projects[0]?.id
+  );
+}
+
+const CURRENT_PROJECT_KEY = "spex.currentProject";
+const RAIL_COLLAPSED_KEY = "spex.railCollapsed";
+/** This page's mirror of the home's choice (localization-3), so the
+ * first paint already speaks it rather than waiting for the core. */
+export const LANGUAGE_KEY = "spex.language";
+const EXPANDED_PROJECTS_KEY = "spex.expandedProjects";
+const DASHBOARD_GROUPS_COLLAPSED_KEY = "spex.dashboardGroupsCollapsed";
+const CAPTAIN_SPLIT_KEY = "spex.captainSplit";
+/** The default share leaves a 1280px window's Captain column wide
+ * enough for the built-in machines' drawings to scale into it rather
+ * than scroll (run-view-81); chrome never moves by itself (DR-030), so
+ * the default holds whether or not a drawing is up. */
+export const CAPTAIN_SPLIT_DEFAULT = 45;
+export const CAPTAIN_SPLIT_MIN = 22;
+export const CAPTAIN_SPLIT_MAX = 70;
+
+/** The explorer's split (space-28, DR-030): the tree's share, bounded
+ * so neither the tree nor the preview is squeezed past reading. */
+const SPACE_SPLIT_KEY = "spex.spaceSplit";
+const SPACE_PRIVACY_KEY = "spex.spacePrivacyCollapsed";
+export const SPACE_SPLIT_DEFAULT = 40;
+export const SPACE_SPLIT_MIN = 25;
+export const SPACE_SPLIT_MAX = 70;
+
+/** The authoring workspace's two splits (playbook-library-52): the
+ * conversation pane's width share beside the artifacts, and its height
+ * share above them once the panes stack. Both are the reader's to set
+ * and are remembered across launches (DR-030). */
+const DRAFT_SPLIT_KEY = "spex.draftSplit";
+const DRAFT_STACK_SPLIT_KEY = "spex.draftStackSplit";
+export const DRAFT_SPLIT_DEFAULT = 45;
+export const DRAFT_SPLIT_MIN = 22;
+export const DRAFT_SPLIT_MAX = 70;
+export const DRAFT_STACK_DEFAULT = 55;
+export const DRAFT_STACK_MIN = 25;
+export const DRAFT_STACK_MAX = 75;
+
+function readPercent(key: string, min: number, max: number, fallback: number): number {
+  const stored = Number(safeStorageGet(key));
+  return Number.isFinite(stored) && stored >= min && stored <= max ? stored : fallback;
+}
+
+/** The authoring agent's one lane in a draft's view (playbook-library-64). */
+export const AUTHOR_PLAYER = "author";
+
+function emptyDraftView(): DraftView {
+  return { view: initialSessionView([{ id: AUTHOR_PLAYER }]), lineSeqs: [] };
+}
+
+type FoldedRecord = Parameters<typeof applyRecord>[2];
+
+/** Legacy native telemetry is history, never authority for a live answer.
+ * Only the ephemeral core snapshot can create approval controls. */
+function permissionAsFailure(record: FoldedRecord): FoldedRecord {
+  if (record.type !== "player_event") return record;
+  const event = (record as { event?: { type?: string; payload?: { toolName?: string; reason?: string } } }).event;
+  if (event?.type !== "permission_request") return record;
+  const tool = event.payload?.toolName ?? i18n._("a tool");
+  const reason = event.payload?.reason;
+  return {
+    ...record,
+    event: {
+      ...event,
+      type: "error",
+      payload: {
+        // One whole line per case, never a translated stem with the
+        // runtime's reason glued on (localization-4).
+        message: reason
+          ? i18n._(
+              "Asked permission to use {tool} — {reason}; historical permission event; no live answer is available",
+              { tool, reason },
+            )
+          : i18n._(
+              "Asked permission to use {tool}; historical permission event; no live answer is available",
+              { tool },
+            ),
+        recoverable: true,
+      },
+    },
+  } as FoldedRecord;
+}
+
+/** One key per capped frame, so a frame's height is remembered under
+ * its own identity beside the other chrome preferences (DR-030). */
+export const frameKey = (frameId: string): string => `spex.frame:${frameId}`;
+
+/** The frame heights kept under `prefix`: the local place's
+ * `spex.frame:`, a seat's qualified by its place (run-view-168). */
+function readFrameHeights(prefix: string): Record<string, number> {
+  const heights: Record<string, number> = {};
+  try {
+    const store = window.localStorage;
+    for (let index = 0; index < store.length; index += 1) {
+      const key = store.key(index);
+      if (!key?.startsWith(prefix)) continue;
+      const steps = Number(store.getItem(key));
+      if (Number.isFinite(steps)) heights[key.slice(prefix.length)] = steps;
+    }
+  } catch {
+    // A frame falls back to its default height.
+  }
+  return heights;
+}
+
+/** The surface the reader last stood on (run-view-67), so a reload
+ * returns them there rather than to Projects. */
+export const SURFACE_KEY = "spex.surface";
+
+/** localStorage access that tolerates non-browser test environments. */
+export function safeStorageGet(key: string): string | undefined {
+  try {
+    return window.localStorage.getItem(key) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function safeStorageSet(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Persistence is best-effort.
+  }
+}
+
+export function safeStorageRemove(key: string): void {
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // Persistence is best-effort.
+  }
+}
+
+/** The languages this client itself prefers (localization-2): the
+ * browser's, which the desktop window inherits from the OS. */
+function preferredLanguages(): readonly string[] {
+  try {
+    if (navigator.languages?.length) return navigator.languages;
+    return navigator.language ? [navigator.language] : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The mirrored choice, an unoffered code counting as none. */
+function readLanguageChoice(): Language | null {
+  const stored = safeStorageGet(LANGUAGE_KEY);
+  return isLanguage(stored) ? stored : null;
+}
+
+/** The language this page paints in, settled before the first render
+ * (localization-3) — the local store's initializer runs on import. The
+ * local store's alone: a seat's choice activates nothing here
+ * (localization-11). */
+function pageLanguage(): { choice: Language | null; resolved: Language } {
+  const choice = readLanguageChoice();
+  const resolved = resolveLanguage(choice, preferredLanguages());
+  activateLanguage(resolved);
+  return { choice, resolved };
+}
+
+/** A per-project flag map kept under `key` (run-view-67, dashboard-45). */
+function readFlags(key: string): Record<string, boolean> {
+  try {
+    const raw = safeStorageGet(key);
+    return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Whether a Groups state pairs other spex repositories with working
+ * folders than the page lists as projects (space-59, space-60,
+ * space-63): a move re-keyed one, or a join added one. */
+export function projectsMoved(state: GroupsState, projects: readonly ProjectInfo[]): boolean {
+  const paired = new Set(
+    allRepositories(state)
+      .filter((repository) => repository.folder !== null && repository.state !== "absent")
+      .map((repository) => repository.key),
+  );
+  return paired.size !== projects.length || projects.some((project) => !paired.has(project.id));
+}
+
+/** Whether the page still shows the session `instance` names under
+ * `draftId`: the one boundary a late event, reply or completion passes
+ * before it touches what the page keeps for that session
+ * (playbook-library-62). */
+export function draftShown(draftId: string, instance: string | undefined): boolean {
+  return instance !== undefined && useAppStore.getState().drafts[draftId]?.instance === instance;
+}
+
+type SetState = Parameters<StateCreator<AppState>>[0];
+type GetState = Parameters<StateCreator<AppState>>[1];
+
+/** What a store offers beside its state: its client, and a message
+ * handed to it as its client would. */
+interface PlaceSeams {
+  /** The store's client; throws while none is connected. */
+  getClient(): SpexClient;
+  /** Put a client in place without dialing — a fake in tests. */
+  setClient(client: SpexClient | undefined): void;
+  /** Hand the store a server message as its client would. */
+  deliver(message: ServerMessage): void;
+  /** End the store's connection for good, dialing no more; a later
+   * `connect()` dials afresh (run-view-50). */
+  close(): void;
+}
+
+/** One core's store (run-view-168): its state, its seams, and the
+ * place it keeps. */
+export type AppStore = UseBoundStore<StoreApi<AppState>> & PlaceSeams & { readonly place: Place };
+
+/** One core's state and acts (run-view-168, DR-133). Everything the
+ * store keeps of its core — the client, the reads in flight and their
+ * counts, the backfills and their buffers — lives in this call, so no
+ * two places share any of it, and every id stays as its core sent it. */
+function placeState(
+  place: Place,
+  initialClient: SpexClient | undefined,
+  endpoint: string | undefined,
+  seams: PlaceSeams,
+  set: SetState,
+  get: GetState,
+): AppState {
+  const local = isLocalPlace(place);
+  /** This place's key for a preference this page keeps (run-view-168). */
+  const prefKey = (key: string): string => placeKey(place, key);
+  const framePrefix = `${prefKey("spex.frame")}:`;
+
+  let client = initialClient;
+
+  function getClient(): SpexClient {
+    if (!client) throw new Error(i18n._("client not connected"));
+    return client;
+  }
+
+  /** Sessions with a history backfill in flight: live records buffer
+   * here so a race can never skip the gap (they apply after the
+   * backfill in seq order). */
+  const backfilling = new Map<
+    string,
+    {
+      seq: number;
+      record: TmuxPlayRecord;
+      role?: string;
+    }[]
+  >();
+
+  /** Live records a session received while its view was being folded
+   * again for a change of language (localization-11): they were applied
+   * to the view shown, with their effects, as they arrived, and reach
+   * the replacement view once more without them. */
+  const refolding = new Map<
+    string,
+    { seq: number; record: TmuxPlayRecord; role?: string }[]
+  >();
+  /** Sessions whose re-fold met a backfill in flight: the backfill owns
+   * the records until it settles, and the re-fold runs then, so a change
+   * of language never goes unread for a view (localization-11). */
+  const refoldPending = new Set<string>();
+
+  /** Drafts with a draft.open replay in flight: live draft.record
+   * messages buffer here, with the instance each names, and apply after
+   * the replay, in seq order. */
+  const draftBackfilling = new Map<string, (DraftRecord & { instance: string })[]>();
+  /** The draft events heard per draft — a state or a removal — against
+   * one running count, so a list read in flight never overrides what
+   * was heard after it was asked (playbook-library-62). */
+  let draftEvents = 0;
+  const draftHeard = new Map<string, number>();
+
+  /** The newest ledger read's number: only its reply applies. */
+  let ledgerReads = 0;
+
+  /** The newest playbook-list read's number: an older reply that a newer
+   * read overtook is discarded (playbook-library-1). */
+  let playbookListReads = 0;
+
+  /** Markers already sent, by session: the standing condition
+   * (run-view-134) re-asserts on every fold push, and this keeps that
+   * from re-sending the same marker while the fold catches up. A refused
+   * write drops its entry so the next push takes the act again. */
+  const sentMarkers = new Map<string, number>();
+
+  /** The newest Space state request's number (space-106): a state reply
+   * older than a `space.state` broadcast or a newer request is discarded. */
+  let spaceReads = 0;
+
+  /** The newest config announcement's number: a project's `config.get`
+   * reply older than a `config.state` broadcast is discarded. */
+  let configReads = 0;
+
+  /** The newest re-read of the projects a Groups state set off: an older
+   * reply is discarded. */
+  let projectReads = 0;
+
+  /** What the page last asked of a clone's machine beyond a plain sync,
+   * by the spex repository's key: a stopped phase names no placement
+   * (space-30), so this remembers the placement a join named — the only
+   * one a Retry joins again (space-13) — the instance an Attach, a Place
+   * or a Leave named, a Place's choice and whether a Leave was confirmed —
+   * which confirm a stopped Leave asks next, and what its Retry sends
+   * again (space-89). It outlives a row remounting and not a reload. */
+  const lastActs = new Map<string, SpaceLastAct>();
+
+  /** Records describe the conversation; the listing owns activity,
+   * including settlement after the final reply and stopped history. */
+  function sessionActivity(view: SessionView, session?: SessionInfo): SessionView {
+    const turnActive = session?.live === false
+      ? false
+      : session?.turnActive ?? view.turnActive;
+    return { ...view, turnActive };
+  }
+
+  function setRunError(sessionId: string, message: string): void {
+    set({ runErrors: { ...get().runErrors, [sessionId]: message } });
+  }
+
+  // Session lists have no revision on the wire. Keep announcements only
+  // while the latest list is pending, including per-ID removals. Its
+  // superseded peers may still finish independent project/prose work.
+  let sessionReads = 0;
+  let sessionConnection = 0;
+  let sessionReadPending = false;
+  const sessionHeard = new Set<string>();
+  async function readSessions(): Promise<boolean> {
+    const read = ++sessionReads;
+    const connection = sessionConnection;
+    sessionReadPending = true;
+    sessionHeard.clear();
+    try {
+      const listed = await getClient().command("session.list", {});
+      if (connection !== sessionConnection) return false;
+      if (read !== sessionReads) return true;
+      const sessions = [
+        ...listed.filter((session) => !sessionHeard.has(session.id)),
+        ...get().sessions.filter((session) => sessionHeard.has(session.id)),
+      ].sort((a, b) => a.createdAt - b.createdAt);
+      for (const old of get().sessions) {
+        if (!sessions.some((session) => session.id === old.id)) get().forgetSession(old.id, old.projectId);
+      }
+      const views = Object.fromEntries(Object.entries(get().views).map(([id, view]) => {
+        const activity = sessionActivity(view, sessions.find((session) => session.id === id));
+        return [id, activity.turnActive === view.turnActive ? view : activity];
+      }));
+      set({ sessions, views });
+      return true;
+    } finally {
+      if (read === sessionReads) {
+        sessionReadPending = false;
+        sessionHeard.clear();
+      }
+    }
+  }
+
+  /**
+   * Re-read the projects and the sessions after a Groups state named
+   * other projects than the page holds (space-59, space-60, space-63):
+   * a joined project lists, and a moved one is followed to its new key
+   * by its working folder — the current project, its open tabs, its
+   * remembered tab and its fold in the sidebar with it.
+   */
+  async function followProjects(): Promise<void> {
+    const read = (projectReads += 1);
+    const [projects, sessionsCurrent] = await Promise.all([
+      getClient().command("project.list", {}),
+      readSessions(),
+    ]);
+    if (read !== projectReads || !sessionsCurrent) return;
+    const state = get();
+    const moved = new Map<string, string>();
+    for (const old of state.projects) {
+      if (projects.some((project) => project.id === old.id)) continue;
+      const now = projects.find((project) => project.path === old.path);
+      if (now) moved.set(old.id, now.id);
+    }
+    const follow = <T>(record: Record<string, T>): Record<string, T> => {
+      const out = { ...record };
+      for (const [from, to] of moved) {
+        if (!(from in out)) continue;
+        if (!(to in out)) out[to] = out[from];
+        delete out[from];
+      }
+      return out;
+    };
+    const current = state.currentProjectId && moved.get(state.currentProjectId);
+    const expandedProjects = follow(state.expandedProjects);
+    set({
+      projects,
+      openTabs: follow(get().openTabs),
+      workspaceTabs: follow(get().workspaceTabs),
+      expandedProjects,
+    });
+    if (moved.size > 0) safeStorageSet(prefKey(EXPANDED_PROJECTS_KEY), JSON.stringify(expandedProjects));
+    if (current) get().setCurrentProject(current);
+    for (const project of projects) {
+      if (!get().projectMeta[project.id]) void get().loadProjectMeta(project.id);
+    }
+  }
+
+  /** The home's choice, from wherever it reached this page — the reply
+   * to `language.get`, the reply to this page's own `language.set`, or
+   * the broadcast that followed anyone's (localization-3). Idempotent:
+   * the setter gets both its reply and the broadcast.
+   *
+   * `saved` marks this page's own write landing (settings-37), and
+   * `reread` is false only for the first read of the choice at connect:
+   * what that refresh is loading already speaks the home's language. */
+  function applyLanguageChoice(
+    choice: Language | null | undefined,
+    options: { saved?: boolean; reread?: boolean } = {},
+  ): void {
+    const stored = isLanguage(choice) ? choice : null;
+    // The page's mirror is the local home's (localization-11): a seat's
+    // choice is that seat's state, kept in its own store and written
+    // nowhere here.
+    if (local) {
+      if (stored) safeStorageSet(LANGUAGE_KEY, stored);
+      else safeStorageRemove(LANGUAGE_KEY);
+    }
+    const resolved = resolveLanguage(stored, preferredLanguages());
+    const current = get().language;
+    // The mark of a landed write outlives the re-rendering it causes:
+    // the section that ticks is a new one, so the tick is the store's.
+    const savedAt = options.saved ? Date.now() : current.savedAt;
+    if (current.choice === stored && current.resolved === resolved) {
+      if (savedAt !== current.savedAt) set({ language: { ...current, savedAt } });
+      return;
+    }
+    // Only a changed resolution reloads the catalog; the root re-renders
+    // off the resolved language, so nothing else need subscribe.
+    const changed = current.resolved !== resolved;
+    const choiceChanged = current.choice !== stored;
+    // The page's language is the local home's: a seat's activates none.
+    if (changed && local) activateLanguage(resolved);
+    set({ language: { choice: stored, resolved, savedAt } });
+    // The core composes prose in the home's language (localization-11),
+    // which is the home's choice, not this page's resolution: a choice
+    // that moves while this page keeps its language (none to 简体中文 on
+    // a page already resolving it from the browser) still changes what
+    // the core writes. So a change of either re-reads what this page
+    // holds of that prose — the config, readiness, the projects and the
+    // sessions, the ledger and each project's guidance, the drafts,
+    // every loaded conversation folded again in place, the Space with
+    // the diagnostics it carries where this page holds a Space at all,
+    // and every cached spec tree with its notices. Each re-load
+    // replaces what it read in place, so no view blanks and nothing
+    // the reader has open loses its state; a reconnect's refresh, which
+    // clears the views, is not what a language change needs.
+    if (!(changed || choiceChanged) || options.reread === false) return;
+    if (get().connection !== "open") return;
+    void get().rereadProse().catch(() => {});
+    if (get().space) void get().loadSpace().catch(() => {});
+    for (const id of Object.keys(get().specTrees)) void get().loadSpecs(id);
+  }
+
+  /** Dispatch the next queued composer message when a turn is idle
+   * (RUN-8), from live records and backfills alike. The runtime is
+   * held only for a turn (DR-051), so a session is no longer live once
+   * its turn settled: a queued message then opens it again — but only
+   * on the heels of that turn's end, never because history was loaded
+   * or an interrupted turn was recovered, which are the user's next
+   * action to take. */
+  const queuedInFlight = new Set<string>();
+  function maybeDispatchQueued(sessionId: string, cause: "turn-ended" | "state" | "backfill" = "state"): void {
+    if (queuedInFlight.has(sessionId)) return;
+    const state = get();
+    const view = state.views[sessionId];
+    const composer = state.composers[sessionId];
+    const next = composer?.queued[0];
+    if (!view || view.turnActive || view.pendingQuestion !== undefined || next === undefined) return;
+    const session = state.sessions.find((s) => s.id === sessionId);
+    if (session?.externalWriter || session?.turnActive || session?.recovery) return;
+    if (session && !session.live && (cause !== "turn-ended" || !session.continuable)) return;
+    set({
+      composers: {
+        ...state.composers,
+        [sessionId]: { ...composer, queued: composer!.queued.slice(1) },
+      },
+    });
+    queuedInFlight.add(sessionId);
+    void getClient()
+      .command("turn.submit", {
+        sessionId,
+        text: next.text,
+        ...(next.attachments ? { attachments: [...next.attachments] } : {}),
+        ...(next.intentId !== undefined ? { intentId: next.intentId } : {}),
+      })
+      .catch((cause: Error) => {
+        const current = get().composers[sessionId] ?? {queued: []};
+        set({composers: {...get().composers, [sessionId]: {...current, queued:[next, ...current.queued]}}});
+        setRunError(
+          sessionId,
+          i18n._("queued submission failed: {reason}", {
+            reason: cause.message,
+          }),
+        );
+      })
+      .finally(() => queuedInFlight.delete(sessionId));
+  }
+
+  /** Fold one record into a view — and let a collapsed lane whose
+   * call this record opens unfold itself (run-view-117). The rule
+   * lives at the fold, so it holds whether or not the session's tab
+   * is shown; folding a lane whose call is already open stands. */
+  function fold(
+    sessionId: string,
+    view: SessionView,
+    seq: number,
+    record: import("@sublang/spex-core/protocol").TmuxPlayRecord,
+    role?: string,
+  ): void {
+    applyRecord(view, seq, permissionAsFailure(record), role);
+    if (hasPresentationHeader(record) && record.type === "player_prompt") {
+      get().setLaneCollapsed(sessionId, String(record.playerId), false);
+    }
+  }
+
+  /** Subscribe and backfill a session's view (idempotent). Live
+   * records arriving mid-backfill buffer and apply afterwards, so a
+   * reconnect can never lose the gap. */
+  /** Fold a loaded conversation again from its first record and swap
+   * the result in. The page phrases some lines at fold time — a run's
+   * "finished" stand-in, an aborted turn, an agent error — in the
+   * language of that moment, so a change of language reads them again
+   * (localization-11) without the view ever leaving the store: the
+   * conversation shown keeps its mount, and every editor open in it
+   * its state. Live handling never pauses for it: a record arriving
+   * while the history is read applies to the view shown at once, with
+   * every effect it carries — a lane opened, a queued send released,
+   * a spec tree re-read — and is only mirrored into the replacement
+   * afterwards, so nothing happens twice and nothing waits; a failed
+   * read leaves the view shown, which holds everything it received. A
+   * backfill in flight owns the session's records, so no re-fold runs
+   * beside one: it is held until the backfill settles, whose end runs
+   * it, since an incremental read phrases no line again. */
+  async function refoldView(sessionId: string): Promise<void> {
+    if (!get().views[sessionId] || refolding.has(sessionId)) return;
+    if (backfilling.has(sessionId)) {
+      refoldPending.add(sessionId);
+      return;
+    }
+    const seen: {seq: number; record: TmuxPlayRecord; role?: string}[] = [];
+    refolding.set(sessionId, seen);
+    try {
+      const history = await getClient().command("history.get", { sessionId, afterSeq: 0 });
+      const current = get();
+      if (!current.views[sessionId] || refolding.get(sessionId) !== seen) return;
+      if (backfilling.has(sessionId)) {
+        refoldPending.add(sessionId);
+        return;
+      }
+      const session = current.sessions.find((s) => s.id === sessionId);
+      const view = initialSessionView(session?.players ?? []);
+      for (const entry of history.records) {
+        applyRecord(view, entry.seq, permissionAsFailure(entry.record), entry.role);
+      }
+      for (const entry of seen) {
+        if (entry.seq > view.lastSeq) applyRecord(view, entry.seq, permissionAsFailure(entry.record), entry.role);
+      }
+      view.loading = false;
+      set({ views: { ...get().views, [sessionId]: sessionActivity(view, session) } });
+    } finally {
+      if (refolding.get(sessionId) === seen) refolding.delete(sessionId);
+    }
+  }
+
+  async function ensureSubscribed(sessionId: string): Promise<void> {
+    const state = get();
+    const session = state.sessions.find((s) => s.id === sessionId);
+    let view = state.views[sessionId];
+    if (!view) {
+      view = initialSessionView(session?.players ?? []);
+      view.loading = true;
+      set({ views: { ...state.views, [sessionId]: view } });
+    }
+    const pending: {seq: number; record: TmuxPlayRecord; role?: string}[] = [];
+    backfilling.set(sessionId, pending);
+    try {
+      await getClient().subscribe({ kind: "session", sessionId });
+      const history = await getClient().command("history.get", {
+        sessionId,
+        afterSeq: view.lastSeq,
+      });
+      const fresh = get();
+      const target = fresh.views[sessionId];
+      if (!target || backfilling.get(sessionId) !== pending) return;
+      for (const entry of history.records) {
+        if (entry.seq > target.lastSeq) {
+          fold(sessionId, target, entry.seq, entry.record, entry.role);
+        }
+      }
+      const buffered = backfilling.get(sessionId) ?? [];
+      for (const entry of buffered) {
+        if (entry.seq > target.lastSeq) {
+          fold(sessionId, target, entry.seq, entry.record, entry.role);
+        }
+      }
+      target.loading = false;
+      target.loadError = undefined;
+      set({ views: { ...fresh.views, [sessionId]: sessionActivity(target, fresh.sessions.find((s) => s.id === sessionId)) } });
+      maybeDispatchQueued(sessionId, "backfill");
+    } catch (cause) {
+      const failed = get().views[sessionId];
+      if (backfilling.get(sessionId) !== pending) return;
+      const message = i18n._("transcript could not be loaded: {reason}", {
+        reason: (cause as Error).message,
+      });
+      if (failed) {
+        failed.loading = false;
+        failed.loadError = message;
+        set({ views: { ...get().views, [sessionId]: sessionActivity(failed, get().sessions.find((s) => s.id === sessionId)) } });
+      }
+      throw cause;
+    } finally {
+      if (backfilling.get(sessionId) === pending) {
+        backfilling.delete(sessionId);
+        // A language change that met this backfill re-folds now.
+        if (refoldPending.delete(sessionId)) void refoldView(sessionId).catch(() => {});
+      }
+    }
+  }
+
+  /** A session, ledger or configuration announcement the Space surface
+   * re-reads on while shown (space-2): counted here, debounced there. */
+  function noteSpaceChange(): void {
+    set({ spaceChangeSeq: get().spaceChangeSeq + 1 });
+  }
+
+  /** Fold one draft record into its view (playbook-library-53): the
+   * same reducer the run view uses, plus the seq index that lets the
+   * thread interleave lines and segments in record order. A record at
+   * or before the view's last seq is a replay and folds nothing. */
+  function foldInto(view: DraftView, entry: DraftRecord): void {
+    if (entry.seq <= view.view.lastSeq) return;
+    const before = view.view.captain.length;
+    applyRecord(view.view, entry.seq, permissionAsFailure(entry.record));
+    if (view.view.captain.length > before) view.lineSeqs.push(entry.seq);
+  }
+
+  function foldDraftRecord(draftId: string, entry: DraftRecord): void {
+    const current = get().draftViews[draftId] ?? emptyDraftView();
+    foldInto(current, entry);
+    // A new outer object each fold: the view mutates in place, so the
+    // identity a selector compares must move for the pane to redraw.
+    set({ draftViews: { ...get().draftViews, [draftId]: { ...current } } });
+  }
+
+  /** Take what the core says of a draft. Another instance under the
+   * same id is another session: what the page kept for the former
+   * goes first, the workspace staying open only where the reader asked
+   * for this one (playbook-library-62). */
+  function adoptDraft(info: DraftInfo, keepOpen = false): void {
+    const known = get().drafts[info.id];
+    if (known?.instance && info.instance && known.instance !== info.instance) {
+      const open = get().openDraftId;
+      forgetDraft(info.id);
+      if (keepOpen && open === info.id) set({ openDraftId: open });
+    }
+    noteDraftHeard(info.id);
+    set({ drafts: { ...get().drafts, [info.id]: info } });
+  }
+
+  /** Whether a message naming `instance` is the shown session's: one
+   * naming a former instance changes nothing. This store's own drafts
+   * alone, as `draftShown` reads the local store's. */
+  const isShown = (draftId: string, instance: string | undefined): boolean =>
+    instance !== undefined && get().drafts[draftId]?.instance === instance;
+
+  function noteDraftHeard(draftId: string): void {
+    draftEvents += 1;
+    draftHeard.set(draftId, draftEvents);
+  }
+
+  /** Subscribe to a draft and replay its whole stored transcript and
+   * source (playbook-library-62): the thread is built again from the
+   * file, so a history replaced on disk replaces it, while the
+   * composer, the Source tab's edits and the Enable form stand; live
+   * records arriving meanwhile buffer and apply afterwards, so a
+   * reconnect can never lose the gap. */
+  async function ensureDraftSubscribed(draftId: string): Promise<void> {
+    const current = get().draftViews[draftId] ?? emptyDraftView();
+    set({
+      draftViews: {
+        ...get().draftViews,
+        [draftId]: { ...current, loading: true, loadError: undefined },
+      },
+    });
+    const pending: (DraftRecord & { instance: string })[] = [];
+    draftBackfilling.set(draftId, pending);
+    try {
+      await getClient().subscribe({ kind: "draft", draftId });
+      const reply = await getClient().command("draft.open", {
+        projectId: draftProject(draftId),
+        draftId,
+        afterSeq: 0,
+      });
+      if (draftBackfilling.get(draftId) !== pending) return;
+      const rebuilt = emptyDraftView();
+      for (const entry of reply.records) foldInto(rebuilt, entry);
+      for (const entry of pending) {
+        if (!reply.draft.instance || entry.instance === reply.draft.instance) foldInto(rebuilt, entry);
+      }
+      adoptDraft(reply.draft, true);
+      const view = rebuilt;
+      const source = reply.source;
+      const known = get().draftSources[draftId];
+      set({
+        draftViews: {
+          ...get().draftViews,
+          [draftId]: { ...view, loading: false, loadError: undefined },
+        },
+        draftSources: {
+          ...get().draftSources,
+          // A restored source says only when it changed; who changed it
+          // is known only for a change the app watched happen.
+          [draftId]: source
+            ? {
+                ...source,
+                ...(known && known.version === source.version && known.by
+                  ? { by: known.by }
+                  : {}),
+              }
+            : null,
+        },
+      });
+    } catch (cause) {
+      if (draftBackfilling.get(draftId) !== pending) return;
+      const view = get().draftViews[draftId] ?? emptyDraftView();
+      set({
+        draftViews: {
+          ...get().draftViews,
+          [draftId]: {
+            ...view,
+            loading: false,
+            loadError: i18n._("The conversation could not be loaded: {reason}", {
+              reason: (cause as Error).message,
+            }),
+          },
+        },
+      });
+      throw cause;
+    } finally {
+      if (draftBackfilling.get(draftId) === pending) draftBackfilling.delete(draftId);
+    }
+  }
+
+  /** The instance a command on a draft names: the one shown
+   * (core-service-96). */
+  function draftInstance(draftId: string): string {
+    const instance = get().drafts[draftId]?.instance;
+    if (!instance) throw new Error(i18n._("This draft is no longer listed."));
+    return instance;
+  }
+
+  /** The project whose spex repository holds a draft (storage-23):
+   * every draft command names it. */
+  function draftProject(draftId: string): string {
+    const projectId = get().drafts[draftId]?.projectId;
+    if (!projectId) throw new Error(i18n._("This draft is no longer listed."));
+    return projectId;
+  }
+
+  /** Read the playbook lists again where they were read before. */
+  function reloadPlaybookLists(): void {
+    const lists = get().playbookLists;
+    if (lists) void get().loadPlaybookLists(lists.projectId ?? undefined).catch(() => {});
+  }
+
+  function setDraftError(draftId: string, message: string): void {
+    set({ draftErrors: { ...get().draftErrors, [draftId]: message } });
+  }
+
+  /** Forget a draft everywhere once the core has retired or deleted it. */
+  function forgetDraft(draftId: string): void {
+    noteDraftHeard(draftId);
+    get().removeAttachmentFiles(`draft:${draftId}`);
+    draftBackfilling.delete(draftId);
+    const state = get();
+    const drop = <T,>(record: Record<string, T>): Record<string, T> => {
+      const { [draftId]: _dropped, ...rest } = record;
+      return rest;
+    };
+    set({
+      drafts: drop(state.drafts),
+      draftViews: drop(state.draftViews),
+      draftSources: drop(state.draftSources),
+      draftArtifacts: drop(state.draftArtifacts),
+      draftComposers: drop(state.draftComposers),
+      draftSourceModes: drop(state.draftSourceModes),
+      draftEditors: drop(state.draftEditors),
+      draftForms: drop(state.draftForms),
+      draftErrors: drop(state.draftErrors),
+      compileProgress: drop(state.compileProgress),
+      compileProgressAt: drop(state.compileProgressAt),
+      openDraftId: state.openDraftId === draftId ? undefined : state.openDraftId,
+    });
+  }
+
+  function handleMessage(message: ServerMessage): void {
+    switch (message.type) {
+      case "hello":
+        // A new authenticated connection establishes which core generation
+        // may publish authority; history and old sockets establish none.
+        set({approvals: undefined});
+        break;
+      case "approval.state": {
+        const previous = get().approvals;
+        if (!previous || (previous.generation === message.state.generation && message.state.revision >= previous.revision)) {
+          set({approvals: message.state});
+        }
+        break;
+      }
+      case "browser.progress":
+        deliverBrowserProgress(message);
+        break;
+      case "server.state":
+        // The open seats, whole (core-service-128), sent on every change
+        // and as the connection opens.
+        set({ seats: message.seats });
+        break;
+      case "registry.state":
+        set({ registryAccounts: { ...get().registryAccounts, [message.state.origin]: message.state } });
+        break;
+      case "space.state":
+        // The core's state replaces the last one wholesale (space-29),
+        // and a read still in flight is older than this broadcast.
+        spaceReads += 1;
+        set({ space: message.state, spaceError: undefined, spaceReadAt: Date.now() });
+        // A move or a join changed which projects there are.
+        if (projectsMoved(message.state, get().projects)) void followProjects().catch(() => {});
+        break;
+      case "config.state":
+        noteSpaceChange();
+        // Every project's composition rides the announcement whole
+        // (core-service-2); a read still in flight is older.
+        configReads += 1;
+        set({ configState: message.state, projectConfigs: message.projects ?? {} });
+        // An edit moves where playbooks are enabled (playbook-library-3):
+        // an already-read list reads again so the surface stays true.
+        reloadPlaybookLists();
+        break;
+      case "environment.state":
+        // The core's state replaces the last one wholesale
+        // (environments-17); what it exports may have moved with it.
+        set({
+          environments: { ...get().environments, [message.repository]: message.state },
+        });
+        reloadPlaybookLists();
+        break;
+      case "readiness.state":
+        set({ readiness: message.entries });
+        break;
+      case "language.state":
+        // One choice per home (localization-3): it reaches every page
+        // with no subscription, this one's own setter included.
+        applyLanguageChoice(message.language);
+        break;
+      case "compile.progress": {
+        // A line of a session's compile is that session's alone; a
+        // standalone compile's names none.
+        if (message.instance !== undefined && !isShown(message.playbookId, message.instance)) break;
+        const progress = get().compileProgress;
+        const times = get().compileProgressAt;
+        set({
+          compileProgress: {
+            ...progress,
+            [message.playbookId]: [
+              ...(progress[message.playbookId] ?? []),
+              message.line,
+            ],
+          },
+          compileProgressAt: {
+            ...times,
+            [message.playbookId]: [
+              ...(times[message.playbookId] ?? []),
+              Date.now(),
+            ],
+          },
+        });
+        break;
+      }
+      case "draft.record": {
+        const buffer = draftBackfilling.get(message.draftId);
+        const entry: DraftRecord = { seq: message.seq, record: message.record };
+        if (buffer) {
+          buffer.push({ ...entry, instance: message.instance });
+          break;
+        }
+        // Only into a thread the page shows for that very session: a late
+        // record never makes one up.
+        const view = get().draftViews[message.draftId];
+        if (!view || !isShown(message.draftId, message.instance)) break;
+        // A record not following the thread's last means the history
+        // changed on disk: the thread is read again whole.
+        if (!view.loading && entry.seq !== view.view.lastSeq + 1) {
+          void ensureDraftSubscribed(message.draftId).catch(() => {});
+          break;
+        }
+        foldDraftRecord(message.draftId, entry);
+        break;
+      }
+      case "draft.state": {
+        const draft = message.draft;
+        const before = get().drafts[draft.id];
+        adoptDraft(draft);
+        // A replaced session's compile log went with it.
+        const previous = before?.instance && draft.instance && before.instance !== draft.instance ? undefined : before;
+        const updates: Partial<AppState> = {};
+        // A compile that just started opens a fresh log: the band folds
+        // this compile's lines, never the last one's under them.
+        if (
+          draft.compile?.outcome === "running" &&
+          previous?.compile?.at !== draft.compile.at
+        ) {
+          updates.compileProgress = { ...get().compileProgress, [draft.id]: [] };
+          updates.compileProgressAt = { ...get().compileProgressAt, [draft.id]: [] };
+        }
+        set(updates);
+        break;
+      }
+      case "draft.removed": {
+        // Deleted, here or elsewhere: every trace goes, and an open
+        // workspace yields to the list. Ids are
+        // unique within one spex repository only, so a removal names
+        // the project too.
+        const known = get().drafts[message.draftId];
+        if (!known || (known.projectId === message.projectId && (message.instance === undefined || known.instance === message.instance))) forgetDraft(message.draftId);
+        break;
+      }
+      case "draft.history-replaced":
+        // A sync may have replaced the history under the same instance:
+        // a thread shown is read again from the file.
+        if (get().draftViews[message.draftId] && isShown(message.draftId, message.instance)) {
+          void ensureDraftSubscribed(message.draftId).catch(() => {});
+        }
+        break;
+      case "draft.source": {
+        if (!isShown(message.draftId, message.instance)) break;
+        // Who changed it: the agent while its turn runs, else the Boss.
+        const by =
+          get().drafts[message.draftId]?.activity === "turn" ? "agent" : "you";
+        set({
+          draftSources: {
+            ...get().draftSources,
+            [message.draftId]: {
+              markdown: message.markdown,
+              version: message.version,
+              mtime: message.mtime,
+              by,
+            },
+          },
+        });
+        break;
+      }
+      case "session.state": {
+        if (sessionReadPending) sessionHeard.add(message.session.id);
+        noteSpaceChange();
+        const sessions = get().sessions.filter(
+          (session) => session.id !== message.session.id,
+        );
+        sessions.push(message.session);
+        sessions.sort((a, b) => a.createdAt - b.createdAt);
+        const view = get().views[message.session.id];
+        // The runtime's release at settlement reports the session no
+        // longer live: that report still belongs to the turn that ended.
+        const wasLive = get().sessions.find((s) => s.id === message.session.id)?.live === true;
+        set({ sessions, ...(view ? {
+          views: { ...get().views, [message.session.id]: sessionActivity(view, message.session) },
+        } : {}) });
+        maybeDispatchQueued(message.session.id, wasLive && !message.session.live ? "turn-ended" : "state");
+        break;
+      }
+      case "session.history-replaced":
+        if (get().views[message.sessionId]) void get().loadPastSession(message.sessionId, true).catch((error: Error) => setRunError(message.sessionId, error.message));
+        break;
+      case "session.removed":
+        if (sessionReadPending) sessionHeard.add(message.sessionId);
+        noteSpaceChange();
+        get().forgetSession(message.sessionId, message.projectId);
+        break;
+      case "intents.changed": {
+        noteSpaceChange();
+        // The one fold moved (DR-035): re-pull it, and refresh any
+        // loaded History first page for the named projects.
+        void get()
+          .loadLedger()
+          .catch(() => {});
+        for (const projectId of message.projectIds) {
+          if (get().history[projectId]) {
+            void get()
+              .loadHistory(projectId)
+              .catch(() => {});
+          }
+        }
+        break;
+      }
+      case "record": {
+        const { sessionId, seq, record, role } = message;
+        const buffer = backfilling.get(sessionId);
+        if (buffer) {
+          buffer.push({ seq, record, ...(role !== undefined ? { role } : {}) });
+          break;
+        }
+        // A re-fold in flight sees the record too, after this view has
+        // taken it with its effects.
+        refolding.get(sessionId)?.push({ seq, record, ...(role !== undefined ? { role } : {}) });
+        const state = get();
+        const session = state.sessions.find((s) => s.id === sessionId);
+        const view =
+          state.views[sessionId] ??
+          initialSessionView(session?.players ?? []);
+        fold(sessionId, view, seq, record, role);
+
+        const updates: Partial<AppState> = {
+          views: { ...state.views, [sessionId]: sessionActivity(view, session) },
+        };
+
+        set(updates);
+        // Dispatch a queued submission when the turn ends (RUN-8).
+        if (
+          hasPresentationHeader(record) &&
+          (record.type === "turn_finished" || record.type === "turn_aborted")
+        ) {
+          maybeDispatchQueued(sessionId, "turn-ended");
+          // Agents may have rewritten specs during the turn: re-read
+          // any loaded tree for this project (DR-011 freshness).
+          if (session && get().specTrees[session.projectId]) {
+            void get().loadSpecs(session.projectId);
+          }
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  seams.getClient = getClient;
+  seams.setClient = (next) => {
+    client = next;
+    // What a page asked of the clones goes with its client.
+    lastActs.clear();
+  };
+  seams.deliver = handleMessage;
+  seams.close = () => {
+    // The client is let go first, so its closing reports nothing here.
+    const closing = client;
+    client = undefined;
+    closing?.close();
+  };
+
+  return {
+    ...createAttachmentState(set, get, getClient),
+    connection: "closed",
+    approvalInboxOpen: false,
+    showApprovals: (approvalFocusId) => set({approvalInboxOpen: true, approvalFocusId}),
+    hideApprovals: () => set({approvalInboxOpen: false, approvalFocusId: undefined}),
+    everConnected: false,
+    seats: [],
+    readiness: [],
+    projects: [],
+    projectMeta: {},
+    machineGraphs: {},
+    projectConfigs: {},
+
+    async loadProjectConfig(projectId: string): Promise<void> {
+      const read = configReads;
+      const state = await getClient().command("config.get", { projectId });
+      if (read !== configReads && projectId in get().projectConfigs) return;
+      set({ projectConfigs: { ...get().projectConfigs, [projectId]: state } });
+    },
+    compileProgress: {},
+    sessions: [],
+    views: {},
+    composers: {},
+    runErrors: {},
+    workspaceTabs: {},
+    openTabs: {},
+    railCollapsed: safeStorageGet(prefKey(RAIL_COLLAPSED_KEY)) === "1",
+    // A seat's choice is unknown until its core answers, and resolving
+    // it here activates nothing (localization-11).
+    language: local ? pageLanguage() : { choice: null, resolved: resolveLanguage(null, preferredLanguages()) },
+    captainSplit: readPercent(
+      prefKey(CAPTAIN_SPLIT_KEY),
+      CAPTAIN_SPLIT_MIN,
+      CAPTAIN_SPLIT_MAX,
+      CAPTAIN_SPLIT_DEFAULT,
+    ),
+    frameHeights: readFrameHeights(framePrefix),
+    expandedProjects: readFlags(prefKey(EXPANDED_PROJECTS_KEY)),
+    specTrees: {},
+    specErrors: {},
+    homeDraft: "",
+    history: {},
+    stagedIntents: {},
+    collapsedLanes: {},
+    foldedSources: {},
+    dashboardGroupsCollapsed: readFlags(prefKey(DASHBOARD_GROUPS_COLLAPSED_KEY)),
+    drafts: {},
+    draftsLoaded: false,
+    draftViews: {},
+    draftSources: {},
+    draftArtifacts: {},
+    draftComposers: {},
+    draftSourceModes: {},
+    draftEditors: {},
+    draftForms: {},
+    draftErrors: {},
+    draftSplit: readPercent(
+      prefKey(DRAFT_SPLIT_KEY),
+      DRAFT_SPLIT_MIN,
+      DRAFT_SPLIT_MAX,
+      DRAFT_SPLIT_DEFAULT,
+    ),
+    draftStackSplit: readPercent(
+      prefKey(DRAFT_STACK_SPLIT_KEY),
+      DRAFT_STACK_MIN,
+      DRAFT_STACK_MAX,
+      DRAFT_STACK_DEFAULT,
+    ),
+    compileProgressAt: {},
+    newPlaybookRequested: false,
+    environments: {},
+    environmentErrors: {},
+    spaceChangeSeq: 0,
+    spaceSplit: readPercent(
+      prefKey(SPACE_SPLIT_KEY),
+      SPACE_SPLIT_MIN,
+      SPACE_SPLIT_MAX,
+      SPACE_SPLIT_DEFAULT,
+    ),
+    spacePrivacyCollapsed: safeStorageGet(prefKey(SPACE_PRIVACY_KEY)) !== "0",
+
+    async loadSpace(): Promise<void> {
+      // Replies apply in request order (space-106): a read that a newer
+      // read or a broadcast overtook is discarded, never applied.
+      const read = (spaceReads += 1);
+      try {
+        const space = await getClient().command("space.get", {});
+        if (read !== spaceReads) return;
+        set({ space, spaceError: undefined, spaceReadAt: Date.now() });
+      } catch (cause) {
+        if (read !== spaceReads) return;
+        set({ spaceError: (cause as Error).message, spaceReadAt: Date.now() });
+      }
+    },
+
+    setSpaceSplit(percent: number): void {
+      const clamped = Math.min(
+        SPACE_SPLIT_MAX,
+        Math.max(SPACE_SPLIT_MIN, Math.round(percent)),
+      );
+      set({ spaceSplit: clamped });
+      safeStorageSet(prefKey(SPACE_SPLIT_KEY), String(clamped));
+    },
+
+    setSpacePrivacyCollapsed(collapsed: boolean): void {
+      set({ spacePrivacyCollapsed: collapsed });
+      safeStorageSet(prefKey(SPACE_PRIVACY_KEY), collapsed ? "1" : "0");
+    },
+
+    async spaceRefresh(): Promise<void> {
+      // An instance is read only while signed in there; the read's end
+      // arrives as `space.state` (space-29), and the state is re-read
+      // either way.
+      if (anySignedIn(get().space)) await getClient().command("space.refresh", {});
+      await get().loadSpace();
+    },
+
+    spaceSignIn: (url) => getClient().command("space.signin.start", { url }),
+
+    async spaceSignInCancel(): Promise<boolean> {
+      const { stopped } = await getClient().command("space.signin.cancel", {});
+      return stopped;
+    },
+
+    async spaceSignOut(instance: string): Promise<void> {
+      const read = (spaceReads += 1);
+      const space = await getClient().command("space.signout", { instance });
+      if (read !== spaceReads) return;
+      set({ space, spaceError: undefined, spaceReadAt: Date.now() });
+    },
+
+    async spaceForget(instance: string): Promise<void> {
+      const read = (spaceReads += 1);
+      const space = await getClient().command("space.forget", { instance });
+      if (read !== spaceReads) return;
+      set({ space, spaceError: undefined, spaceReadAt: Date.now() });
+    },
+
+    async spacePick(repository, choice, noticed): Promise<void> {
+      await getClient().command("space.pick", { repository, choice, ...(noticed ? { noticed: true } : {}) });
+    },
+
+    async spaceJoin(instance: string, hostId: string, folder?: string): Promise<void> {
+      await getClient().command("space.join", {
+        instance,
+        hostId,
+        ...(folder !== undefined ? { folder } : {}),
+      });
+    },
+
+    spaceLastAct: (repository) => lastActs.get(repository),
+
+    spaceMembers: (target) => getClient().command("space.members", { ...target }),
+
+    spaceGroupCreate: (instance, name, path, parent) => getClient().command("space.group.create", { instance, name, path, parent }),
+
+    spaceShare: (target, login, role) => getClient().command("space.share", { ...target, login, role }),
+
+    spaceUnshare: (target, login) => getClient().command("space.unshare", { ...target, login }),
+
+    async spaceRepairDecline(repair: string, declined: boolean): Promise<void> {
+      const read = (spaceReads += 1);
+      const space = await getClient().command("space.repair.decline", { repair, declined });
+      if (read !== spaceReads) return;
+      set({ space, spaceError: undefined, spaceReadAt: Date.now() });
+    },
+
+    async rebindProject(projectId: string, path: string, aliases: string[]): Promise<ProjectInfo> {
+      const project = await getClient().command("project.rebind", {
+        projectId,
+        path,
+        // A repair naming no directory has no alias to carry.
+        ...(aliases.length ? { aliases } : {}),
+      });
+      set({ projects: await getClient().command("project.list", {}) });
+      void get().loadProjectMeta(project.id);
+      // The gesture meant to lower the count must lower it (space-1).
+      await get().loadSpace();
+      return project;
+    },
+
+    async spaceFetch(repository: string): Promise<void> {
+      // Accepted at once; the outcome is state (space-29, DR-010 §5).
+      await getClient().command("space.fetch", { repository });
+    },
+
+    async spaceSync(repository, input): Promise<void> {
+      // A join is remembered by the placement it names, before the
+      // reply, so a stop inside it is still this join's; a sync asking
+      // none forgets it, the page having last asked a plain sync
+      // (space-13, space-30).
+      if (input.join === true && input.placement !== undefined) {
+        lastActs.set(repository, { op: "join", instance: input.placement });
+      } else if (lastActs.get(repository)?.op === "join") {
+        lastActs.delete(repository);
+      }
+      await getClient().command("space.sync", {
+        repository,
+        ...(input.placement !== undefined ? { placement: input.placement } : {}),
+        ...(input.choices !== undefined ? { choices: input.choices } : {}),
+        ...(input.join !== undefined ? { join: input.join } : {}),
+        ...(input.noticed !== undefined ? { noticed: input.noticed } : {}),
+      });
+    },
+
+    async spaceCancel(repository: string): Promise<boolean> {
+      const { stopped } = await getClient().command("space.cancel", { repository });
+      return stopped;
+    },
+
+    spaceDiff: (repository, unit, path, side, placement) =>
+      getClient().command("space.diff", {
+        repository,
+        unit,
+        path,
+        side,
+        ...(placement !== undefined ? { placement } : {}),
+      }),
+
+    spaceTree: (repository, path) =>
+      getClient().command("space.tree", {
+        repository,
+        ...(path !== undefined ? { path } : {}),
+      }),
+
+    spaceRead: (repository, path) => getClient().command("space.read", { repository, path }),
+
+    connect(url?: string): void {
+      // A seat is dialed at its relay path (core-service-129), never at
+      // the local core's endpoint.
+      const target = url ?? endpoint ?? (local ? defaultCoreUrl() : undefined);
+      if (target === undefined) throw new Error(i18n._("client not connected"));
+      set({ coreUrl: target });
+      // Only the client in place speaks for this store: one let go by a
+      // redial or a close reports nothing more (run-view-50).
+      const dialing: SpexClient = new SpexClient({
+        url: target,
+        onMessage: (message) => {
+          if (client === dialing) handleMessage(message);
+        },
+        onStatus: (connection) => {
+          if (client !== dialing) return;
+          if (connection !== "open") {
+            sessionConnection += 1;
+            sessionReads += 1;
+            sessionReadPending = false;
+            sessionHeard.clear();
+          }
+          set({ connection });
+          if (connection === "open") {
+            set({ everConnected: true });
+            // A failed bootstrap must not present as an empty app
+            // (DR-010 §5): surface it with a retry.
+            void get()
+              .refresh()
+              .then(() => set({ refreshError: undefined }))
+              .catch((cause: Error) =>
+                set({
+                  refreshError: i18n._("app state failed to load: {reason}", {
+                    reason: cause.message,
+                  }),
+                }),
+              );
+          }
+        },
+      });
+      client = dialing;
+      dialing.connect();
+    },
+
+    async rereadProse(): Promise<void> {
+      const [configState, readiness, projects, sessionsCurrent] = await Promise.all([
+        getClient().command("config.get", {}),
+        getClient().command("readiness.get", {}),
+        getClient().command("project.list", {}),
+        readSessions(),
+      ]);
+      if (!sessionsCurrent) return;
+      set({ configState, readiness, projects });
+      void get().loadLedger();
+      for (const project of projects) void get().loadProjectMeta(project.id);
+      void get().listDrafts().catch(() => {});
+      // The core phrases an environment's staleness, failures and
+      // invalid entries: what was read is read again.
+      reloadPlaybookLists();
+      for (const repository of Object.keys(get().environments)) {
+        void get().loadEnvironment(repository).catch(() => {});
+      }
+      for (const sessionId of Object.keys(get().views)) void refoldView(sessionId).catch(() => {});
+    },
+
+    async refresh(): Promise<void> {
+      const [configState, readiness, projects, sessionsCurrent] = await Promise.all([
+        getClient().command("config.get", {}),
+        getClient().command("readiness.get", {}),
+        getClient().command("project.list", {}),
+        readSessions(),
+      ]);
+      if (!sessionsCurrent) return;
+      // The home's choice, once connected (localization-3). A
+      // preference never blocks the app: the page keeps painting in
+      // what it last read until the core answers.
+      void (async () => {
+        try {
+          const result = await getClient().command("language.get", {});
+          // This very refresh is reading the core's prose in the home's
+          // language already, so learning it re-reads nothing.
+          applyLanguageChoice(result?.language ?? null, { reread: false });
+        } catch {
+          // Unreadable: this page's mirror stands.
+        }
+      })();
+      const sessions = get().sessions;
+      const loaded = new Set(Object.keys(get().views));
+      set({ configState, readiness, projects, projectsRead: true, views:{} });
+      void get().loadLedger();
+      void get().loadMachineGraphs();
+      for (const project of projects) {
+        void get().loadProjectMeta(project.id);
+      }
+      // A checkout may replace history while disconnected. Reload cached
+      // conversations from sequence zero, retaining drafts and queued text.
+      const live = sessions.filter((session) => session.live);
+      for (const session of sessions.filter((item) => item.live || loaded.has(item.id))) {
+        await ensureSubscribed(session.id).catch(() => {});
+      }
+      // Drafts opened this launch re-subscribe and read their whole
+      // transcript again (playbook-library-62), once the list has said
+      // where each stands now — a move while away re-keys its project.
+      await get()
+        .listDrafts()
+        .catch(() => {});
+      for (const draftId of Object.keys(get().draftViews)) {
+        await ensureDraftSubscribed(draftId).catch(() => {});
+      }
+      // Boot the project context (DR-011): the persisted project when
+      // it still exists, else the first live session's project, else
+      // any project at all — a workspace holding projects never opens
+      // asking which one (run-view-57).
+      let current = get().currentProjectId;
+      if (!current) {
+        const persisted = safeStorageGet(prefKey(CURRENT_PROJECT_KEY));
+        if (persisted && projects.some((p) => p.id === persisted)) {
+          current = persisted;
+        } else if (live.length > 0) {
+          current = live[0].projectId;
+        } else {
+          current = projects[0]?.id;
+        }
+        if (current) set({ currentProjectId: current });
+      }
+      // Bootstrap session activation happens within the current
+      // project, never across it.
+      const active = get().activeSessionId;
+      const inProject = live.filter((s) => s.projectId === current);
+      if ((!active || !live.some((s) => s.id === active)) && inProject[0]) {
+        set({ activeSessionId: inProject[0].id });
+      }
+      // A launch opens the current project's live session and nothing
+      // else (run-view-57): the sidebar carries the rest.
+      if (current && inProject[0]) {
+        get().openTab(current, inProject[0].id);
+      }
+    },
+
+    setCurrentProject(projectId: string | undefined): void {
+      set({ currentProjectId: projectId });
+      if (projectId) safeStorageSet(prefKey(CURRENT_PROJECT_KEY), projectId);
+    },
+
+    setWorkspaceTab(projectId: string, tab: string): void {
+      set({
+        workspaceTabs: { ...get().workspaceTabs, [projectId]: tab },
+      });
+    },
+
+    openTab(projectId: string, sessionId: string): void {
+      const open = get().openTabs[projectId] ?? [];
+      if (open.includes(sessionId)) return;
+      set({
+        openTabs: { ...get().openTabs, [projectId]: [...open, sessionId] },
+      });
+    },
+
+    closeTab(projectId: string, sessionId: string): void {
+      const open = get().openTabs[projectId] ?? [];
+      const index = open.indexOf(sessionId);
+      if (index < 0) return;
+      const next = open.filter((id) => id !== sessionId);
+      const updates: Partial<AppState> = {
+        openTabs: { ...get().openTabs, [projectId]: next },
+      };
+      // Closing the tab you are looking at lands on a neighbour, never
+      // on nothing (run-view-47).
+      if (get().workspaceTabs[projectId] === sessionId) {
+        const neighbour = next[index] ?? next[index - 1];
+        updates.workspaceTabs = {
+          ...get().workspaceTabs,
+          [projectId]: neighbour ?? "start",
+        };
+      }
+      set(updates);
+    },
+
+    setRailCollapsed(collapsed: boolean): void {
+      set({ railCollapsed: collapsed });
+      safeStorageSet(prefKey(RAIL_COLLAPSED_KEY), collapsed ? "1" : "0");
+    },
+
+    async setLanguage(choice: Language | null): Promise<void> {
+      // The core owns the choice; the broadcast that follows reaches
+      // this page too, and applying it twice changes nothing.
+      const result = await getClient().command("language.set", { language: choice });
+      applyLanguageChoice(result?.language ?? null, { saved: true });
+    },
+
+    setCaptainSplit(percent: number): void {
+      const clamped = Math.min(
+        CAPTAIN_SPLIT_MAX,
+        Math.max(CAPTAIN_SPLIT_MIN, Math.round(percent)),
+      );
+      set({ captainSplit: clamped });
+      safeStorageSet(prefKey(CAPTAIN_SPLIT_KEY), String(clamped));
+    },
+
+    setFrameHeight(frameId: string, steps: number): void {
+      // The frame owns its bounds and its unit; the store keeps what
+      // the reader set and hands it back on the next launch.
+      set({ frameHeights: { ...get().frameHeights, [frameId]: steps } });
+      safeStorageSet(`${framePrefix}${frameId}`, String(steps));
+    },
+
+    toggleProjectExpanded(projectId: string, expanded: boolean): void {
+      const next = { ...get().expandedProjects, [projectId]: expanded };
+      set({ expandedProjects: next });
+      safeStorageSet(prefKey(EXPANDED_PROJECTS_KEY), JSON.stringify(next));
+    },
+
+    setLaneCollapsed(sessionId: string, playerId: string, collapsed: boolean): void {
+      const lanes = get().collapsedLanes[sessionId] ?? [];
+      if (lanes.includes(playerId) === collapsed) return;
+      const next = collapsed
+        ? [...lanes, playerId]
+        : lanes.filter((id) => id !== playerId);
+      set({ collapsedLanes: { ...get().collapsedLanes, [sessionId]: next } });
+    },
+
+    setSourcesFolded(projectId: string, folded: boolean): void {
+      if ((get().foldedSources[projectId] ?? false) === folded) return;
+      set({ foldedSources: { ...get().foldedSources, [projectId]: folded } });
+    },
+
+    setDashboardGroupCollapsed(projectId: string, collapsed: boolean): void {
+      if ((get().dashboardGroupsCollapsed[projectId] ?? false) === collapsed) {
+        return;
+      }
+      const next = {
+        ...get().dashboardGroupsCollapsed,
+        [projectId]: collapsed,
+      };
+      set({ dashboardGroupsCollapsed: next });
+      safeStorageSet(prefKey(DASHBOARD_GROUPS_COLLAPSED_KEY), JSON.stringify(next));
+    },
+
+    async addProjectByPath(path: string): Promise<ProjectInfo> {
+      try {
+        return await get().registerProject(path);
+      } catch (cause) {
+        // Add means an existing repository: a directory that is none
+        // is refused with the way forward, never initialized behind
+        // the user's back (projects-1, projects-22).
+        if (/not the root of a git work tree/.test((cause as Error).message)) {
+          throw new Error(
+            i18n._(
+              "{path} is not the root of a git work tree. To start a new repository there, use Create instead.",
+              { path },
+            ),
+          );
+        }
+        throw cause;
+      }
+    },
+
+    async openAcademyExample(path?: string): Promise<ProjectInfo> {
+      // Same path UX as the palette's typed paths: pass through as
+      // written and let the core expand ~ (DR-015 example mode).
+      const target = path?.trim() || "~/spex-academy";
+      let project: ProjectInfo;
+      try {
+        project = await getClient().command("project.create", {
+          path: target,
+          example: true,
+        });
+      } catch (cause) {
+        // A repeat visit: the example is already a registered
+        // project — open it instead of surfacing the conflict. The
+        // refusal carries the expanded path as a fact apart from its
+        // words (which follow the home's language), and the client
+        // cannot derive that path itself.
+        const refusal = cause as SpexCommandError;
+        const registered =
+          refusal.code === "conflict" && typeof refusal.details?.path === "string"
+            ? refusal.details.path
+            : undefined;
+        if (!registered) throw cause;
+        const projects = await getClient().command("project.list", {});
+        const existing = projects.find((entry) => entry.path === registered);
+        if (!existing) throw cause;
+        set({ projects });
+        void get().loadProjectMeta(existing.id);
+        get().setCurrentProject(existing.id);
+        return existing;
+      }
+      // Registration happened server-side: mirror the post-create
+      // flow of addProjectByPath, then make the example current.
+      set({ projects: await getClient().command("project.list", {}) });
+      void get().loadProjectMeta(project.id);
+      get().setCurrentProject(project.id);
+      return project;
+    },
+
+    async loadSpecs(projectId: string): Promise<void> {
+      try {
+        const tree = await getClient().command("specs.get", { projectId });
+        const { [projectId]: _, ...errors } = get().specErrors;
+        set({
+          specTrees: { ...get().specTrees, [projectId]: tree },
+          specErrors: errors,
+        });
+      } catch (cause) {
+        set({
+          specErrors: {
+            ...get().specErrors,
+            [projectId]: (cause as Error).message,
+          },
+        });
+      }
+    },
+
+    async loadMachineGraphs() {
+      const state = get();
+      if (state.configState?.status !== "valid") return;
+      const playbooks = state.configState.summary?.playbooks ?? [];
+      for (const playbook of playbooks) {
+        if (playbook.id in get().machineGraphs) continue;
+        try {
+          const artifacts = (await getClient().command("playbook.artifacts", {
+            playbookId: playbook.id,
+          })) as { machine?: MachineGraph | null };
+          set({
+            machineGraphs: {
+              ...get().machineGraphs,
+              [playbook.id]: artifacts.machine ?? null,
+            },
+          });
+        } catch {
+          // A failed fetch records nothing; the card degrades to the
+          // observed drawing (run-view-64) and a later config load
+          // retries.
+        }
+      }
+    },
+
+    async readSpecRecord(
+      projectId: string,
+      path: string,
+    ): Promise<{ markdown: string; version: string }> {
+      const reply = await getClient().command("specs.read", {
+        projectId,
+        path,
+      });
+      return { markdown: reply.markdown, version: reply.version };
+    },
+
+    async writeSpec(
+      projectId: string,
+      path: string,
+      content: string,
+      baseVersion?: string,
+    ): Promise<{ version: string }> {
+      const reply = await getClient().command("specs.write", {
+        projectId,
+        path,
+        content,
+        ...(baseVersion !== undefined ? { baseVersion } : {}),
+      });
+      return { version: reply.version };
+    },
+
+    loadAgentOptions: (adapter) => getClient().command("agent.options", { adapter }),
+
+    async setAgentSettings(sessionId, agentId, change): Promise<void> {
+      const session = await getClient().command("session.agent.set", { sessionId, agentId, ...change });
+      // The core broadcasts the same session; taking the reply too
+      // means the chip never redraws from a value it just replaced.
+      const sessions = get().sessions.filter((entry) => entry.id !== session.id);
+      sessions.push(session);
+      sessions.sort((a, b) => a.createdAt - b.createdAt);
+      set({ sessions });
+    },
+
+    async refreshReadiness(): Promise<void> {
+      set({ readiness: await getClient().command("readiness.get", {}) });
+    },
+
+    async registerProject(path: string): Promise<ProjectInfo> {
+      const project = await getClient().command("project.register", { path });
+      set({ projects: await getClient().command("project.list", {}) });
+      void get().loadProjectMeta(project.id);
+      // A repair answered from Space must lower its count at once.
+      if (get().space) await get().loadSpace();
+      return project;
+    },
+
+    async createProject(path: string, scaffold: boolean): Promise<ProjectInfo> {
+      const project = await getClient().command("project.create", {
+        path,
+        scaffold,
+        ...(scaffold ? { scaffoldLanguage: get().language.resolved } : {}),
+      });
+      set({ projects: await getClient().command("project.list", {}) });
+      void get().loadProjectMeta(project.id);
+      return project;
+    },
+
+    async removeProject(projectId: string, confirm?: boolean): Promise<void> {
+      await getClient().command("project.remove", {
+        projectId,
+        ...(confirm ? { confirm: true } : {}),
+      });
+      set({ projects: await getClient().command("project.list", {}) });
+    },
+
+    async loadProjectMeta(projectId: string, refresh = false): Promise<void> {
+      const before = get();
+      set({
+        projectMeta: {
+          ...before.projectMeta,
+          [projectId]: { ...before.projectMeta[projectId], loading: true },
+        },
+      });
+      const [status, forge] = await Promise.allSettled([
+        getClient().command("project.status", { projectId }),
+        getClient().command("forge.items", { projectId, refresh }),
+      ]);
+      // A failed read keeps what was last served beside its failure
+      // (dashboard-14): the lists, with their fetch moment, stay on the
+      // page and a later read can replace them.
+      const last = get().projectMeta[projectId];
+      const meta: ProjectMeta = { loading: false };
+      if (status.status === "fulfilled") meta.status = status.value;
+      else {
+        if (last?.status) meta.status = last.status;
+        meta.statusError = (status.reason as Error).message;
+      }
+      if (forge.status === "fulfilled") meta.forge = forge.value;
+      else {
+        if (last?.forge) meta.forge = last.forge;
+        meta.forgeError = (forge.reason as Error).message;
+      }
+      set({ projectMeta: { ...get().projectMeta, [projectId]: meta } });
+    },
+
+    async openSession(projectId: string): Promise<SessionInfo> {
+      const session = await getClient().command("session.create", {
+        projectId,
+      });
+      const sessions = [
+        ...get().sessions.filter((existing) => existing.id !== session.id),
+        session,
+      ].sort((a, b) => a.createdAt - b.createdAt);
+      set({ sessions });
+      await get().focusSession(session.id);
+      return session;
+    },
+
+    async focusSession(sessionId: string): Promise<void> {
+      if (!get().views[sessionId]) {
+        await ensureSubscribed(sessionId);
+      }
+      set({ activeSessionId: sessionId });
+      // Focusing a session always carries its project context along
+      // (DR-011): sidebar rows, Dashboard rows and palette rows route
+      // through here, and each puts the session in the working set.
+      const session = get().sessions.find((s) => s.id === sessionId);
+      if (session) {
+        get().setCurrentProject(session.projectId);
+        get().openTab(session.projectId, sessionId);
+        get().setWorkspaceTab(session.projectId, sessionId);
+      }
+    },
+
+    async loadPastSession(sessionId: string, force = false): Promise<void> {
+      if (force) {
+        // Retry after a failed load: the stale view would otherwise
+        // short-circuit this into a no-op.
+        const { [sessionId]: _, ...views } = get().views;
+        set({ views });
+        get().clearRunError(sessionId);
+      }
+      if (!get().views[sessionId]) {
+        await ensureSubscribed(sessionId);
+      }
+    },
+
+    async deleteSession(sessionId: string): Promise<void> {
+      const session = get().sessions.find((s) => s.id === sessionId);
+      if (session?.externalWriter) {
+        throw new Error(
+          i18n._("Session ownership must be idle before deleting it."),
+        );
+      }
+      await getClient().command("session.delete", { sessionId });
+      // The broadcast follows; the reply is proof enough to forget it.
+      if (session) get().forgetSession(sessionId, session.projectId);
+    },
+
+    async recoverSession(sessionId: string, action: "restore" | "discard"): Promise<void> {
+      if (get().sessions.find((session) => session.id === sessionId)?.externalWriter) {
+        throw new Error(
+          i18n._("Session ownership must be idle before recovery."),
+        );
+      }
+      if (action === "restore") {
+        await getClient().command("session.restore", { sessionId });
+      } else {
+        const result = await getClient().command("session.discard", { sessionId });
+        const session = get().sessions.find((s) => s.id === sessionId);
+        if (result.removed && session) get().forgetSession(sessionId, session.projectId);
+        else await get().loadPastSession(sessionId, true);
+      }
+    },
+
+    forgetSession(sessionId: string, projectId: string): void {
+      get().removeAttachmentFiles(`session:${sessionId}`);
+      // The tab first: closing lands the reader on a neighbour, never
+      // on nothing (run-view-47).
+      get().closeTab(projectId, sessionId);
+      backfilling.delete(sessionId);
+      refoldPending.delete(sessionId);
+      const state = get();
+      const { [sessionId]: _view, ...views } = state.views;
+      const { [sessionId]: _composer, ...composers } = state.composers;
+      const { [sessionId]: _error, ...runErrors } = state.runErrors;
+      const { [sessionId]: _staged, ...stagedIntents } = state.stagedIntents;
+      const { [sessionId]: _lanes, ...collapsedLanes } = state.collapsedLanes;
+      set({
+        sessions: state.sessions.filter((s) => s.id !== sessionId),
+        views,
+        composers,
+        runErrors,
+        stagedIntents,
+        collapsedLanes,
+        activeSessionId:
+          state.activeSessionId === sessionId
+            ? undefined
+            : state.activeSessionId,
+      });
+    },
+
+    async submitSessionControl(
+      sessionId: string,
+      kind: "recovery" | "ending",
+      actionId?: string,
+    ): Promise<void> {
+      const state = get();
+      const session = state.sessions.find((s) => s.id === sessionId);
+      if (session?.externalWriter) {
+        throw new Error(
+          i18n._("Session ownership must be idle before sending a message."),
+        );
+      }
+      if (session?.recovery && !session.turnActive) {
+        throw new Error(
+          i18n._("Restore the interrupted turn before sending another message."),
+        );
+      }
+      try {
+        if (session && !session.live) await ensureSubscribed(sessionId);
+        await getClient().command("session.control", {
+          sessionId,
+          kind,
+          ...(actionId !== undefined ? { actionId } : {}),
+        });
+      } catch (cause) {
+        const error = cause as { code?: string; message: string };
+        // A control turn is never queued: the control it names may not
+        // be advertised by the time a queued turn would run.
+        setRunError(sessionId, error.message);
+        throw cause;
+      }
+    },
+
+    async submitBossText(sessionId: string, text: string, attachments?: readonly MediaAsset[]): Promise<void> {
+      const state = get();
+      const session = state.sessions.find((s) => s.id === sessionId);
+      if (session?.externalWriter) {
+        throw new Error(
+          i18n._("Session ownership must be idle before sending a message."),
+        );
+      }
+      if (session?.recovery && !session.turnActive) {
+        throw new Error(
+          i18n._("Restore the interrupted turn before sending another message."),
+        );
+      }
+      const view = state.views[sessionId];
+      // A staged intent dispatches with the text that carries it
+      // (DR-035); the chip leaves the composer either way — riding
+      // the queued entry, or consumed by the submission.
+      const staged = state.stagedIntents[sessionId];
+      const intentId = staged?.intentId;
+      const consumeStaged = () => {
+        if (staged) get().clearStagedIntent(sessionId);
+      };
+      if (session?.live !== false && (session?.turnActive ?? view?.turnActive)) {
+        throw new Error(i18n._("Captain is working. Wait for the turn to finish."));
+      }
+      try {
+        // The runtime is held only for a turn (DR-051): a message to a
+        // session that is not live opens it again, and the connection
+        // re-subscribed only live sessions, so this one's records need
+        // a subscription before the turn they belong to.
+        if (session && !session.live) await ensureSubscribed(sessionId);
+        await getClient().command("turn.submit", {
+          sessionId,
+          text,
+          ...(attachments ? { attachments: [...attachments] } : {}),
+          ...(intentId !== undefined ? { intentId } : {}),
+        });
+        consumeStaged();
+      } catch (cause) {
+        const error = cause as { code?: string; message: string };
+        setRunError(sessionId, error.message);
+        throw cause;
+      }
+    },
+
+    async loadLedger(): Promise<void> {
+      // Replies apply in request order (dashboard-42): an older read
+      // landing after a newer one is discarded, never applied.
+      const read = (ledgerReads += 1);
+      try {
+        const ledger = await getClient().command("ledger.get", {});
+        if (read !== ledgerReads) return;
+        set({ ledger, ledgerError: undefined });
+      } catch (cause) {
+        if (read !== ledgerReads) return;
+        set({ ledgerError: (cause as Error).message });
+      }
+    },
+
+    async loadHistory(projectId: string, more = false): Promise<void> {
+      const current = get().history[projectId];
+      const cursorRow = more
+        ? current?.intents[current.intents.length - 1]
+        : undefined;
+      set({
+        history: {
+          ...get().history,
+          [projectId]: {
+            intents: current?.intents ?? [],
+            more: current?.more ?? false,
+            loading: true,
+          },
+        },
+      });
+      try {
+        const page = await getClient().command("ledger.history", {
+          projectId,
+          ...(cursorRow?.intent.closedAt !== undefined
+            ? {
+                before: {
+                  closedAt: cursorRow.intent.closedAt,
+                  intentId: cursorRow.intent.id,
+                },
+              }
+            : {}),
+        });
+        const kept = more ? (get().history[projectId]?.intents ?? []) : [];
+        set({
+          history: {
+            ...get().history,
+            [projectId]: {
+              intents: [...kept, ...page.intents],
+              more: page.more,
+            },
+          },
+        });
+      } catch {
+        const stale = get().history[projectId];
+        if (stale) {
+          set({
+            history: {
+              ...get().history,
+              [projectId]: { ...stale, loading: false },
+            },
+          });
+        }
+      }
+    },
+
+    async queueIntent(input): Promise<IntentInfo> {
+      const { attachments, ...rest } = input;
+      const intent = await getClient().command("intent.queue", { ...rest, ...(attachments?.length ? { attachments: [...attachments] } : {}) });
+      await get().loadLedger();
+      return intent;
+    },
+
+    async editIntent(intentId, text, attachments): Promise<void> {
+      await getClient().command("intent.edit", { intentId, text, ...(attachments ? { attachments: [...attachments] } : {}) });
+      await get().loadLedger();
+    },
+
+    async closeIntent(intentId, as): Promise<void> {
+      await getClient().command("intent.close", { intentId, as });
+      await get().loadLedger();
+    },
+
+    async reviewTurn(sessionId, turnId): Promise<void> {
+      await getClient().command("session.viewed", { sessionId, turnId });
+      sentMarkers.set(sessionId, turnId);
+      await get().loadLedger();
+    },
+
+    async removeIntent(intentId): Promise<void> {
+      await getClient().command("intent.remove", { intentId });
+      // The row leaves at once, from every page already loaded — the
+      // broadcast that follows re-reads the first page anyway.
+      const history = Object.fromEntries(
+        Object.entries(get().history).map(([projectId, page]) => [
+          projectId,
+          {
+            ...page,
+            intents: page.intents.filter((row) => row.intent.id !== intentId),
+          },
+        ]),
+      );
+      set({ history });
+      await get().loadLedger();
+    },
+
+    async stageDispatch(intent: IntentInfo): Promise<string> {
+      const title = contentTitle(intent);
+      // The project's current conversation is the lane Start reuses
+      // (run-view-86, DR-051): its context is the point of a session.
+      const current = currentSessionOf(get().sessions, intent.projectId);
+      if (current) {
+        await get().focusSession(current.id);
+        get().setDraft(current.id, intent.text);
+        get().stageAttachmentAssets(`session:${current.id}`, intentMediaOwner(intent), intent.attachments ?? []);
+        set({
+          stagedIntents: {
+            ...get().stagedIntents,
+            [current.id]: { intentId: intent.id, title },
+          },
+        });
+        return current.id;
+      }
+      // No conversation yet: stage the Captain home, where sending
+      // creates the session in the same motion (run-view-26).
+      get().setCurrentProject(intent.projectId);
+      get().setWorkspaceTab(intent.projectId, "start");
+      get().setHomeDraft(intent.text);
+      get().stageAttachmentAssets(`home:${intent.projectId}`, intentMediaOwner(intent), intent.attachments ?? []);
+      set({
+        stagedIntents: {
+          ...get().stagedIntents,
+          home: { intentId: intent.id, title },
+        },
+      });
+      return "home";
+    },
+
+    clearStagedIntent(key: string): void {
+      const { [key]: _, ...rest } = get().stagedIntents;
+      set({ stagedIntents: rest });
+    },
+
+    markViewed(sessionId: string): void {
+      // The marker names the very turn that summons (run-view-134).
+      // The fold raises a review entry only for a finished turn past
+      // the marker, so naming that turn is monotonic and can never
+      // name a turn in flight, which the core refuses anyway
+      // (core-service-48). With nothing summoning there is nothing to
+      // mark, and this is a no-op.
+      const entry = (get().ledger?.attention ?? []).find(
+        (item) => item.kind === "review" && item.sessionId === sessionId,
+      );
+      const turnId = entry?.turnId;
+      if (typeof turnId !== "number") return;
+      if (sentMarkers.get(sessionId) === turnId) return;
+      sentMarkers.set(sessionId, turnId);
+      void getClient()
+        .command("session.viewed", { sessionId, turnId })
+        .catch(() => {
+          // A refusal — the core's runtime or storage refusing the
+          // write — leaves the condition standing: the next fold push
+          // asserts it again (core-service-48, core-service-86).
+          if (sentMarkers.get(sessionId) === turnId) {
+            sentMarkers.delete(sessionId);
+          }
+        });
+    },
+
+    removeQueued(sessionId: string, index: number): void {
+      const composer = get().composers[sessionId];
+      if (!composer) return;
+      set({
+        composers: {
+          ...get().composers,
+          [sessionId]: {
+            ...composer,
+            queued: composer.queued.filter((_, i) => i !== index),
+          },
+        },
+      });
+    },
+
+    async abortTurn(sessionId: string): Promise<void> {
+      try {
+        await getClient().command("turn.abort", { sessionId });
+      } catch (cause) {
+        setRunError(
+          sessionId,
+          i18n._("abort failed: {reason}", {
+            reason: (cause as Error).message,
+          }),
+        );
+      }
+    },
+
+    clearRunError(sessionId: string): void {
+      const { [sessionId]: _, ...rest } = get().runErrors;
+      set({ runErrors: rest });
+    },
+
+    setDraft(sessionId: string, draft: string): void {
+      const composer = get().composers[sessionId] ?? { queued: [] };
+      set({
+        composers: {
+          ...get().composers,
+          [sessionId]: { ...composer, draft },
+        },
+      });
+    },
+
+    setHomeDraft(draft: string): void {
+      set({ homeDraft: draft });
+    },
+
+    async abortCompile(): Promise<void> {
+      const active = get().activeCompile;
+      if (!active?.running) return;
+      try {
+        await getClient().command("compile.abort", {
+          playbookId: active.playbookId,
+        });
+      } catch (cause) {
+        const progress = get().compileProgress;
+        set({
+          compileProgress: {
+            ...progress,
+            [active.playbookId]: [
+              ...(progress[active.playbookId] ?? []),
+              i18n._("✗ cancel failed: {reason}", {
+                reason: (cause as Error).message,
+              }),
+            ],
+          },
+        });
+      }
+    },
+
+    // -----------------------------------------------------------------
+    // Playbook drafts (DR-058)
+    // -----------------------------------------------------------------
+
+    async listDrafts(): Promise<void> {
+      const asked = draftEvents;
+      const listed = await getClient().command("draft.list", {});
+      // A draft heard of since the list was asked keeps what was heard.
+      const heardSince = (id: string) => (draftHeard.get(id) ?? 0) > asked;
+      for (const draft of Array.isArray(listed) ? listed : []) {
+        if (!heardSince(draft.id)) adoptDraft(draft);
+      }
+      const ids = new Set((Array.isArray(listed) ? listed : []).map((draft) => draft.id));
+      // One the list no longer names is gone, open workspace and all,
+      // unless something newer than the list was heard of it.
+      const state = get();
+      const known = new Set([...Object.keys(state.drafts), ...Object.keys(state.draftViews), ...(state.openDraftId ? [state.openDraftId] : [])]);
+      for (const id of known) {
+        if (!ids.has(id) && !heardSince(id)) forgetDraft(id);
+      }
+      set({ draftsLoaded: true });
+    },
+
+    async loadDraftDefaults(projectId: string): Promise<CommandResults["draft.defaults"]> {
+      return getClient().command("draft.defaults", { projectId });
+    },
+
+    async createDraft(draftId: string, fields: { org: string; license: string }): Promise<DraftInfo> {
+      const projectId = workingProject(get());
+      if (!projectId) throw new Error(draftNeedsProject());
+      const draft = await getClient().command("draft.create", { projectId, draftId, org: fields.org, license: fields.license });
+      adoptDraft(draft);
+      await get().openDraft(draft.id);
+      return draft;
+    },
+
+    async openDraft(draftId: string): Promise<void> {
+      noteDraftHeard(draftId);
+      set({ openDraftId: draftId });
+      // A draft opened this launch keeps its thread; the replay from
+      // its last seq brings only what it missed.
+      await ensureDraftSubscribed(draftId).catch(() => {
+        // The scoped diagnostic stands in place of the thread.
+      });
+    },
+
+    closeDraft(): void {
+      set({ openDraftId: undefined });
+    },
+
+    async sendDraft(draftId: string, text: string, attachments?: readonly MediaAsset[]): Promise<{ queued: boolean }> {
+      const instance = get().drafts[draftId]?.instance;
+      try {
+        const reply = await getClient().command("draft.send", { projectId: draftProject(draftId), draftId, instance: draftInstance(draftId), text, ...(attachments?.length ? { attachments: [...attachments] } : {}) });
+        if (isShown(draftId, instance)) get().clearDraftError(draftId);
+        return { queued: reply.queued };
+      } catch (cause) {
+        if (isShown(draftId, instance) || instance === undefined) setDraftError(draftId, (cause as Error).message);
+        throw cause;
+      }
+    },
+
+    async abortDraft(draftId: string): Promise<void> {
+      const instance = get().drafts[draftId]?.instance;
+      try {
+        await getClient().command("draft.abort", { projectId: draftProject(draftId), draftId, instance: draftInstance(draftId) });
+      } catch (cause) {
+        if (instance !== undefined && !isShown(draftId, instance)) return;
+        setDraftError(
+          draftId,
+          i18n._("abort failed: {reason}", {
+            reason: (cause as Error).message,
+          }),
+        );
+      }
+    },
+
+    async writeDraftSource(draftId, input) {
+      const instance = draftInstance(draftId);
+      const reply = await getClient().command("draft.source.write", {
+        projectId: draftProject(draftId),
+        draftId,
+        instance,
+        ...(input.content !== undefined ? { content: input.content } : {}),
+        ...(input.sourcePath !== undefined ? { sourcePath: input.sourcePath } : {}),
+        ...(input.baseVersion !== undefined ? { baseVersion: input.baseVersion } : {}),
+      });
+      // The broadcast follows; the Boss's own write is known to be theirs.
+      const current = get().draftSources[draftId];
+      if (isShown(draftId, instance) && (input.content !== undefined || current)) {
+        set({
+          draftSources: {
+            ...get().draftSources,
+            [draftId]: {
+              markdown: input.content ?? current?.markdown ?? "",
+              version: reply.version,
+              mtime: reply.mtime,
+              by: "you",
+            },
+          },
+        });
+      }
+      return reply;
+    },
+
+    async refreshDraftSource(draftId: string): Promise<DraftSourceState | null> {
+      const view = get().draftViews[draftId];
+      const instance = get().drafts[draftId]?.instance;
+      const reply = await getClient().command("draft.open", {
+        projectId: draftProject(draftId),
+        draftId,
+        // Only the source is wanted: records after the last seq are
+        // those the stream is already delivering.
+        afterSeq: view?.view.lastSeq ?? 0,
+      });
+      const source = reply.source
+        ? { markdown: reply.source.markdown, version: reply.source.version, mtime: reply.source.mtime }
+        : null;
+      // A reply for a session replaced meanwhile, or one the page no
+      // longer shows, changes nothing here.
+      if (!isShown(draftId, instance) || reply.draft.instance !== instance) return source;
+      adoptDraft(reply.draft);
+      set({ draftSources: { ...get().draftSources, [draftId]: source } });
+      return source;
+    },
+
+    async compileDraft(draftId: string): Promise<void> {
+      const instance = get().drafts[draftId]?.instance;
+      set({
+        compileProgress: { ...get().compileProgress, [draftId]: [] },
+        compileProgressAt: { ...get().compileProgressAt, [draftId]: [] },
+      });
+      try {
+        // Compiles run for minutes: no client timeout (DR-010 §5).
+        await getClient().command("draft.compile", { projectId: draftProject(draftId), draftId, instance: draftInstance(draftId) }, { timeoutMs: 0 });
+      } catch (cause) {
+        const error = cause as { code?: string; message: string };
+        // A failed phase and a cancel are told by the band from the
+        // draft's state; a refusal is a message to show.
+        if (error.code !== "aborted" && error.code !== "invalid_request" && (instance === undefined || isShown(draftId, instance))) {
+          setDraftError(draftId, error.message);
+        }
+      }
+    },
+
+    async abortDraftCompile(draftId: string): Promise<void> {
+      const instance = get().drafts[draftId]?.instance;
+      try {
+        await getClient().command("compile.abort", { playbookId: draftId, instance: draftInstance(draftId) });
+      } catch (cause) {
+        if (instance !== undefined && !isShown(draftId, instance)) return;
+        setDraftError(
+          draftId,
+          i18n._("cancel failed: {reason}", {
+            reason: (cause as Error).message,
+          }),
+        );
+      }
+    },
+
+    async registerDraft(draftId, input): Promise<void> {
+      const projectId = draftProject(draftId);
+      const instance = draftInstance(draftId);
+      const configState = await getClient().command("draft.register", {
+        projectId,
+        draftId,
+        instance,
+        command: input.command,
+        intent: input.intent,
+        bindings: input.bindings,
+        ...(input.newPlayers ? { newPlayers: input.newPlayers } : {}),
+        ...(input.repository ? { repository: input.repository } : {}),
+      });
+      // The session stays, to be worked on further and published; the
+      // list opens with the new card in view (playbook-library-61).
+      // The config it wrote is everyone's; the workspace closes only if
+      // it still shows the session that enabled.
+      set({ configState });
+      void get().loadPlaybookLists(projectId).catch(() => {});
+      if (!isShown(draftId, instance) || get().openDraftId !== draftId) return;
+      set({ revealPlaybook: draftId, openDraftId: undefined });
+    },
+
+    async setDraftPlayer(draftId, playerId): Promise<void> {
+      const instance = draftInstance(draftId);
+      const draft = await getClient().command("draft.player.set", { projectId: draftProject(draftId), draftId, instance, playerId });
+      if (isShown(draftId, instance)) adoptDraft(draft);
+    },
+
+    async deleteDraft(draftId: string): Promise<void> {
+      // A file that will not read is deleted under its bytes' version.
+      const known = get().drafts[draftId];
+      const named = known?.instance ? { instance: known.instance } : { fileVersion: known?.fileVersion };
+      await getClient().command("draft.delete", { projectId: draftProject(draftId), draftId, ...named });
+      if (get().drafts[draftId]?.instance !== known?.instance) return;
+      forgetDraft(draftId);
+      void getClient().unsubscribe({ kind: "draft", draftId }).catch(() => {});
+    },
+
+    async loadDraftArtifacts(draftId: string): Promise<PlaybookArtifacts> {
+      const instance = get().drafts[draftId]?.instance;
+      const artifacts = await getClient().command("draft.artifacts", { projectId: draftProject(draftId), draftId });
+      if (instance === undefined || isShown(draftId, instance)) set({ draftArtifacts: { ...get().draftArtifacts, [draftId]: artifacts } });
+      return artifacts;
+    },
+
+    setDraftComposer(draftId: string, draft: string): void {
+      set({ draftComposers: { ...get().draftComposers, [draftId]: { draft } } });
+    },
+
+    setDraftSourceMode(draftId: string, mode: Partial<DraftSourceMode>): void {
+      const current = get().draftSourceModes[draftId] ?? {
+        mode: "view",
+        pasteText: "",
+        pastePath: "",
+      };
+      set({
+        draftSourceModes: {
+          ...get().draftSourceModes,
+          [draftId]: { ...current, ...mode },
+        },
+      });
+    },
+
+    setDraftEditor(draftId: string, editor: SpecEditorState | undefined): void {
+      const { [draftId]: _dropped, ...rest } = get().draftEditors;
+      set({ draftEditors: editor ? { ...rest, [draftId]: editor } : rest });
+    },
+
+    setDraftForm(draftId: string, form: DraftRegisterForm): void {
+      set({ draftForms: { ...get().draftForms, [draftId]: form } });
+    },
+
+    clearDraftError(draftId: string): void {
+      const { [draftId]: _dropped, ...rest } = get().draftErrors;
+      set({ draftErrors: rest });
+    },
+    reportDraftError(draftId: string, message: string): void {
+      setDraftError(draftId, message);
+    },
+
+    setDraftSplit(percent: number): void {
+      const clamped = Math.min(
+        DRAFT_SPLIT_MAX,
+        Math.max(DRAFT_SPLIT_MIN, Math.round(percent)),
+      );
+      set({ draftSplit: clamped });
+      safeStorageSet(prefKey(DRAFT_SPLIT_KEY), String(clamped));
+    },
+
+    setDraftStackSplit(percent: number): void {
+      const clamped = Math.min(
+        DRAFT_STACK_MAX,
+        Math.max(DRAFT_STACK_MIN, Math.round(percent)),
+      );
+      set({ draftStackSplit: clamped });
+      safeStorageSet(prefKey(DRAFT_STACK_SPLIT_KEY), String(clamped));
+    },
+
+    requestNewPlaybook(): void {
+      set({ newPlaybookRequested: true });
+    },
+
+    consumeNewPlaybookRequest(): boolean {
+      const requested = get().newPlaybookRequested;
+      if (requested) set({ newPlaybookRequested: false });
+      return requested;
+    },
+
+    consumeRevealPlaybook(): string | undefined {
+      const reveal = get().revealPlaybook;
+      if (reveal !== undefined) set({ revealPlaybook: undefined });
+      return reveal;
+    },
+
+    // -----------------------------------------------------------------
+    // Environments (playbook-library-1, playbook-library-92, DR-104)
+    // -----------------------------------------------------------------
+
+    async loadPlaybookLists(projectId: string | undefined): Promise<void> {
+      const read = (playbookListReads += 1);
+      const lists = await getClient().command(
+        "environment.playbooks",
+        projectId ? { projectId } : {},
+      );
+      if (read !== playbookListReads) return;
+      set({ playbookLists: { ...lists, projectId: projectId ?? null } });
+    },
+
+    async loadEnvironment(repository: string): Promise<void> {
+      try {
+        const state = await getClient().command("environment.get", { repository });
+        const { [repository]: _dropped, ...errors } = get().environmentErrors;
+        set({
+          environments: { ...get().environments, [repository]: state },
+          environmentErrors: errors,
+        });
+      } catch (cause) {
+        set({
+          environmentErrors: {
+            ...get().environmentErrors,
+            [repository]: (cause as Error).message,
+          },
+        });
+        throw cause;
+      }
+    },
+
+    // Each change is accepted at once; resolving and installing report
+    // through environment.state (environments-15, DR-010 §5).
+    async requestSpecPackage(repository, name, request): Promise<void> {
+      await getClient().command("environment.request", { repository, name, request });
+    },
+
+    async previewFolderPackage(repository: string, path: string): Promise<RequestPreview> {
+      const reply = await getClient().command("environment.request", {
+        repository,
+        request: { kind: "path", path },
+        dryRun: true,
+      });
+      return reply.preview ?? { name: null, version: null };
+    },
+
+    async removeSpecPackage(repository: string, name: string): Promise<void> {
+      await getClient().command("environment.remove", { repository, name });
+    },
+
+    async resolveEnvironment(repository: string): Promise<void> {
+      await getClient().command("environment.resolve", { repository });
+    },
+
+    async installEnvironment(repository: string): Promise<void> {
+      await getClient().command("environment.install", { repository });
+    },
+
+    async searchRegistry(repository: string, query: string): Promise<RegistryResult[]> {
+      const { packages } = await getClient().command("environment.search", { repository, query });
+      return packages;
+    },
+
+    async previewPublish(repository: string, name: string): Promise<PublishPreview> {
+      const reply = await getClient().command("environment.publish", {
+        repository,
+        name,
+        dryRun: true,
+      });
+      if (!reply.preview) {
+        throw new Error(i18n._("Spex could not read what this would publish."));
+      }
+      return reply.preview;
+    },
+
+    async publishSpecPackage(repository: string, name: string): Promise<void> {
+      await getClient().command("environment.publish", { repository, name });
+    },
+
+    async runCompile(input): Promise<void> {
+      const playbookId = input.playbookId;
+      // A compile writes its spec package inside a project's working
+      // folder (environments-10): the one named, else the current one.
+      const projectId = input.projectId ?? workingProject(get());
+      if (!projectId) throw new Error(draftNeedsProject());
+      set({
+        activeCompile: { playbookId, running: true },
+        compileProgress: { ...get().compileProgress, [playbookId]: [] },
+      });
+      const appendLine = (line: string) => {
+        const progress = get().compileProgress;
+        set({
+          compileProgress: {
+            ...progress,
+            [playbookId]: [...(progress[playbookId] ?? []), line],
+          },
+        });
+      };
+      try {
+        // Compiles legitimately run for minutes: no client timeout
+        // (DR-010 §5) — a dropped socket still rejects the call.
+        await getClient().command("compile.run", { ...input, projectId }, { timeoutMs: 0 });
+        appendLine(i18n._("✓ compiled and registered — see Configured playbooks"));
+        set({ activeCompile: { playbookId, running: false, ok: true } });
+      } catch (cause) {
+        const error = cause as { code?: string; message: string };
+        // A user cancel already ends the log with the ◇ line.
+        if (error.code === "aborted") {
+          set({ activeCompile: { playbookId, running: false, ok: false } });
+          return;
+        }
+        appendLine(`✗ ${error.message}`);
+        set({ activeCompile: { playbookId, running: false, ok: false } });
+        throw cause;
+      }
+    },
+  };
+}
+
+/** Make the store of one core (run-view-168): `client` a client already
+ * in place, `endpoint` what `connect()` dials when it names none — a
+ * seat's relay path (core-service-129), the local core's by default. */
+export function createAppStore(
+  place: Place,
+  client?: SpexClient,
+  options: { endpoint?: string } = {},
+): AppStore {
+  const seams = {} as PlaceSeams;
+  const store = create<AppState>((set, get) =>
+    placeState(place, client, options.endpoint, seams, set, get),
+  );
+  return Object.assign(store, seams, { place });
+}
+
+/** The local place's store (run-view-168): the one every surface reads,
+ * made on import so the page's language is settled before the first
+ * render (localization-3). */
+export const useAppStore = createAppStore(LOCAL_PLACE);
+
+/** The local store's client. */
+export function getClient(): SpexClient {
+  return useAppStore.getClient();
+}
+
+/** Test seam: store actions resolve the local store's client, which
+ * module mocks cannot reach — vitest injects a fake through here. */
+export function setClientForTests(fake: SpexClient | undefined): void {
+  useAppStore.setClient(fake);
+}
+
+/** Test seam: hand the local store a server message as the client
+ * would, without a socket. */
+export function deliverServerMessageForTests(message: ServerMessage): void {
+  useAppStore.deliver(message);
+}

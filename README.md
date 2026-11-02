@@ -1,93 +1,297 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <!-- SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai> -->
 
-# spex
+# Spex: the spec-first IDE
 
 [![npm version](https://img.shields.io/npm/v/@sublang/spex)](https://www.npmjs.com/package/@sublang/spex)
 [![Node.js](https://img.shields.io/node/v/@sublang/spex)](https://nodejs.org/)
 [![CI](https://github.com/sublang-ai/spex/actions/workflows/ci.yml/badge.svg)](https://github.com/sublang-ai/spex/actions/workflows/ci.yml)
 
-*The essential spec layer AI agents need to build software reliably.*
+*Specs are the source.*
 
-Scaffolds a `specs/` directory so AI coding agents can read and follow
-your project's requirements and design.
+Spex brings specs and AI workflows into one IDE. Reuse a spec and its
+skills or playbooks as a versioned **spec package**: find and publish
+packages on [Spex Space](https://spex.sublang.ai), and install them from
+the IDE. Space also offers optional project-record sharing and sync.
 
-## Install
+## Why Spex
+
+When programming shifts from code to specifications, four problems keep
+showing up:
+
+1. **Flat, lengthy spec text** burdens people and AI alike. Ambiguity,
+   redundancy, and inconsistency hide in prose.
+2. **Skills written in natural language drift.** Editing and managing them
+   is unpredictable, so long-running tasks are hard to trust.
+3. **A single agent's work is often defective** and cannot be delivered with
+   confidence.
+4. **Supervising several agents is exhausting.** Attention scatters, intents
+   get forgotten, and the mental burden grows.
+
+Spex answers each with one systematic design:
+
+1. **Structured specs.** Requirements become itemized, normalized statements,
+   grouped into spec packages that cite one another. The structure exposes
+   ambiguity and redundancy, drives out inconsistency, and gives the system's
+   concept design high cohesion and loose coupling: the ground for long-term
+   maintainability.
+2. **A natural-language compiler.** A workflow described in prose compiles
+   into a state machine whose predefined states and transitions form a
+   deterministic control mechanism. Agents act within those boundaries, so
+   long tasks run reliably.
+3. **Playbooks of mutually checking agents.** Several agents on several LLMs
+   challenge and verify each other, cutting hallucinations and defects before
+   delivery.
+4. **A Dashboard that decouples intents from sessions.** Work is organized
+   around what you intend rather than around chats, which sharply lowers the
+   mental burden.
+
+## Getting started
+
+Follow [Start using Spex](docs/getting-started.md) to open a project,
+install a spec package, use its skills and playbooks, and author and
+publish a workflow of your own.
+
+To set up a team or a workshop — where groups are made, who shares what, where a package publishes — read [docs/groups.md](docs/groups.md).
+
+Requires Node.js 22.19 or later. The desktop compiles playbooks on the Node
+inside its Electron; the server shell compiles them only when its Node, or a
+`node` on `PATH`, is 23.6 or later.
+
+**1. Scaffold `specs/` in your project.**
 
 ```sh
-npm install -g @sublang/spex
+npx @sublang/spex scaffold                        # create specs/
+npx @sublang/spex scaffold --agents=claude,codex  # choose coding agents
+npx @sublang/spex scaffold --lang zh              # Chinese templates where available
+npx @sublang/spex scaffold --update               # refresh the scaffold
+npx @sublang/spex lint                            # check the tree
 ```
 
-Or run once without installing:
+The scaffold holds decision records, intent records, and one Markdown file
+per spec package, each stating its intent, External Behavior, optional
+Internal Behavior, and Verification
+([meta-30](specs/meta.md#meta-30),
+[DR-000](specs/decisions/000-spec-structure-format.md)).
+It also installs a managed specs section in the instruction file of each
+chosen agent: `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`
+([scaffold-5](specs/packages/scaffold.md#scaffold-5)).
+`spex lint` checks layout, sections, IDs, citations, records, and the map
+([lint-3](specs/packages/lint.md#lint-3)).
+`--update` needs a clean `specs/` tree, refreshes Spex-owned files, and
+prints an agent prompt for the judgment work, including migration of a
+spex 0.x tree ([scaffold-11](specs/packages/scaffold.md#scaffold-11),
+[scaffold-26](specs/packages/scaffold.md#scaffold-26)).
+The instruction files the scaffold installs tell agents to run
+`npx @sublang/spex lint`, or `spex lint` where the CLI is installed
+(`npm install -g @sublang/spex`)
+([scaffold-56](specs/packages/scaffold.md#scaffold-56)).
+
+**2. Develop through playbook workflows that keep the specs in sync.**
+Use the built-ins, typically `/decide` to record a decision and `/code` to
+implement an intent under review, or compile your own workflow from prose
+in the IDE with the [`slc`](https://github.com/sublang-ai/slc) it ships.
+
+**3. Work in the Spex IDE**, where specs, playbook runs and compilation, and
+the intent Dashboard live together. Desktop downloads are available on
+[GitHub Releases](https://github.com/sublang-ai/spex/releases): a macOS
+M-series DMG (open it and drag Spex.app to Applications) and a Windows
+x86-64 per-user installer for 64-bit Intel/AMD PCs (no WSL required).
+Each release includes SHA-256 checksums. These builds are unsigned and the macOS app is not notarized;
+the operating system may require approval before opening.
+Desktop and server hosts require a filesystem with private POSIX
+permissions or supported private Windows ACLs.
+To run from source:
 
 ```sh
-npx @sublang/spex scaffold
+git clone https://github.com/sublang-ai/spex.git
+cd spex
+npm ci
+npm start
 ```
 
-## Usage
+`npm ci` fetches the packages and the first `npm start` fetches the
+Electron binary, so the first run needs the network. `npm start` builds
+the workspaces, rebuilds the `better-sqlite3` native module for Electron
+from source, and launches the desktop app; the rebuild needs a C/C++
+toolchain — the Xcode Command Line Tools on macOS, Python 3, `make` and
+`g++` on Linux. Native Windows uses bundled Node SQLite and skips that ABI rebuild.
+Real playbook runs need a ready coding-agent adapter: Claude Code signed
+in (run `claude` once in a terminal, or set `ANTHROPIC_API_KEY`) or Codex
+signed in (`codex`, or `OPENAI_API_KEY`); the SDKs in this checkout do
+not sign you in. Settings → Agents shows each adapter's readiness and
+what it still needs. Compiling playbooks needs only a ready adapter,
+since the compiler is installed in this checkout.
+The Claude, Codex and OpenCode SDKs are pinned by `package-lock.json` to
+the releases Cligent tests; `npm ci` restores them, and is the app's own
+repair when one is missing.
+
+**First run.** A fresh home shows a welcome page. Choose **Add a local
+project** to select an existing Git repository, or expand **Create a new
+project…** in that flow to make one with a `specs/` scaffold. **Open the
+Academy example** opens the included sample project. Once a project is
+selected, describe your goal to the Captain; type `/` in the task field
+to see enabled playbooks and their descriptions, such as `/decide`,
+`/code`, and `/review`.
+Project creation and coding workflows make Git commits, so configure
+`user.name` and `user.email` first. The issue and PR panels and the Dashboard's Sources on a
+GitHub remote need `gh auth login`. Config and sessions live in the
+Spex home — `~/.spex`, or `SPEX_HOME` — in spex repositories under
+`workspace/`: each project's records in its own, and your config at
+`workspace/<you>/<you>-spex/config/playbook.config.yaml`
+([storage](docs/storage.md)).
+
+**Shared session upgrades.** Spex requires Playbook 18 for bounded session
+persistence. Before upgrading a shared home, stop every older desktop, server
+and Playbook CLI writer, snapshot the home, and upgrade them together.
+Monolithic schema-7 sessions remain readable; continuing one requires explicit
+`playbook migrate-session <id>` with configuration selecting that clone's
+session store. The [storage guide](docs/storage.md#migration-and-definitions)
+describes the retained originals and migration boundaries.
+
+**Playbooks come in packages.** A project's `spex.yaml` lists the
+packages it adds — specs with the skills and playbooks made from them —
+from a registry, a Git repository or a folder in the project, and
+`spex.lock` records the exact versions installed
+([package format](specs/packages/environments.md)). Their skills reach
+every agent Spex runs: a project folder's `.claude/skills` for Claude
+Code and `.agents/skills` for Codex, Gemini CLI, Kimi Code and OpenCode,
+and, for your Personal packages, the same folders in your home folder.
+A package's spec is placed in the project's `specs/packages/`, beside
+its own specs. The app ships the built-in playbooks, `sublang/playbooks`,
+which hold `/code`, `/review`, `/decide` and the others: the first start
+seeds them, so they run offline, and every project has them. A
+project's **Packages** tab adds, updates, removes and publishes its
+packages; its **Playbooks** tab shows the playbooks they provide, and
+enables one when you choose a player for each of its roles.
+
+**Publish and install through Spex Space.** Browse public packages
+without an account: on a project's **Packages** tab, choose **Add…**,
+search on **Registry**, pick a version and choose **Add**. Adding
+installs a package and places its skills for your agents and its spec
+in `specs/`; enable a playbook it provides on the **Playbooks** tab by
+choosing a player for each role. Author a workflow through
+**New playbook**, compile it, and **Publish** it after signing in to the
+registry with access to its org.
+See the [package guide](docs/getting-started.md#install-and-use-a-package).
+For a spec-only or skill package, prepare a valid folder in the
+project, add it with **Add… → Folder**, then choose **Publish** on its
+row. Review the preview and confirm with your registry sign-in; no
+compilation or separate API token is needed. See
+[publishing packages](docs/getting-started.md#publish-specs-skills-and-playbooks),
+or the optional [HTTP guide](https://spex.sublang.ai/llms.txt) for automation.
+Registry search lists public packages. For a known public or private
+package, type its `org/name` on **Add… → Registry** with a version such
+as `1.2.3` or `^1.2.3`. Private packages need a sign-in with access. The
+[`spex` command line](packages/cli/README.md) does the same from a
+terminal, with no app running.
+
+**Optional project-record sharing.** Sign in on **Space** when you want
+to sync records with a group. The default is [Spex Space](https://spex.sublang.ai) unless
+`SPEX_HOST_URL` names another when the home is first created. The desktop
+opens the Space's sign-in page in your browser; the server shell links
+to the browser approval page. Spex then syncs your Personal records to
+the Space, and a project's records once you add it to a group; a
+group's members see its records. Git gets the Space's credential
+through Spex's own credential helper, run on the app's own runtime,
+never through a remote URL, and this computer's sign-in stays in
+`local/credentials.yaml`, readable by you alone
+([git-host](specs/packages/git-host.md),
+[DR-103](specs/decisions/103-the-home-and-its-groups.md)).
+
+App releases on [GitHub Releases](https://github.com/sublang-ai/spex/releases)
+(`app-v*` tags) build both native desktop downloads from the tagged source;
+a failed platform build prevents publication. Source remains available:
+check out the tag and run the commands above.
+The clone commands above follow current `main`;
+release tags keep their tagged behavior. In particular,
+`app-v0.9.0-beta.16` predates the current Space address default, so check
+the Space's address before signing in. Existing homes keep their saved
+addresses.
+
+To use Spex from another machine, run the server shell instead. It serves
+the UI and the core on one port behind a token in the URL, binds loopback by
+default, and prints an SSH tunnel line; a public bind needs
+`--tls-cert`/`--tls-key`
+([server-shell-1](specs/packages/server-shell.md#server-shell-1),
+[server-shell-2](specs/packages/server-shell.md#server-shell-2)).
 
 ```sh
-spex scaffold
+npm run start:server     # prints http://127.0.0.1:8137/?token=...
 ```
 
-This creates:
+The [`spex` CLI](packages/cli/README.md) needs no server. It adds,
+installs and publishes spec packages on a folder's own files, which the
+server reads at its next use when the folder is one of its projects.
 
-- **`specs/`** — directories and starter templates for writing behavioral
-  specs, decision records, and iteration plans
-- **`CLAUDE.md` / `AGENTS.md`** — instructions that tell AI agents (Claude,
-  Codex, etc.) to read and follow the specs before writing code
+Options take the `--name=value` or `--name value` form after `--` —
+`--host`, `--port` (default 8137), `--token` or `SPEX_TOKEN`, `--data-dir`
+or `SPEX_HOME`, `--tls-cert`/`--tls-key`, and `--insecure` — e.g.
+`npm run start:server -- --port=0`.
 
-See `specs/decisions/000-spec-structure-format.md` for the spec format and naming conventions.
+## Files and browser tools
 
-Idempotency: Rerunning is safe — existing files and directories are skipped.
+Attach files with the composer's file button, paste an image, or drop files
+onto the composer. The same controls work for a new conversation, a
+follow-up, queued work, and playbook authoring. Files finish uploading
+before submission; failed uploads can be retried, and a refused submission
+keeps its text and files. A file-only message is accepted and the Captain
+can ask what you want done with it. Each file may be up to 100 MiB; one
+message may contain up to 16 files and 256 MiB total. The selected agent
+and model determine which formats they can interpret. Attachment-bearing sessions
+also require every writer sharing the store to support that format.
 
-**Try it:** review the sample iteration `specs/iterations/000-spdx-headers.md`, update the copyright text, then prompt your AI coding agent:
+For browser work, open the working agent in Settings → Agents, choose
+**Set up browser**, and then enable **Browser** and save. Setup checks the
+execution host, downloads missing managed Chromium components, and proves
+that an isolated headless browser can launch and take a screenshot.
+The first download can take several minutes; setup allows up to fifteen
+minutes and can be cancelled while it runs.
+Checking readiness does not enable access. Conversation agent settings can
+override the choice for the next turn or return to the saved setting.
+Authoring uses the selected agent's saved setting and offers the same setup
+check beside its selector. No MCP package or command needs to be chosen.
 
-```text
-Complete Iteration #0
-```
+Use `/inspect` for a task such as “Open my local app and explain its UX with
+screenshots.” An existing home finds it on **Playbooks** among the built-in
+spec package's playbooks: choose a player for its Inspector role and select
+**Enable**. Enable Browser for the worker assigned to Inspect; the Captain's
+routing calls stay tool-free.
+Start the app first and include its
+URL. Native figures returned by a supported agent appear in the conversation
+and remain available when it reopens. Browser readiness is separate from
+agent sign-in, model vision support, and the target app's availability.
 
-### Updating templates
+On a remote server, the browser runs on that server: `localhost` refers to
+the server, while files selected in your browser are uploaded as bytes.
+A graphical desktop is unnecessary. Missing Linux libraries or a host
+policy that prevents Chromium's sandbox produces a setup diagnostic;
+setup installs no operating-system packages and does not weaken the sandbox.
+An administrator must resolve those host prerequisites before retrying.
+This Browser control does not grant control of arbitrary desktop apps.
 
-When a new release ships updated templates, refresh them with:
+See [Approvals and human decisions](docs/approvals.md) for one-time tool
+permissions, workflow questions, Codex's access-to-Spex prompt, and OS grants.
 
-```sh
-spex scaffold --update
-```
+## Repository
 
-- Spex-authoritative files (`specs/meta.md` and the spec-format decision record) are refreshed unconditionally, including when they are absent.
-- Starter files (`map.md`, the sample iteration, boilerplate items) are refreshed when you have not customized them, and written from the bundled template when they are absent. Customized starter files are kept as-is. Remove a starter file *after* `--update` if you do not want it.
-- Anything you authored outside the bundled framework and starter files is left alone.
+| Path | Purpose |
+| --- | --- |
+| [`specs/`](specs) | Source of truth for this repository; start at the [spec map](specs/map.md) |
+| [`scaffold/`](scaffold), [`packages/cli`](packages/cli) | Shipped templates and the npm CLI |
+| [`packages/core`](packages/core), [`packages/ui`](packages/ui) | Headless service and protocol-only web UI |
+| [`apps/desktop`](apps/desktop) | Electron shell, specified in [app-shell](specs/packages/app-shell.md) |
+| [`apps/server`](apps/server) | Server shell for remote browser access, specified in [server-shell](specs/packages/server-shell.md) |
+| [`demo/`](demo) | Academy example and spec-package case study |
 
-Review the changes with `git diff -- specs`.
-Update any citations that reference renamed sections or renumbered IDs — the command prints
-clear next steps and a copy-paste-ready prompt you can hand to your AI agent for that review.
+For development: `npm ci`, `npm run build`, `npm test`; `npm run e2e` drives
+the served UI through its user journeys in Chromium (after a one-time
+`npx playwright install chromium`). Maintainers also use the
+[release smoke checklist](docs/release-smoke.md).
 
-## Workflow
+Contributions are welcome through
+[issues](https://github.com/sublang-ai/spex/issues),
+[pull requests](https://github.com/sublang-ai/spex/pulls), and
+[Discord](https://discord.gg/XxTPjNqy9g).
 
-Spex does *not* enforce a heavyweight workflow.
-We believe spec-driven development is a flexible combination of a few primitives.
-
-1. **Make Decisions** — Discuss requirements, architecture, and design with AI agents. Let AI generate and review decision records in `specs/decisions/`.
-2. **Plan Iterations** — Break down work into tasks with AI agents. Let AI generate and review iteration records in `specs/iterations/`.
-3. **Agents Execute** — Let AI agents complete the tasks autonomously. They generate code and update `specs/user/`, `specs/dev/`, and `specs/test/`.
-
-Then loop back to the next decision or iteration.
-
-## Requirements
-
-- Node.js >= 20
-- Git (optional, used for repo root detection)
-
-## Contributing
-
-We welcome contributions of all kinds. If you'd like to help:
-
-- 🌟 Star our repo if you find spex useful.
-- [Open an issue](https://github.com/sublang-ai/spex/issues) for bugs or feature requests.
-- [Open a PR](https://github.com/sublang-ai/spex/pulls) for fixes or improvements.
-- Discuss on [Discord](https://discord.gg/XxTPjNqy9g) for support or new ideas.
-
-## License
-
-[Apache-2.0](LICENSE)
+Licensed under [Apache-2.0](LICENSE).
