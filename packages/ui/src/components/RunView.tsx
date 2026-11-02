@@ -1,0 +1,1087 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// The project session run view (RUN-1..12): Captain column with the
+// Boss composer docked below, player panes for the visible roster.
+
+import { ApprovalNotice } from "./ApprovalInbox.js";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  CAPTAIN_AGENT_ID,
+  type DerivedIntent,
+  type FailureCause,
+  type IntentSource,
+  type MediaAsset,
+  type PlaybookSummary,
+  type SessionInfo,
+} from "@sublang/spex-core/protocol";
+
+import type { CaptainLine, SessionView } from "../state/reducer.js";
+import type { ComposerState } from "../state/store.js";
+import {
+  CaptainPane,
+  type ReadinessHint,
+  type ThreadExtra,
+} from "./CaptainPane.js";
+import {
+  CAPTAIN_SPLIT_DEFAULT,
+  CAPTAIN_SPLIT_MAX,
+  CAPTAIN_SPLIT_MIN,
+} from "../state/store.js";
+import { usePlaceStore } from "../state/place-context.js";
+import { SessionRecovery } from "./SessionRecovery.js";
+import { currentLocale, i18n } from "../i18n.js";
+import { ParkedRun } from "./ParkedRun.js";
+import { Composer } from "./Composer.js";
+import { sessionAttachmentKey, useComposerAttachments } from "../lib/useComposerAttachments.js";
+import { DeliveryCard } from "./DeliveryCard.js";
+import { InlineConfirm } from "./InlineConfirm.js";
+import { MediaOwnerProvider } from "./StoredMedia.js";
+import { PlayerPane } from "./PlayerPane.js";
+import { AgentSettingsPopover } from "./AgentSettings.js";
+import { sessionAgents } from "../lib/session-agents.js";
+import { WorkingLine } from "./WorkingLine.js";
+import { parkedRun, type MachineFrame } from "../lib/machine-frames.js";
+import type { FailureContext } from "./FailureCard.js";
+import {
+  causeAdapterMessage,
+  causePhrase,
+  causePlayer,
+  causeStep,
+  readRecordFailure,
+} from "../lib/failure-catalogue.js";
+import { failureRecovery } from "../lib/labels.js";
+import { playerNamer } from "../lib/player-names.js";
+
+/** The cause the last failure the thread reported carried
+ * (run-view-147): the notices say why from the same reading the card
+ * draws, so no two surfaces explain one failure differently. */
+/** Whether the failure a run stands parked on is the Boss's own stop
+ * (run-view-186): the runtime moved it there with its `aborted` cause. */
+function abortedPark(frame: MachineFrame): boolean {
+  return frame.active === "failed" && frame.failureCode === "aborted";
+}
+
+/** The player a step's role is bound to in the run's configuration
+ * (run-view-185): the catalog's binding for that playbook and role. */
+function boundPlayer(configuration: unknown, playbookId: string, role: string): string | undefined {
+  const catalog = configuration && typeof configuration === "object"
+    ? (configuration as { catalog?: unknown }).catalog
+    : undefined;
+  const playbook = catalog && typeof catalog === "object"
+    ? (catalog as Record<string, unknown>)[playbookId]
+    : undefined;
+  const roles = playbook && typeof playbook === "object" ? (playbook as { roles?: unknown }).roles : undefined;
+  const binding = roles && typeof roles === "object" ? (roles as Record<string, unknown>)[role] : undefined;
+  const playerId = binding && typeof binding === "object" ? (binding as { playerId?: unknown }).playerId : undefined;
+  return typeof playerId === "string" && playerId ? playerId : undefined;
+}
+
+/** Scroll a pane's own scroll box to put `target` in its upper third,
+ * moving no other scroll (run-view-7), and light it briefly. */
+function bringIntoBox(target: HTMLElement | null | undefined): void {
+  if (!target) return;
+  let box: HTMLElement | null = target.parentElement;
+  while (box && !(box.scrollHeight > box.clientHeight && /(auto|scroll)/.test(getComputedStyle(box).overflowY))) {
+    box = box.parentElement;
+  }
+  if (box) {
+    const offset = target.getBoundingClientRect().top - box.getBoundingClientRect().top;
+    box.scrollTop += offset - box.clientHeight / 3;
+  }
+  target.dataset.flash = "1";
+  setTimeout(() => {
+    delete target.dataset.flash;
+  }, 1600);
+}
+
+function latestFailureCause(
+  lines: readonly CaptainLine[],
+): FailureCause | undefined {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (line.kind !== "status" && line.kind !== "error") continue;
+    const cause = readRecordFailure(line.data)?.cause;
+    if (cause) return cause;
+  }
+  return undefined;
+}
+
+
+/** The house divider (DR-030): the Captain/players split here, and
+ * the authoring workspace's split elsewhere (playbook-library-52). A
+ * machine drawing has a natural width that reflowing text does not, so
+ * the reader sets the split: drag it, nudge it by arrow key, or
+ * double-click to restore the default. Turned horizontal — between two
+ * stacked boxes — it is drawn as the capped frame's grip (DR-041 §9)
+ * and answers the vertical arrow keys. */
+export function SplitDivider({
+  percent,
+  onChange,
+  containerRef,
+  orientation = "vertical",
+  label,
+  testId = "captain-divider",
+  min = CAPTAIN_SPLIT_MIN,
+  max = CAPTAIN_SPLIT_MAX,
+  defaultPercent = CAPTAIN_SPLIT_DEFAULT,
+}: {
+  percent: number;
+  onChange(next: number): void;
+  containerRef: React.RefObject<HTMLDivElement | null>;
+  /** vertical: a rule between side-by-side panes; horizontal: a grip
+   * between stacked ones. */
+  orientation?: "vertical" | "horizontal";
+  /** The separator's accessible name. */
+  label?: string;
+  testId?: string;
+  min?: number;
+  max?: number;
+  defaultPercent?: number;
+}) {
+  const [dragging, setDragging] = useState(false);
+  const vertical = orientation === "vertical";
+
+  // The share is a percentage on a flex child, so it resolves against
+  // the container's content box and is then carried along by the gap
+  // before the divider. Measuring the border box instead left the rule
+  // up to 40px from the hand that was dragging it, which reads as a
+  // control that refuses to follow (DR-030, DR-041 §9).
+  function fromClient(clientX: number, clientY: number): number | undefined {
+    const el = containerRef.current;
+    if (!el) return undefined;
+    const box = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    if (vertical) {
+      const padLeft = parseFloat(style.paddingLeft) || 0;
+      const padRight = parseFloat(style.paddingRight) || 0;
+      const gap = parseFloat(style.columnGap) || 0;
+      const content = box.width - padLeft - padRight;
+      if (content <= 0) return undefined;
+      return ((clientX - box.left - padLeft - gap) / content) * 100;
+    }
+    const padTop = parseFloat(style.paddingTop) || 0;
+    const padBottom = parseFloat(style.paddingBottom) || 0;
+    const gap = parseFloat(style.rowGap) || 0;
+    const content = box.height - padTop - padBottom;
+    if (content <= 0) return undefined;
+    return ((clientY - box.top - padTop - gap) / content) * 100;
+  }
+
+  const [less, more] = vertical
+    ? ["ArrowLeft", "ArrowRight"]
+    : ["ArrowUp", "ArrowDown"];
+
+  return (
+    <div
+      data-testid={testId}
+      data-dragging={dragging ? "1" : "0"}
+      role="separator"
+      aria-orientation={orientation}
+      aria-label={label ?? i18n._("Resize the Captain pane")}
+      aria-valuenow={percent}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      tabIndex={0}
+      onPointerDown={(event) => {
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+        setDragging(true);
+      }}
+      onPointerMove={(event) => {
+        if (!dragging) return;
+        const next = fromClient(event.clientX, event.clientY);
+        if (next !== undefined) onChange(next);
+      }}
+      onPointerUp={(event) => {
+        event.currentTarget.releasePointerCapture?.(event.pointerId);
+        setDragging(false);
+      }}
+      onDoubleClick={() => onChange(defaultPercent)}
+      onKeyDown={(event) => {
+        if (event.key === less) onChange(percent - 2);
+        else if (event.key === more) onChange(percent + 2);
+        else if (event.key === "Home") onChange(defaultPercent);
+        else return;
+        event.preventDefault();
+      }}
+      // A 12px hit target around a 2px rule: reachable without
+      // becoming a visible bar (DR-010 §6). The horizontal form is the
+      // capped frame's 24px grip carrying a drawn handle (DR-010 §7).
+      className={
+        vertical
+          ? "group relative -mx-1.5 w-3 shrink-0 cursor-col-resize touch-none focus:outline-none"
+          : "group flex h-6 w-full shrink-0 cursor-row-resize touch-none items-center justify-center focus:outline-none"
+      }
+    >
+      <span
+        aria-hidden
+        className={
+          vertical
+            ? `absolute inset-y-0 left-1/2 w-0.5 -translate-x-1/2 rounded ${
+                dragging
+                  ? "bg-brand-500"
+                  : "bg-transparent group-hover:bg-neutral-300 group-focus:bg-brand-500 dark:group-hover:bg-neutral-700"
+              }`
+            : `h-1 w-8 rounded-full ${
+                dragging
+                  ? "bg-brand-500"
+                  : "bg-neutral-300 group-hover:bg-neutral-400 group-focus-visible:bg-brand-500 group-focus-visible:ring-2 group-focus-visible:ring-brand-400 dark:bg-neutral-700 dark:group-hover:bg-neutral-600"
+              }`
+        }
+      />
+    </div>
+  );
+}
+
+/** The player grid is the run's one sideways-scrolling canvas, so an
+ * edge that hides a pane says so: a hard cut reads as broken, a fade
+ * reads as "more this way" (run-view-7, DR-041). Either edge can hide
+ * one — the grid scrolls itself to the lane whose call opens — so each
+ * is faded only while a pane lies beyond it. */
+/** Bring one lane's pane into the grid's view by the grid's own offset
+ * alone (run-view-7), answering the pane it found. */
+function scrollLaneIntoGrid(grid: HTMLElement, playerId: string): HTMLElement | undefined {
+  const pane = Array.from(
+    grid.querySelectorAll<HTMLElement>('[data-testid^="player-pane-"]'),
+  ).find((el) => el.dataset.testid === `player-pane-${playerId}`);
+  if (!pane) return undefined;
+  const box = grid.getBoundingClientRect();
+  const rect = pane.getBoundingClientRect();
+  if (rect.left < box.left - 1) {
+    grid.scrollLeft -= box.left - rect.left;
+  } else if (rect.right > box.right + 1) {
+    grid.scrollLeft += Math.min(rect.right - box.right, rect.left - box.left);
+  }
+  return pane;
+}
+
+function markGridEdges(box: HTMLElement): void {
+  const before = box.scrollLeft > 1;
+  const beyond = box.scrollLeft + box.clientWidth < box.scrollWidth - 1;
+  box.style.setProperty("--fade-start", before ? FADE : "0px");
+  box.style.setProperty("--fade-end", beyond ? FADE : "0px");
+}
+
+/** How far an edge fades while it hides a pane; zero retires it. */
+const FADE = "24px";
+
+export function RunView({
+  session,
+  view,
+  composer,
+  connected,
+  error,
+  playbooks,
+  readOnly,
+  attention,
+  onStartNew,
+  onCompileNew,
+  onRetryLoad,
+  onRecover,
+  onDraftChange,
+  onSubmit,
+  onAbort,
+  onRemoveQueued,
+  onDismissError,
+  readinessHint,
+  focusTurn,
+  focusAt,
+  onFocusHandled,
+  onOpenAgentSettings,
+}: {
+  session: SessionInfo;
+  view: SessionView;
+  composer: ComposerState;
+  connected: boolean;
+  error?: string;
+  playbooks?: PlaybookSummary[];
+  /** Set while the Captain's adapter reports not ready: a live
+   * session's failure lines then link to Settings (run-view-2). */
+  readinessHint?: ReadinessHint;
+  /** History the core cannot continue (run-view-33): input replaced. */
+  readOnly?: boolean;
+  /** The kind of attention entry this session carries, from the one
+   * ledger fold (dashboard-9): the conversation names the act its
+   * summons asks for (run-view-135). */
+  attention?: "question" | "failure" | "finish" | "review";
+  onStartNew?: () => void;
+  onCompileNew?: () => void;
+  /** Retry a failed transcript load (read-only view). */
+  onRetryLoad?: () => void;
+  onRecover?: (action: "restore" | "discard") => Promise<void>;
+  onDraftChange?: (draft: string) => void;
+  onSubmit: (text: string, attachments?: readonly MediaAsset[]) => Promise<void>;
+  onAbort: () => void;
+  onRemoveQueued: (index: number) => void;
+  onDismissError: () => void;
+  /** Attention activation (run-view-91): land at this turn's place —
+   * its question bubble, failure line, or delivery card. */
+  focusTurn?: number;
+  /** The onset of a failure whose attention entry names no turn. */
+  focusAt?: number;
+  onFocusHandled?: () => void;
+  /** Open Settings at an agent's row (run-view-179, settings-52). */
+  onOpenAgentSettings?: (agentId: string) => void;
+}) {
+  const store = usePlaceStore();
+  const externalWriter = session.externalWriter;
+  const media = useComposerAttachments(sessionAttachmentKey(session.id), { kind: "project", id: session.projectId });
+  readOnly ||= !!externalWriter;
+  // Stop animation without closing the record fold's open text segment:
+  // another host can append its next delta while ownership is unknown.
+  const activityView = useMemo(() => view.turnActive ? view : {
+    ...view,
+    players: Object.fromEntries(Object.entries(view.players).map(([id, player]) => [id, {
+      ...player,
+      running: false,
+      segments: player.segments.map((segment) => segment.kind === "text"
+        ? { ...segment, streaming: false }
+        : segment),
+    }])),
+  }, [view]);
+  const machineGraphs = store((state) => state.machineGraphs);
+  // The configured values this conversation's own settings are read
+  // over (run-view-139): one source, so a chip and the editor it opens
+  // never disagree about the same agent.
+  const configSummary = store((state) =>
+    state.configState?.status === "valid" ? state.configState.summary : undefined,
+  );
+  const setAgentSettings = store((state) => state.setAgentSettings);
+  // One agent's editor, opened from that agent's own chip: the object
+  // the reader touched is the object they get (run-view-138, DR-068).
+  const [editingAgent, setEditingAgent] = useState<string | undefined>();
+  const settingsAnchorRef = useRef<HTMLButtonElement>(null);
+  // A failure's "Adjust" (run-view-179): the chip it points at while
+  // its lane comes into view, and the failure line a player with no
+  // lane opens the same editor from.
+  const [highlightedChip, setHighlightedChip] = useState<string | undefined>();
+  const [failureEditor, setFailureEditor] = useState<{ agentId: string; line: number } | undefined>();
+  const failureAnchorRef = useRef<HTMLButtonElement>(null);
+  const adjustTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  useEffect(() => () => adjustTimers.current.forEach(clearTimeout), []);
+  const captainSplit = store((state) => state.captainSplit);
+  const setCaptainSplit = store((state) => state.setCaptainSplit);
+  const ledger = store((state) => state.ledger);
+  const staged = store((state) => state.stagedIntents[session.id]);
+  const clearStagedIntent = store((state) => state.clearStagedIntent);
+  const submitSessionControl = store((state) => state.submitSessionControl);
+  const queueIntent = store((state) => state.queueIntent);
+  const closeIntent = store((state) => state.closeIntent);
+  const stageDispatch = store((state) => state.stageDispatch);
+  const collapsedLanes = store((state) => state.collapsedLanes[session.id]);
+  const setLaneCollapsed = store((state) => state.setLaneCollapsed);
+  const splitRef = useRef<HTMLDivElement>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
+
+  // The intents this session's turns are bound to (DR-035): the open
+  // fold serves them; a closed one survives below as a snapshot so its
+  // delivery card can resolve in place rather than vanish.
+  const bound = useMemo(
+    () =>
+      (ledger?.intents ?? []).filter(
+        (entry) => entry.intent.dispatched?.sessionId === session.id,
+      ),
+    [ledger, session.id],
+  );
+
+  // Finished intents seen here, kept after their verdict closes them
+  // (run-view-87: the card resolves in place). A released or re-worked
+  // intent leaves the map — its card no longer belongs in the thread.
+  const [delivered, setDelivered] = useState<Record<string, DerivedIntent>>({});
+  useEffect(() => {
+    if (!ledger) return;
+    setDelivered((previous) => {
+      const next = { ...previous };
+      let changed = false;
+      for (const entry of bound) {
+        if (entry.state === "finished") {
+          next[entry.intent.id] = entry;
+          changed = true;
+        } else if (previous[entry.intent.id]) {
+          delete next[entry.intent.id];
+          changed = true;
+        }
+      }
+      return changed ? next : previous;
+    });
+  }, [ledger, bound]);
+
+  // An intent's turn range runs from its dispatch turn up to the next
+  // dispatch in this session (DR-035).
+  const dispatchTurns = useMemo(() => {
+    const turns = new Set<number>();
+    for (const entry of bound) {
+      if (entry.intent.dispatched) turns.add(entry.intent.dispatched.turnId);
+    }
+    for (const entry of Object.values(delivered)) {
+      if (entry.intent.dispatched) turns.add(entry.intent.dispatched.turnId);
+    }
+    return [...turns].sort((a, b) => a - b);
+  }, [bound, delivered]);
+
+  function rangeOf(entry: DerivedIntent): [number, number] {
+    const from = entry.intent.dispatched?.turnId ?? 0;
+    const to =
+      dispatchTurns.find((turn) => turn > from) ?? Number.POSITIVE_INFINITY;
+    return [from, to];
+  }
+
+  // The working line (run-view-90): the newest open dispatched intent
+  // owns the conversation.
+  const workingIntent = useMemo(() => {
+    const open = bound.filter(
+      (entry) => entry.state === "working" || entry.state === "interrupted",
+    );
+    open.sort(
+      (a, b) => (b.intent.dispatched?.at ?? 0) - (a.intent.dispatched?.at ?? 0),
+    );
+    return open[0];
+  }, [bound]);
+
+  // The bound turn's Boss bubble wears the intent's source chip
+  // (run-view-89).
+  const bossSources = useMemo(() => {
+    const map = new Map<number, IntentSource>();
+    for (const entry of [...Object.values(delivered), ...bound]) {
+      const dispatched = entry.intent.dispatched;
+      if (dispatched && entry.intent.source) {
+        map.set(dispatched.turnId, entry.intent.source);
+      }
+    }
+    return map;
+  }, [bound, delivered]);
+
+  // The project's queue, oldest first: the core marks its oldest row
+  // next (run-view-87, core-service-107).
+  const projectQueue = useMemo(
+    () =>
+      (ledger?.intents ?? []).filter(
+        (entry) =>
+          entry.intent.projectId === session.projectId &&
+          entry.state === "queued",
+      ),
+    [ledger, session.projectId],
+  );
+  const nextUp = projectQueue.find((entry) => entry.next);
+
+  // Delivery cards anchored at each intent's final turn's end.
+  const extras = useMemo<ThreadExtra[]>(() => {
+    const list: ThreadExtra[] = [];
+    for (const entry of Object.values(delivered)) {
+      const [from, to] = rangeOf(entry);
+      let anchor = -1;
+      view.captain.forEach((line, index) => {
+        if (line.turnId !== null && line.turnId >= from && line.turnId < to) {
+          anchor = index;
+        }
+      });
+      if (anchor < 0) continue;
+      const stillOpen =
+        ledger?.intents.some((open) => open.intent.id === entry.intent.id) ??
+        true;
+      list.push({
+        key: `delivery-${entry.intent.id}`,
+        afterIndex: anchor,
+        focusKey: `card-${entry.intent.id}`,
+        node: (
+          <DeliveryCard
+            derived={entry}
+            closed={!stillOpen}
+            live={!readOnly}
+            ownsConversation={to === Number.POSITIVE_INFINITY}
+            next={nextUp}
+            onClose={(as) => closeIntent(entry.intent.id, as)}
+            onStartNext={(intent) => void stageDispatch(intent)}
+            onQueueNext={async (text) => {
+              await queueIntent({ projectId: session.projectId, text });
+            }}
+          />
+        ),
+      });
+    }
+    return list;
+    // rangeOf reads only state derived in this render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    delivered,
+    dispatchTurns,
+    view.captain,
+    ledger,
+    nextUp,
+    session,
+  ]);
+
+  // Where an attention activation should land (run-view-91): the
+  // delivery card, the question bubble, or the failure line of the
+  // named turn — a boss bubble as the last resort.
+  const focusKey = useMemo(() => {
+    if (focusAt !== undefined) {
+      const index = view.captain.findIndex((line) => line.kind === "error" && line.at === focusAt);
+      return index < 0 ? undefined : `line-${index}`;
+    }
+    if (focusTurn === undefined) return undefined;
+    // Finished intents straight from the ledger count before their
+    // card has folded into the delivered map, so the focus never
+    // lands on the wrong element in the interim.
+    const cards = new Map<string, DerivedIntent>();
+    for (const entry of bound) {
+      if (entry.state === "finished") cards.set(entry.intent.id, entry);
+    }
+    for (const entry of Object.values(delivered)) {
+      cards.set(entry.intent.id, entry);
+    }
+    for (const entry of cards.values()) {
+      const [from, to] = rangeOf(entry);
+      if (focusTurn >= from && focusTurn < to) return `card-${entry.intent.id}`;
+    }
+    for (const kind of ["question", "error", "boss"] as const) {
+      for (let index = view.captain.length - 1; index >= 0; index -= 1) {
+        const line = view.captain[index];
+        if (line.kind === kind && line.turnId === focusTurn) {
+          return `line-${index}`;
+        }
+      }
+    }
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusTurn, focusAt, bound, delivered, dispatchTurns, view.captain]);
+  // A pane is a player lane, not a moment (DR-032), but only once a
+  // call has reached it (DR-146): a bound player's lane appears with
+  // its first call record, in that order, and stays for the session's
+  // life, so a call that ends leaves its transcript where the reader
+  // last saw it and a player no call reached takes no place.
+  const roster = new Set(session.players.map((player) => player.id));
+  const lanes = view.calledPlayers.filter((playerId) => roster.has(playerId));
+  // The lanes the reader folded to rails (run-view-116): this
+  // session's, kept while the app runs. The store unfolds one whose
+  // call opens as it folds the record (run-view-117), so the pane
+  // that comes into view below is already whole.
+  const collapsed = new Set(collapsedLanes ?? []);
+  // A lane whose call just opened, or that just appeared, comes into
+  // view (run-view-7): the grid scrolls only as far as it must and
+  // only when the pane is out of sight, so a lane the reader is
+  // following never leaves under them and the working one never hides
+  // beyond the edge. A lane can appear with an event or its failure
+  // and never run, so its arrival counts as well as its running. Only
+  // the grid's own offset moves — scrollIntoView would carry the
+  // page and the Captain column along, pushing a question and its
+  // composer out of view in the stacked form.
+  const runningLanes = lanes
+    .filter((playerId) => activityView.players[playerId]?.running)
+    .join("\u0000");
+  const laneKey = lanes.join("\u0000");
+  const shownLanes = useRef(lanes);
+  useEffect(() => {
+    const grid = gridRef.current;
+    const appeared = lanes.filter((playerId) => !shownLanes.current.includes(playerId));
+    shownLanes.current = lanes;
+    const targets = [...(runningLanes ? runningLanes.split("\u0000") : []), ...appeared];
+    if (!grid || targets.length === 0) return;
+    for (const playerId of targets) scrollLaneIntoGrid(grid, playerId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runningLanes, laneKey]);
+  /** The reader asked for a lane (run-view-178/179): the grid scrolls
+   * to it as above, and in the stacked form the column scrolls to the
+   * grid, since the reader's own act asked to go there. */
+  const showLane = (playerId: string, callKey?: string): void => {
+    const grid = gridRef.current;
+    if (!grid) return;
+    if (collapsed.has(playerId)) setLaneCollapsed(session.id, playerId, false);
+    const pane = scrollLaneIntoGrid(grid, playerId);
+    pane?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    // At the call the line stands for (run-view-182, run-view-183).
+    if (callKey) {
+      setTimeout(() => bringIntoBox(
+        gridRef.current?.querySelector<HTMLElement>(`[data-call-block="${callKey}"]`),
+      ), 0);
+    }
+  };
+  /** A call's label leads back to its delegation line (run-view-181). */
+  const showDispatch = (callKey: string): void => {
+    bringIntoBox(document.querySelector<HTMLElement>(`[data-call-dispatch="${callKey}"]`));
+  };
+  // The fade must return with the content it hides (run-view-7): the
+  // grid's box changes with the divider and the rail, and a lane
+  // folding to a rail narrows the content under an unchanged box, so
+  // the panes are watched as well as the box.
+  const collapsedKey = (collapsedLanes ?? []).join("\u0000");
+  useEffect(() => {
+    const grid = gridRef.current;
+    if (!grid) return;
+    markGridEdges(grid);
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => markGridEdges(grid));
+    observer.observe(grid);
+    for (const pane of Array.from(grid.children)) observer.observe(pane);
+    return () => observer.disconnect();
+  }, [laneKey, collapsedKey, runningLanes]);
+  // No lane, no split (run-view-7): until a call reaches a player —
+  // or in a session whose roster binds none — the Captain reads as
+  // the Captain home does, one column at the home's measure, with no
+  // divider to nowhere.
+  const soloCaptain = lanes.length === 0;
+  const metaById = new Map(session.players.map((player) => [player.id, player]));
+  // This session's agents — the Captain and its players — with what
+  // each is set to run (run-view-138/139). The config summary is read
+  // here rather than fetched: the chip needs no second source.
+  const agentById = new Map(sessionAgents(session, configSummary).map((agent) => [agent.id, agent]));
+  const settingsReadOnly = readOnly || !!externalWriter;
+  // Each player's name over this session's roster (run-view-177).
+  const names = playerNamer(session.players.map((player) => player.id));
+  const captainName = i18n._({
+    id: "Captain",
+    comment: "the agent that routes the Boss's message to a playbook",
+  });
+  const agentName = (agentId: string): string =>
+    agentId === CAPTAIN_AGENT_ID ? captainName : names(agentId);
+  /** "Adjust ⟨name⟩" (run-view-179): the agent's own chip editor, from
+   * its chip where it stands — a player's lane unfolds and comes into
+   * view and the chip is pointed at first — else from the failure. */
+  const adjust = (agentId: string, line: number): void => {
+    adjustTimers.current.forEach(clearTimeout);
+    adjustTimers.current = [];
+    setFailureEditor(undefined);
+    if (agentId === CAPTAIN_AGENT_ID) {
+      setEditingAgent(agentId);
+      return;
+    }
+    if (!lanes.includes(agentId)) {
+      setEditingAgent(undefined);
+      setFailureEditor({ agentId, line });
+      return;
+    }
+    setEditingAgent(undefined);
+    setLaneCollapsed(session.id, agentId, false);
+    setHighlightedChip(agentId);
+    adjustTimers.current.push(
+      setTimeout(() => showLane(agentId), 0),
+      setTimeout(() => setEditingAgent(agentId), 400),
+      setTimeout(() => setHighlightedChip(undefined), 1600),
+    );
+  };
+  /** A failure's ways back to the agent it names (run-view-179). */
+  const recovery = (line: CaptainLine, index: number): React.ReactNode => {
+    if (line.kind !== "error" && line.kind !== "status") return null;
+    const reported = readRecordFailure(line.data);
+    if (line.kind === "status" && !reported) return null;
+    const player = line.agent ? undefined : causePlayer(reported?.cause);
+    const agentId = line.agent ?? player;
+    if (!agentId) return null;
+    const said = player
+      ? causeAdapterMessage(reported?.cause) ?? reported?.message ?? line.raw ?? line.text
+      : line.raw ?? line.text;
+    const kind = failureRecovery(said);
+    const name = agentName(agentId);
+    const canAdjust = kind === "unknown" && agentById.has(agentId) && !settingsReadOnly;
+    const canChange = (kind === "unknown" || kind === "settings") && !!onOpenAgentSettings;
+    if (!canAdjust && !canChange) return null;
+    const open = failureEditor?.agentId === agentId && failureEditor.line === index;
+    const agent = agentById.get(agentId);
+    const entry = "shrink-0 font-medium text-brand-600 hover:underline dark:text-brand-300";
+    return (
+      <span className="relative inline-flex flex-wrap items-baseline gap-x-2">
+        {canAdjust ? (
+          <button
+            type="button"
+            data-testid={`failure-adjust-${agentId}`}
+            ref={open ? failureAnchorRef : undefined}
+            aria-expanded={open}
+            onClick={() => adjust(agentId, index)}
+            title={i18n._("For this conversation, from the next message")}
+            className={entry}
+          >
+            {i18n._({ id: "Adjust {agent}", values: { agent: name }, comment: "a failure's way back: open this agent's settings for this conversation" })}
+          </button>
+        ) : null}
+        {canChange ? (
+          <button
+            type="button"
+            data-testid={`failure-settings-${agentId}`}
+            onClick={() => onOpenAgentSettings?.(agentId)}
+            title={i18n._("For new sessions")}
+            className={entry}
+          >
+            {i18n._({ id: "Change {agent} in Settings", values: { agent: name }, comment: "a failure's way back: open this agent's row in Settings" })}
+          </button>
+        ) : null}
+        {open && agent ? (
+          <AgentSettingsPopover
+            agent={agent}
+            context={{ kind: "project", id: session.projectId }}
+            readOnly={settingsReadOnly}
+            anchorRef={failureAnchorRef}
+            onSave={(change) => setAgentSettings(session.id, agentId, change)}
+            onClose={() => setFailureEditor(undefined)}
+          />
+        ) : null}
+      </span>
+    );
+  };
+  /** The props a pane needs to show its agent's chip and, while that
+   * chip is the open one, the editor hanging from it. */
+  const agentProps = (agentId: string) => {
+    const agent = agentById.get(agentId);
+    if (!agent) return {};
+    const open = editingAgent === agentId;
+    return {
+      settings: agent,
+      onEditSettings: () => setEditingAgent((current) => (current === agentId ? undefined : agentId)),
+      settingsOpen: open,
+      ...(open
+        ? {
+            settingsAnchorRef,
+            settingsPopover: (
+              <AgentSettingsPopover
+                agent={agent}
+                context={{ kind: "project", id: session.projectId }}
+                readOnly={settingsReadOnly}
+                anchorRef={settingsAnchorRef}
+                onSave={(change) => setAgentSettings(session.id, agentId, change)}
+                onClose={() => setEditingAgent(undefined)}
+              />
+            ),
+          }
+        : {}),
+    };
+  };
+  const title =
+    session.title ??
+    i18n._({
+      id: "new session",
+      comment: "stands as the title of a conversation that has none yet",
+    });
+  const uncertain = !externalWriter && !!session.recovery && !session.turnActive;
+  // The runtime is held only for a turn (DR-051): whether it is held
+  // is not the reader's business, so nothing here says "ended". Only
+  // history the core cannot continue is named, with when it last spoke.
+  const history = !externalWriter && readOnly && !uncertain;
+  const loadError = view.loadError ?? (readOnly && !uncertain ? error : undefined);
+  // The parked-run notice (run-view-128, DR-060, DR-073): the run the
+  // stream still reports underway, standing parked on the Boss — in
+  // its recoverable failure state, or waiting for a reply. The way
+  // back stands until that run leaves the park, mid-turn included.
+  // The notice speaks the run's command and never an identifier
+  // (DR-010 §2): where no configured playbook claims the run, the
+  // trace's id rides the tooltip and the words name no command at
+  // all, rather than dressing an id as one.
+  const parked = readOnly || uncertain
+    ? undefined
+    : parkedRun(activityView.frames);
+  const parkedCommand = parked
+    ? playbooks?.find((entry) => entry.id === parked.frame.playbookId)?.command
+    : undefined;
+  // Each card keeps the position recorded at its own failure. Only a
+  // card for the still-current failure park reads today's controls.
+  const failureContext = (line: CaptainLine): FailureContext | undefined => {
+    const failure = line.failure;
+    if (!failure) return undefined;
+    const command = playbooks?.find((entry) => entry.id === failure.playbookId)?.command;
+    const current = parked?.reason === "failure" && session.parked?.reason === "failure" &&
+      parked.frame.traceSessionId === failure.traceSessionId &&
+      parked.frame.transitions.length === failure.transitionCount &&
+      (parked.frame.lastFired?.at ?? parked.frame.openedAt) === failure.transitionAt;
+    return {
+      name: names,
+      ...(command ? { command } : {}),
+      ...(failure.step ? { step: failure.step } : {}),
+      ...(current && session.parked?.actions ? { actions: session.parked.actions } : {}),
+    };
+  };
+  const failureCause = latestFailureCause(activityView.captain);
+  // What a card reads beyond its frame (run-view-185, run-view-186):
+  // the player each step reaches, and whether a failure park is the
+  // Boss's own stop.
+  const card = {
+    names,
+    stepPlayer: (frame: MachineFrame, stateId: string, role: string | undefined) =>
+      frame.stepPlayers?.[stateId] ??
+      // A step not called yet reads the binding its run started with,
+      // not one the session made since.
+      (role
+        ? boundPlayer(
+            "historicalExecution" in frame ? frame.historicalExecution : activityView.latestExecution,
+            frame.playbookId,
+            role,
+          )
+        : undefined),
+    aborted: abortedPark,
+  };
+
+  return (
+    <MediaOwnerProvider owner={{ kind: "session", id: session.id }}>
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* The conversation names itself (run-view-69). */}
+      <div className="@container flex items-center gap-2 border-b border-neutral-200 px-4 py-1.5 text-sm dark:border-neutral-800">
+        <span className="min-w-0 truncate font-medium" title={title}>
+          {title}
+        </span>
+        {externalWriter ? (
+          <span
+            role="status"
+            data-testid="session-external-owner"
+            className="text-xs text-neutral-500 dark:text-neutral-400"
+          >
+            {externalWriter === "active"
+              ? i18n._("Session is in use elsewhere")
+              : i18n._("Session ownership is unknown · controls are unavailable")}
+          </span>
+        ) : history ? (
+          <span
+            data-testid="session-last-active"
+            className="shrink-0 text-xs text-neutral-500 dark:text-neutral-400"
+          >
+            {i18n._("Last active {when}", {
+              when: session.endedAt
+                ? new Date(session.endedAt).toLocaleString(currentLocale())
+                : "",
+            })}
+          </span>
+        ) : null}
+      </div>
+      {/* The split is layout by its own width (run-view-107): panes
+          side by side with the divider from 42rem, stacked below it
+          with the divider hidden and the reader's split kept. The
+          container is the wrapper, never the flex box itself — an
+          element cannot answer its own container query, and a split
+          that carried both stacked at every width. */}
+      <div
+        data-testid="split-container"
+        className="@container flex min-h-0 flex-1 flex-col"
+      >
+      <div
+        ref={splitRef}
+        className="flex min-h-0 flex-1 flex-col gap-3 p-3 @2xl:flex-row"
+      >
+        <div
+          data-testid="captain-column"
+          style={{ "--captain-split": `${captainSplit}%` } as React.CSSProperties}
+          className={`relative flex min-h-0 min-w-0 flex-auto flex-col gap-2 overflow-y-auto ${
+            soloCaptain
+              ? "mx-auto w-full max-w-2xl"
+              : "@2xl:w-(--captain-split) @2xl:min-w-[280px] @2xl:flex-none"
+          }`}
+        >
+          <CaptainPane
+            view={activityView}
+            activeMs={session.agentActiveMs?.[CAPTAIN_AGENT_ID]}
+            machineGraphs={machineGraphs}
+            bossSources={bossSources}
+            extras={extras}
+            readiness={readOnly ? undefined : readinessHint}
+            failure={failureContext}
+            {...agentProps(CAPTAIN_AGENT_ID)}
+            focusKey={focusKey}
+            onFocusHandled={onFocusHandled}
+            names={names}
+            onShowLane={showLane}
+            recovery={recovery}
+            lanes={lanes}
+            card={card}
+          />
+          {!readOnly ? (
+            // The working line (run-view-90) with its Drop
+            // (run-view-113): the verdict closes the intent over the
+            // protocol while the turn keeps running.
+            <WorkingLine
+              intent={workingIntent?.intent}
+              inputAvailable={connected && !view.turnActive}
+              onDrop={(intent) => closeIntent(intent.id, "dropped")}
+            />
+          ) : null}
+          {uncertain ? (
+            <SessionRecovery
+              input={session.recovery!.input}
+              discardable={session.recovery!.discardable}
+              connected={connected && !session.live}
+              onRecover={onRecover}
+            />
+          ) : null}
+          {loadError ? (
+            <div
+              role="alert"
+              data-testid="past-load-error"
+              className="flex items-start gap-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300"
+            >
+              <span className="min-w-0 flex-1">{loadError}</span>
+              {onRetryLoad ? (
+                <button
+                  type="button"
+                  onClick={onRetryLoad}
+                  className="font-medium text-brand-600 hover:underline dark:text-brand-300"
+                >
+                  {i18n._({ id: "Retry", comment: "act: load the transcript again" })}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {/* A failure that parked no run (run-view-135): nothing is
+              stuck, so the way on is an ordinary message — and until
+              now the summons named no act at all. */}
+          {attention === "failure" && !parked && !readOnly && !uncertain && !view.turnActive ? (
+            <div
+              role="status"
+              data-testid="unparked-failure-notice"
+              className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300"
+            >
+              <p>{i18n._("The last turn failed. Send a message to pick it up.")}</p>
+              {/* Why, and what to do about it outside Spex (DR-075):
+                  the same catalogue phrase every other mention uses. */}
+              {causePhrase(failureCause, names) ? (
+                <p
+                  data-testid="unparked-failure-why"
+                  className="text-neutral-600 dark:text-neutral-400"
+                >
+                  {causePhrase(failureCause, names)}
+                </p>
+              ) : null}
+              {causeStep(failureCause, names) ? (
+                <p
+                  data-testid="unparked-failure-next"
+                  className="text-neutral-600 dark:text-neutral-400"
+                >
+                  {causeStep(failureCause, names)}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+          {parked ? (
+            <ParkedRun
+              reason={parked.reason}
+              command={parkedCommand}
+              playbookId={parkedCommand ? undefined : parked.frame.playbookId}
+              state={parked.frame.active ?? undefined}
+              parked={session.parked}
+              cause={failureCause}
+              aborted={parked.reason === "failure" && abortedPark(parked.frame)}
+              connected={connected}
+              turnActive={view.turnActive}
+              onControl={async ({ kind, actionId }) => {
+                // Nothing else rides this turn (run-view-129,
+                // run-view-112): a staged intent detaches rather than
+                // being stamped by a control it did not ask for
+                // (run-view-86).
+                if (staged) clearStagedIntent(session.id);
+                // One ruling, one command (run-view-112): where the
+                // session serves an open intent, the close is the whole
+                // act — the core ends the parked run and records the
+                // verdict together (core-service-46). Sending both from
+                // here would race that path.
+                const ruled = kind === "ending" ? workingIntent?.intent : undefined;
+                if (ruled) await closeIntent(ruled.id, "dropped");
+                else await submitSessionControl(session.id, kind, actionId);
+              }}
+            />
+          ) : null}
+          {history ? (
+            <>
+              {/* The history notice (run-view-33): the core's reason it
+                  cannot continue, and the way on; its control wraps
+                  under the words in a narrow pane. */}
+              <div
+                data-testid="history-notice"
+                className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-sm text-neutral-500 dark:border-neutral-800 dark:bg-neutral-900"
+              >
+                <span className="min-w-0 flex-1 basis-40">
+                  {session.continuationReason ??
+                    i18n._("History — this session can't be continued")}
+                </span>
+                {onStartNew ? (
+                  <button
+                    type="button"
+                    onClick={onStartNew}
+                    title={i18n._("Start a new session in this project")}
+                    className="ml-auto shrink-0 rounded-md border border-brand-300 px-2.5 py-1 text-xs text-brand-600 hover:bg-brand-50 dark:border-brand-800 dark:text-brand-300 dark:hover:bg-brand-950"
+                  >
+                    {i18n._("New session")}
+                  </button>
+                ) : null}
+              </div>
+            </>
+          ) : null}
+          <ApprovalNotice owner={{kind: "session", id: session.id}} />
+          {readOnly && !uncertain ? null : (
+            <Composer
+              view={view}
+              composer={composer}
+              connected={connected}
+              blockedReason={
+                uncertain
+                  ? i18n._("Restore the interrupted turn before sending.")
+                  : undefined
+              }
+              error={error}
+              playbooks={playbooks}
+              staged={staged}
+              onCompileNew={onCompileNew}
+              onDraftChange={onDraftChange}
+              attachments={media.controls}
+              onSubmit={async (text) => {
+                if (media.assets.length || staged) await onSubmit(text, media.assets);
+                else await onSubmit(text);
+                media.consume();
+              }}
+              onAbort={onAbort}
+              onRemoveQueued={onRemoveQueued}
+              onDismissError={onDismissError}
+              onDetachStaged={() => clearStagedIntent(session.id)}
+              onQueueInstead={async (text) => {
+                // Queue instead of send (run-view-85): chat provenance
+                // names this session; nothing is dispatched.
+                await queueIntent({
+                  projectId: session.projectId,
+                  text,
+                  attachments: media.assets,
+                  source: { kind: "chat", ref: session.id },
+                });
+                media.consume();
+              }}
+            />
+          )}
+        </div>
+        {soloCaptain ? null : (
+          <>
+            <div className="hidden @2xl:contents">
+              <SplitDivider
+                percent={captainSplit}
+                onChange={setCaptainSplit}
+                containerRef={splitRef}
+              />
+            </div>
+            <div
+              ref={gridRef}
+              data-testid="player-grid"
+              className="relative flex min-h-min min-w-0 flex-1 gap-3 overflow-x-auto [mask-image:linear-gradient(to_right,transparent_0,#000_var(--fade-start,0px),#000_calc(100%_-_var(--fade-end,0px)),transparent_100%)] [mask-repeat:no-repeat] [mask-size:100%_100%]"
+              onScroll={(event) => markGridEdges(event.currentTarget)}
+            >
+              {lanes.map((playerId) => (
+                <PlayerPane
+                  key={playerId}
+                  view={
+                    activityView.players[playerId] ?? {
+                      id: playerId,
+                      running: false,
+                      segments: [],
+                    }
+                  }
+                  meta={metaById.get(playerId)}
+                  activeMs={session.agentActiveMs?.[playerId]}
+                  {...agentProps(playerId)}
+                  collapsed={collapsed.has(playerId)}
+                  onCollapsedChange={(next) =>
+                    setLaneCollapsed(session.id, playerId, next)
+                  }
+                  name={names(playerId)}
+                  chipHighlighted={highlightedChip === playerId}
+                  calls={activityView.stepCalls}
+                  onShowDispatch={showDispatch}
+                />
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+      </div>
+    </div>
+    </MediaOwnerProvider>
+  );
+}

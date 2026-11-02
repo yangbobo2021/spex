@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// Browser acceptance journeys (DR-039): Chromium over the served UI
+// bundle against a real core. The hermetic lane is the default; the
+// live lane (SPEX_E2E_LIVE=1, `@live` tests) — the regression of
+// DR-086, `npm run regression` — uses the machine's signed-in agents,
+// each journey setting its own budget.
+
+import { defineConfig, devices } from "@playwright/test";
+
+const live = process.env.SPEX_E2E_LIVE === "1";
+
+export default defineConfig({
+  testDir: "./tests",
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 1 : 0,
+  // Each journey runs a browser and a real core; avoid host-dependent load.
+  workers: 1,
+  timeout: live ? 10 * 60_000 : 45_000,
+  expect: { timeout: live ? 60_000 : 15_000 },
+  reporter: process.env.CI ? [["list"], ["html", { open: "never" }]] : "list",
+  // Every test boots its own shell on a scratch root; live journeys
+  // only run when asked for, hermetic ones only when not.
+  grep: live ? /@live/ : undefined,
+  grepInvert: live ? undefined : /@live/,
+  use: {
+    trace: "retain-on-failure",
+    screenshot: "only-on-failure",
+    // The shell serves loopback plaintext; nothing is remote.
+    ignoreHTTPSErrors: true,
+    // The interface follows the browser's languages when the home has
+    // stored no choice (localization-2), so the journeys pin English
+    // and assert English; a journey that wants Chinese sets its own
+    // context locale.
+    locale: "en-US",
+    // A live journey runs for hours: an action on a control that never
+    // comes fails in a minute rather than at the journey's budget.
+    ...(live ? { actionTimeout: 60_000 } : {}),
+  },
+  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+});

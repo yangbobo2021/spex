@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// The Source tab (playbook-library-56, playbook-library-5): the
+// draft's `<id>.md` rendered as it stands on disk, refreshed on every
+// source message so text appears while the agent writes, captioned
+// with who changed it last and when; Edit through the whole-file
+// editor idiom with its version-token conflicts (spec-view-48/50);
+// Paste — text or a picked file — as the way in for a source of one's
+// own, text alone at a remote place (run-view-169). Save and Use as
+// source wait while the agent may be editing the same file.
+
+import { useState } from "react";
+import type { DraftInfo } from "@sublang/spex-core/protocol";
+
+import type { SpecEditorState } from "../lib/spec-view-model.js";
+import type { DraftSourceMode, DraftSourceState } from "../state/store.js";
+import { draftSourcePath } from "../lib/drafts.js";
+import { relativeAge } from "../lib/time.js";
+import { currentLocale, i18n } from "../i18n.js";
+import { useClock } from "../lib/useClock.js";
+import { Markdown } from "./Markdown.js";
+import { Rich } from "./Rich.js";
+import { SpecEditor } from "./SpecEditor.js";
+
+const BUTTON_CLASS =
+  "rounded-md border border-neutral-300 px-2.5 py-1 text-xs text-neutral-600 hover:bg-neutral-100 disabled:cursor-default disabled:opacity-50 disabled:hover:bg-transparent dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800";
+
+export function DraftSourceTab({
+  draftId,
+  draft,
+  source,
+  mode,
+  editor,
+  connected,
+  pickFile,
+  pathEntry = true,
+  onMode,
+  onEditor,
+  onWrite,
+  onRead,
+}: {
+  draftId: string;
+  draft: DraftInfo;
+  /** The source as last streamed; null with none; undefined until
+   * the open replied. */
+  source: DraftSourceState | null | undefined;
+  mode: DraftSourceMode;
+  editor?: SpecEditorState;
+  connected: boolean;
+  /** The native bridge's file picker, where the shell offers one. */
+  pickFile?: () => Promise<string | null>;
+  /** Whether a file's path may be named: false at a remote place,
+   * whose drafts are on its server, where only text is pasted
+   * (run-view-169). */
+  pathEntry?: boolean;
+  onMode: (mode: Partial<DraftSourceMode>) => void;
+  onEditor: (editor: SpecEditorState | undefined) => void;
+  onWrite: (input: {
+    content?: string;
+    sourcePath?: string;
+    baseVersion?: string;
+  }) => Promise<{ version: string; mtime: number }>;
+  onRead: () => Promise<DraftSourceState | null>;
+}) {
+  const now = useClock(false);
+  const [pasteBusy, setPasteBusy] = useState(false);
+  const [pasteError, setPasteError] = useState<string>();
+  // Save and Use as source write under the version read, whatever runs
+  // beside them: a file changed meanwhile is a conflict to answer
+  // (playbook-library-56).
+  const path = `${draftId}.md`;
+
+  if (mode.mode === "edit" && editor) {
+    return (
+      <div data-testid="source-editor" className="flex min-h-0 flex-1 flex-col">
+        <SpecEditor
+          key={path}
+          state={editor}
+          onState={onEditor}
+          onWrite={(content, baseVersion) =>
+            onWrite({
+              content,
+              ...(baseVersion !== undefined ? { baseVersion } : {}),
+            })
+          }
+          onRead={async () => {
+            const fresh = await onRead();
+            return {
+              markdown: fresh?.markdown ?? "",
+              ...(fresh?.version ? { version: fresh.version } : {}),
+            };
+          }}
+          onSaved={() => {
+            onEditor(undefined);
+            onMode({ mode: "view" });
+          }}
+          onCancel={() => {
+            onEditor(undefined);
+            onMode({ mode: "view" });
+          }}
+        />
+      </div>
+    );
+  }
+
+  if (mode.mode === "paste") {
+    // A path is read only where one may be named (run-view-169).
+    const pastedPath = pathEntry ? mode.pastePath.trim() : "";
+    const canUse =
+      connected &&
+      !pasteBusy &&
+      (mode.pasteText.trim().length > 0 || pastedPath.length > 0);
+    const useAsSource = async (): Promise<void> => {
+      if (!canUse) return;
+      setPasteBusy(true);
+      setPasteError(undefined);
+      try {
+        await onWrite(pastedPath ? { sourcePath: pastedPath } : { content: mode.pasteText });
+        onMode({ mode: "view", pasteText: "", pastePath: "" });
+      } catch (cause) {
+        setPasteError((cause as Error).message);
+      } finally {
+        setPasteBusy(false);
+      }
+    };
+    return (
+      <div data-testid="source-paste" className="flex min-h-0 flex-1 flex-col gap-2">
+        <label className="flex min-h-0 flex-col gap-0.5 text-sm">
+          <span className="text-xs text-neutral-500">{i18n._("Workflow source")}</span>
+          <textarea
+            data-testid="paste-text"
+            // The mode opens for text to land in it (playbook-library-84).
+            autoFocus
+            value={mode.pasteText}
+            onChange={(event) => onMode({ pasteText: event.target.value })}
+            rows={6}
+            placeholder={i18n._("Paste the playbook source — prose, a SKILL.md, or workflow markdown…")}
+            className="rounded border border-neutral-300 bg-white px-2 py-1 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-950"
+          />
+        </label>
+        {pathEntry ? (
+          <label className="flex flex-col gap-0.5 text-sm">
+            <span className="text-xs text-neutral-500">{i18n._("Source file path (overrides the text)")}</span>
+            <span className="flex items-center gap-1.5">
+              <input
+                data-testid="paste-path"
+                value={mode.pastePath}
+                onChange={(event) => onMode({ pastePath: event.target.value })}
+                // The placeholder is the shape of a path, not a phrase.
+                placeholder="/path/to/workflow.md"
+                className="min-w-0 flex-1 rounded border border-neutral-300 bg-white px-2 py-1 dark:border-neutral-700 dark:bg-neutral-950"
+              />
+              {pickFile ? (
+                <button
+                  type="button"
+                  data-testid="paste-pick"
+                  onClick={() => {
+                    void pickFile().then((picked) => {
+                      if (picked) onMode({ pastePath: picked });
+                    });
+                  }}
+                  className={BUTTON_CLASS}
+                >
+                  {i18n._({ id: "Pick file", comment: "open the OS file picker" })}
+                </button>
+              ) : null}
+            </span>
+          </label>
+        ) : null}
+        {pasteError ? (
+          <div
+            role="alert"
+            data-testid="paste-error"
+            className="rounded border border-red-300 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300"
+          >
+            {pasteError}
+          </div>
+        ) : null}
+        <div className="flex flex-wrap items-center gap-2">
+          <span data-testid="paste-caption" className="text-xs text-neutral-500">
+            {pastedPath
+              ? i18n._("The file is copied in as the playbook's source")
+              : i18n._("Replaces the playbook's source")}
+          </span>
+          <span className="ml-auto flex items-center gap-1.5">
+            <button
+              type="button"
+              data-testid="paste-cancel"
+              onClick={() => onMode({ mode: "view" })}
+              className={BUTTON_CLASS}
+            >
+              {i18n._({ id: "Cancel", comment: "leave an editor without saving" })}
+            </button>
+            <button
+              type="button"
+              data-testid="paste-use"
+              disabled={!canUse}
+              onClick={() => void useAsSource()}
+              className="rounded-md bg-brand-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-brand-500 disabled:opacity-40"
+            >
+              {pasteBusy ? i18n._({ id: "Writing…", comment: "the source is being written to disk" }) : i18n._("Use as source")}
+            </button>
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  const openEditor = (): void => {
+    onEditor({
+      path,
+      original: source?.markdown ?? "",
+      draft: source?.markdown ?? "",
+      ...(source?.version ? { version: source.version } : {}),
+      preview: false,
+    });
+    onMode({ mode: "edit" });
+  };
+
+  if (!source) {
+    return (
+      <div
+        data-testid="source-empty"
+        className="m-auto flex max-w-sm flex-col items-center gap-2 text-center text-sm text-neutral-500"
+      >
+        <span>
+          <Rich
+            text={i18n._(
+              "No source yet — the agent writes <0>{path}</0> here as you talk.",
+              { path },
+            )}
+            components={[<span className="font-mono" key="path" />]}
+          />
+        </span>
+        <span className="flex items-center gap-2 text-xs">
+          {i18n._("Prefer your own?")}
+          <button
+            type="button"
+            data-testid="source-paste"
+            title={pathEntry ? i18n._("Paste a source or pick a file") : i18n._("Paste a source")}
+            onClick={() => onMode({ mode: "paste" })}
+            className={BUTTON_CLASS}
+          >
+            {i18n._({ id: "Paste", comment: "bring in a source of one's own" })}
+          </button>
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div data-testid="source-view" className="flex min-h-0 flex-1 flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        {/* Where the file is in the working folder (playbook-library-56). */}
+        <span
+          data-testid="source-path"
+          title={draftSourcePath(draft)}
+          className="min-w-0 truncate font-mono text-xs text-neutral-500"
+        >
+          {draftSourcePath(draft)}
+        </span>
+        <span
+          data-testid="source-caption"
+          title={new Date(source.mtime).toLocaleString(currentLocale())}
+          className="min-w-0 truncate text-xs text-neutral-500"
+        >
+          {/* One caption per hand, so no phrase is assembled: who last
+              wrote the source, and how long ago. */}
+          {source.by === "agent"
+            ? i18n._("Updated {age} by the agent", { age: relativeAge(source.mtime, now) })
+            : source.by === "you"
+              ? i18n._("Updated {age} by you", { age: relativeAge(source.mtime, now) })
+              : i18n._("Updated {age}", { age: relativeAge(source.mtime, now) })}
+        </span>
+        <span className="ml-auto flex items-center gap-1.5">
+          <button
+            type="button"
+            data-testid="source-edit"
+            title={i18n._("Edit the whole file")}
+            onClick={openEditor}
+            className={BUTTON_CLASS}
+          >
+            {i18n._({ id: "Edit", comment: "open the whole-file editor on the source" })}
+          </button>
+          <button
+            type="button"
+            data-testid="source-paste"
+            title={
+              pathEntry
+                ? i18n._("Replace the source with pasted text or a file")
+                : i18n._("Replace the source with pasted text")
+            }
+            onClick={() => onMode({ mode: "paste" })}
+            className={BUTTON_CLASS}
+          >
+            {i18n._({ id: "Paste", comment: "bring in a source of one's own" })}
+          </button>
+        </span>
+      </div>
+      {/* The source scrolls in a box of its own and holds nothing
+          focusable, so the box takes the keyboard stop that scrolls it
+          and says what it holds (run-view-50). */}
+      <div
+        data-testid="source-markdown"
+        tabIndex={0}
+        role="group"
+        aria-label={i18n._({ id: "Source", comment: "pipeline stage: the authored workflow" })}
+        className="relative min-h-0 flex-1 overflow-y-auto rounded-md border border-neutral-200 bg-neutral-50 p-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 dark:border-neutral-800 dark:bg-neutral-950"
+      >
+        <Markdown text={source.markdown} links="web-only" />
+      </div>
+    </div>
+  );
+}

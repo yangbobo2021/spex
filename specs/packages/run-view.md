@@ -1,0 +1,1687 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai> -->
+
+# run-view: Run View
+
+## Intent
+
+This spec covers the project session run view — the Spex screen that renders one live playbook session — spanning its user-visible behavior, its implementation requirements, and its integration coverage.
+The view presents a Captain pane, read-only player panes, and the single Boss composer.
+Conversation and graphs derive from records; session availability and turn activity derive from the core's published state.
+Both arrive through the WebSocket protocol, and the captain glyph vocabulary follows the embedded Playbook Captain shell.
+Coverage replays recorded record-stream fixtures through that protocol, exercising the record-driven rendering contract without live agents.
+
+## External Behavior
+
+### Elapsed-Span Vocabulary
+
+#### run-view-145
+
+When the run view presents an elapsed work span — how long work took or has run, rather than how old a moment is — it shall use one compact vocabulary and never raw milliseconds:
+
+| Span | Form |
+| --- | --- |
+| less than one second | `<1s` |
+| at least one second | round to the nearest whole second, then render seconds below a minute, minutes and seconds below an hour, or hours and minutes from an hour onward — at most the largest two units, with zero remainders omitted and no zero padding, as in `12s`, `3m 12s`, and `2h 5m` |
+
+### Captain Pane
+
+#### run-view-1
+
+While a project session is live, when the session record stream delivers a captain status line or captain speech, the Captain pane shall append it in arrival order — preserving each status line's glyph, and rendering speech text as chat-style prose, visually distinct from glyph lines:
+
+| Glyph | Line kind |
+| --- | --- |
+| ◇ | engagement start, stop, and finished status |
+| ◆ | failure and await-Boss-reply notices |
+| ▸ ⮕ ⤷ | playbook state-machine progress stream — absorbed by the machine card while its run's frame is open [[run-view-60](#run-view-60)] |
+
+- a status line, a time separator [[run-view-41](#run-view-41)], and a question's sender line [[run-view-9](#run-view-9)] are system lines at the type scale's small step — 12px, left-aligned like the conversation, the glyph standing as an icon in a fixed slot before the words — never a smaller, centered, monospace whisper ([DR-010](../decisions/010-interface-craft.md) §8);
+- a status line that is only a machine's name — an event in SCREAMING_SNAKE with or without a glyph, or a guard or result in camelCase after its arrow — reads as that name's lowercase words with its glyph or arrow kept, `START_PROPOSE` as "start propose" and `→ needsBossReply` as "→ needs boss reply", the name as written staying in the words' tooltip wherever they differ from it ([DR-010](../decisions/010-interface-craft.md) §2).
+
+#### run-view-2
+
+While a project session is live, when the session record stream delivers a failure, the Captain pane shall display one ◆ line carrying both the failure name and the failure message, so no delivered failure is left without a visible line:
+
+- a failure identical to the line just before it, within the same turn, folds into that line as a visible count (×2, ×3, …) whose meaning is also in text — never suppressed, never merged with a different failure or across turns;
+- the line speaks plain ([DR-010](../decisions/010-interface-craft.md) §2): a leading "Error:" and doubled periods are stripped, a known runtime message — a sign-in that expired, a rate limit, a timeout, an agent process that exited, a command not installed, an unknown adapter or player, a repository reconciliation that failed — reads as its plain phrase, and whenever the words changed the runtime's own text stays in the line's tooltip;
+- a delivered failure the runtime reported an account of — its own error beside the line, with the structured cause it attached where it attached one — is drawn in that line's place as the failure card [[run-view-147](#run-view-147)] instead, carrying the same count and the same readiness link ([DR-075](../decisions/075-a-failure-says-what-and-what-now.md));
+- while the Captain agent's adapter readiness reports not ready [[core-service-9](core-service.md#core-service-9)], each failure line carries a "Check agent readiness" link that opens Settings in place, its tooltip naming the unmet requirement.
+
+#### run-view-147
+
+Where a failure the record stream delivers carries the runtime's own account of it [[run-view-2](#run-view-2)], the run view shall draw a failure card at that failure's place saying what failed, why, and what now, every word read from data and none composed by a model ([DR-075](../decisions/075-a-failure-says-what-and-what-now.md), [DR-069](../decisions/069-key-phrases-not-sentences.md)):
+
+| Line | What it says |
+| --- | --- |
+| what failed | the command a configured playbook gives the run recorded at this failure, and the step it failed in — the state it left for its failure state — in the state vocabulary's human form [[run-view-59](#run-view-59)]; later recovery or runs never replace that identity or step, and neither is named where the stream named neither |
+| why | the catalogue's phrase for the structured cause the runtime attached, falling back to the runtime's own message spoken plain [[run-view-2](#run-view-2)] where it attached none |
+| what now | the Boss step the catalogue gives that cause, where it gives one, and the standing of each control the session summary publishes [[core-service-32](core-service.md#core-service-32)] only while this failure's own run remains in that failure park; absent where there is neither |
+
+- the catalogue holds one row per failure code the runtime exports [[run-view-148](#run-view-148)], each row a phrase and an optional Boss step — what to do outside Spex — derived from that code's bounded evidence: its repository paths printed as a comma-separated list ending in "… and N more" for the count the evidence says was omitted, never their content, and a nested failure phrased by the child's own cause;
+- a standing the runtime reports for a control reads as that control's label and the phrased reason it carries, so a control that would do nothing says so before it is pressed;
+- an adapter message a cause's evidence carries reads in the plain phrase the runtime mapping gives it [[run-view-2](#run-view-2)], and otherwise as itself, bounded to 120 characters ending in an ellipsis and carrying no Boss step;
+- a code the catalogue has no row for, and a standing reason it has no phrase for, read as their own identifiers in words rather than as nothing;
+- the runtime's own message and the raw state id ride the card's tooltip and never its copy ([DR-010](../decisions/010-interface-craft.md) §2);
+- a restore's recorded position [[core-service-82](core-service.md#core-service-82)] moving a run into its failure state delivers that failure, its account the cause the position carries for that run, and the card stands at the position's place; a run the stream already showed parked there keeps the account it was given.
+
+### Player Panes
+
+#### run-view-3
+
+While a project session is live, when the session record stream delivers text or text deltas for a visible player, that player's pane shall render the accumulating message as formatted Markdown, appending each delta as it arrives rather than waiting for turn completion:
+
+- A player pane's transcript is read-only — no text input, reply, or edit affordance — since Boss input happens only in the Boss composer [[run-view-8](#run-view-8)], while its header governs the lane's agent [[run-view-138](#run-view-138)];
+- rendered text wraps inside its pane — an unbroken token such as a long URL breaks anywhere rather than scrolling the pane sideways, in a player pane, a call's prompt, and the Captain thread's bubbles alike ([DR-041](../decisions/041-chrome-that-fits.md)) — and a code block wraps its long lines the same way, so nothing in a transcript scrolls sideways or traps the keyboard.
+
+#### run-view-4
+
+When the session record stream delivers a tool-use event for a visible player, that player's pane shall render it as a collapsed card labeled with the tool name and the subject read from the tool's own input, expanding on demand to the full input and, once delivered, the paired tool result:
+
+| The tool input is | The card's subject is |
+| --- | --- |
+| a string | that string |
+| an object holding a string at one of `command`, `file_path`, `path`, `pattern`, `url`, `query`, `prompt`, `description` | the first such value in that key order |
+| anything else | nothing — the label is the tool name alone, never a guessed field |
+
+- a subject is presented as one line — outer whitespace trimmed, inner whitespace runs collapsed to single spaces, elided where the card's width ends — so the collapsed card carries what the call acts on and never its payload;
+- a command a runner wrapped as `<shell> -lc <command>` — a login-shell wrapper with its quoting — presents the inner command as it was typed, and a runner's wire name for its shell tool reads "shell" with the wire name in the label's tooltip, so the coder's rows read as commands whichever agent runs them;
+- the expanded body prints each string-valued field — a command, a patch, an old and new string, a file's content, the result's text — verbatim under the field's name, and only a value that is not a string as JSON, every line wrapping inside the card so it never widens the pane;
+- a delivered result's span uses the run view's duration vocabulary [[run-view-145](#run-view-145)] ([DR-010](../decisions/010-interface-craft.md) §2);
+- while the lane's call is open, a card with no result yet reads at work, collapsed or not: the running mark stands where the ending's mark will, followed by "running · ⟨elapsed⟩" since the tool's use, ticking in the duration vocabulary [[run-view-145](#run-view-145)], on a tinted row, and the card takes its ending's mark once its result arrives ([DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)).
+
+#### run-view-83
+
+Where a rendered agent message carries a Markdown link — in a player pane [[run-view-3](#run-view-3)] or the Captain thread [[run-view-1](#run-view-1)] — the run view shall present it as a link only where the shell can open it [[app-shell-21](app-shell.md#app-shell-21)], presenting every other target as its own text with the target named in its tooltip:
+
+- an agent cites a repo path or a spec item as freely as it cites a URL, and a citation nothing can open must not wear the affordance of one;
+- a link opens outside the page — a new browsing context, with no referrer — so the served page never navigates away from the session.
+
+#### run-view-5
+
+When the session record stream delivers thinking content for a visible player, that player's pane shall render it collapsed by default, with an affordance that expands the full thinking text on demand.
+
+#### run-view-6
+
+When a player call completes, that player's pane shall report the call's usage on its result line by what the call delivered, showing token totals only where the call reported them and never a monetary figure ([DR-032](../decisions/032-session-players.md), [DR-044](../decisions/044-no-money-in-the-interface.md)):
+
+| The call reported | The pane shows |
+| --- | --- |
+| tokens | the call's token totals as "⟨in⟩→⟨out⟩ token", taken as given because they are inclusive of cached reads ([DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)) |
+| a cost, with or without tokens | nothing for it — no amount in any currency, whatever its provenance |
+| neither | no usage line — an unreported figure is silence, never a zero nobody measured |
+
+#### run-view-127
+
+When the session record stream delivers a player's failure — an error event, or a finished result reporting an error — that player's pane shall show the failure once per call, however many channels of the stream carry it ([DR-003](../decisions/003-runtime-reuse.md): an adapter may say one failure as prose, as repeated error events, and again in its result):
+
+- an error event whose message is identical to the call's standing failure line folds into that line as a visible count (×2, ×3, …) whose meaning is also in text — never merged with a different failure or across calls;
+- a text segment of the same call that is exactly the failure's words — a failure passed off as prose — gives way to the failure line;
+- the call's result line reads "✗ failed" with the words in its tooltip when its error repeats the failure line above it, and prints the error only where no line carries it.
+
+#### run-view-177
+
+Wherever the run view names a session player — its lane's header and rail [[run-view-116](#run-view-116)], a delegation line [[run-view-178](#run-view-178)], a failure's recovery entries [[run-view-179](#run-view-179)] — it shall show the player's name beside its mark, with the player's full id in the tooltip ([DR-155](../decisions/155-players-named-delegated-and-recovered.md)):
+
+- the name is the id's last dot-separated segment — `dev.reviewer` reads reviewer, `alice` reads alice — and every player of the roster sharing that segment with another reads as its full id instead;
+- the mark is the Captain's letter-in-a-circle style holding the name's first letter uppercased, in one neutral colour for every player, while the Captain's "C" keeps the brand colour;
+- the header still names the role its latest call served, before the name, where the role differs from the name.
+
+#### run-view-178
+
+When a session's records hold a player call — its traced start [[run-view-183](#run-view-183)], or for a call no trace starts, its prompt — the Captain pane shall show one delegation line at that record's place in the thread, outside every machine card, naming the player [[run-view-177](#run-view-177)] and the call's step [[run-view-188](#run-view-188)], and also what the call runs where the call's player no earlier call reached or its adapter or model differs from that player's previous call ([DR-155](../decisions/155-players-named-delegated-and-recovered.md), [DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)):
+
+| The call's model reads | Where |
+| --- | --- |
+| the model its `init` event reported | the call reported one |
+| the configured model | no report, and the call's role — the role its first record carries — resolves in the execution context it ran under to bindings agreeing on one model setting, else no binding names the role and the player's own setting stands |
+| "provider default" | no report, and that confirmed setting names no model |
+| nothing — adapter alone | no report, and the role is absent or resolves to bindings that disagree |
+
+- the adapter is the player's in that execution context: the `session_context` record its `contextSeq` names, else the latest before it;
+- two calls differ where their adapters or configured models differ, or where both reported a model and the reports differ — a call with no report never differs from one with a report by the report alone;
+- the session summary's latest model per agent is never read, so a later model change leaves earlier lines as they were;
+- activating the line brings the player's lane into view at the call's own entry [[run-view-186](#run-view-186)];
+- the line's accessible name reads its parts in order, each set apart, the dots between them drawn only;
+- a traced call that failed before its player recorded anything still puts its line, which leads nowhere, its failure standing in the thread [[run-view-147](#run-view-147)];
+- every line derives from stored records alone, so reopening the session shows the same lines.
+
+#### run-view-179
+
+Where a failure line or card in the Captain pane [[run-view-2](#run-view-2)] [[run-view-147](#run-view-147)] belongs to an agent — the Captain for the Captain's own failed turn, a player for a cause naming it, directly or through a nested failure — the run view shall name that agent [[run-view-177](#run-view-177)] in the cause and offer its recovery entries by what the runtime said, as the runtime-message mapping of [[run-view-2](#run-view-2)] classifies it ([DR-155](../decisions/155-players-named-delegated-and-recovered.md)):
+
+| The message is | Entries |
+| --- | --- |
+| an expired sign-in, or a rate limit | "Change ⟨name⟩ in Settings", beside the mapping's own words of what to do outside Spex |
+| a command not installed | none: the mapping's words alone |
+| an unknown adapter | "Change ⟨name⟩ in Settings" |
+| none the mapping knows | "Adjust ⟨name⟩" and "Change ⟨name⟩ in Settings" |
+| any other mapped message | none |
+
+- "Adjust ⟨name⟩" opens that agent's chip popover [[run-view-138](#run-view-138)], whose changes apply from the next message: for a player whose lane stands, the lane unfolds and comes into view, its chip is highlighted briefly and the popover opens from it; for a player with no lane, the same popover opens from the failure; for the Captain, from the Captain pane's chip;
+- "Adjust ⟨name⟩" is offered only where that agent's chip is, and never on history a session cannot continue;
+- "Change ⟨name⟩ in Settings" opens Settings at that agent's row editor [[settings-52](settings.md#settings-52)], where a change applies to new sessions;
+- nothing changes an agent's adapter or model without the reader.
+
+#### run-view-183
+
+While trace records fold into the run view's state [[run-view-14](#run-view-14)], the run view shall hold each traced player call — one per `player.call.started`, identified by its trace session and call id, a call id counting within one trace session only — with its state, role, player, start and finish, and the outcome and repository identity matched to it as follows ([DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)):
+
+| Concern | Rule |
+| --- | --- |
+| its outcome | the first `outcome.accepted` of its trace session after the call finished whose source is the call's state, until a later call of that state in that session starts; a call of another state never takes or cuts off another's outcome, and a transition's source is not read |
+| a transition's outcomes | the `outcome.accepted` records following that transition's `fsm.transition`, until the same trace session's next trace record of another type; each trace session collects its own, so another session's records — its transitions and its disposal among them — and the state telemetry between them end nothing, and the turn's end ends a collection with no identity |
+| its repository identity | the fields the step table names for its step [[run-view-188](#run-view-188)] in the event output of the transition that accepted its outcome, each a revision read short, and only where that transition's collection ended and held that one `outcome.accepted` alone, one no call took counting |
+| judging | the call came back with no outcome yet, and none of these has happened: its run ended or moved to its failure state with the transition that did so collected, its trace session was disposed, a later call of its state started, the turn ended |
+| unconfirmed | the call came back, and one of those happened with no outcome matched |
+| failed | the call came back, and its run moved to its failure state, with a cause other than the Boss's stop, before an outcome was matched |
+| lost | the call never finished when the turn ended or a restore moved the runs to their recorded position [[run-view-74](#run-view-74)]: the process died in it, so it is open no more, takes no prompt record and puts no return line |
+| its lane entry | the earliest of its player's open calls not yet matched takes that player's next prompt record, since one player's calls run one at a time and each prompt follows its call's start |
+
+- every matching reads stored records alone, so a reopened session holds the calls the live one held.
+
+#### run-view-184
+
+When a traced call [[run-view-183](#run-view-183)] finishes having come back or been stopped, the Captain pane shall show one return line at that record's place in the thread, outside every machine card, naming the player [[run-view-177](#run-view-177)] and saying what the call came back with, how long it ran in the duration vocabulary [[run-view-145](#run-view-145)], and its reply's first line, the whole reply opening in place ([DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)):
+
+| The call | The line reads |
+| --- | --- |
+| came back, judging | "← ⟨name⟩ handed back", marked "judging" |
+| came back, unconfirmed | "← ⟨name⟩ handed back", marked "unconfirmed" |
+| came back, failed | "← ⟨name⟩ handed back", marked "failed" |
+| came back with an outcome | "← ⟨name⟩ ⟨the outcome's words⟩" [[run-view-188](#run-view-188)] and its repository identity where one is matched |
+| came back asking the Boss | "← ⟨name⟩ asks you", marked "waiting for you" while that question waits [[run-view-9](#run-view-9)], with no first line and no reply to open, the question reaching the Boss in the Captain's words alone ([DR-085](../decisions/085-boss-talks-through-captain.md)) |
+| was stopped | "← ⟨name⟩ aborted" |
+
+- a failed call puts no return line, its failure standing in the thread [[run-view-147](#run-view-147)];
+- activating the line brings the player's lane into view at that call [[run-view-186](#run-view-186)];
+- the line's accessible name reads its head with its identity, its mark and its duration in order, each set apart, the dots between them drawn only;
+- the reply reads in the language the player wrote it in.
+
+### Pane Visibility
+
+#### run-view-7
+
+The run view shall show one player pane for each player of the session's bound roster of which the session holds a call record (its prompt, an event, or its finish), from that record on for the rest of the session; a player no call has reached takes no place ([DR-032](../decisions/032-session-players.md), [DR-146](../decisions/146-a-lane-appears-with-its-first-call.md)):
+
+- a pane is a player's lane, so once it stands it stays whether or not that player is engaged in the call now running, and a finished call's transcript stays where the reader last read it;
+- panes stand in the order of their players' first call records, so simultaneous calls appear side by side in that order with no limit on their number, and no pane reorders by which one is working;
+- which panes stand, and in which order, is read from the session's records alone, so a reopened, restarted or switched-to session shows the panes it showed;
+- a delegation that fails before any record of its player arrives adds no pane, its failure reading in the Captain thread alone, while a call that records anything and then fails keeps its pane with the failure shown in it [[run-view-127](#run-view-127)];
+- the pane's header carries a collapse control, and a collapsed pane stands in its place as a rail [[run-view-116](#run-view-116)] that opens itself when its call opens [[run-view-117](#run-view-117)] — a folded lane is still a lane;
+- the runtime's report of which players a call engages adds no pane and removes none — a lane the reader is following never leaves under them — and when a lane's call opens, or its pane first appears, while that pane lies beyond the grid's visible edge, the grid scrolls just far enough to show it, side by side or stacked alike, so the working lane never hides behind others;
+- bringing a pane into view moves only the grid's own scroll offset — never the page, the Captain column, or the keyboard focus — so a question and the composer the Captain column shows stay where the reader left them;
+- a pane still lying beyond the grid's edge is said, not cut: the grid fades whichever edge hides one, and retires that edge's fade once nothing lies beyond it ([DR-041](../decisions/041-chrome-that-fits.md));
+- while no pane stands — before the session's first call, or for a roster with no players — the Captain column stands alone at the Captain home's reading width with no divider, a division with nothing on its far side reading as a pane that failed to load, and the first pane's arrival restores the divider at the split's setting;
+- the pane's header names the lane and the role its latest call served [[run-view-79](#run-view-79)] — "coder · dev.coder" — with the lane's agent chip beside it, which is also the control that tunes that agent for this session [[run-view-139](#run-view-139)] [[run-view-138](#run-view-138)] and owns the header's slack: a reading longer than the pane can hold ends in an ellipsis with its whole in its tooltip, so the header and the transcript never widen past the pane ([DR-041](../decisions/041-chrome-that-fits.md));
+- while the lane's call is open, the header carries "⟨role⟩ running · ⟨elapsed⟩" beside the running mark — the span since the call's prompt, ticking each second in the duration vocabulary [[run-view-145](#run-view-145)] — so a minutes-long call never reads as a hang ([DR-010](../decisions/010-interface-craft.md) §5); as the pane narrows, the live reading remains after the resting active-time phrase has yielded [[run-view-143](#run-view-143)], then yields before the lane identity and header controls at the pane floor ([DR-041](../decisions/041-chrome-that-fits.md));
+- while the lane's call is open, the pane's foot holds one line below the transcript, wherever the reader has scrolled, with the running mark and what the player is doing now, read from the open call's latest entry — a tool card at work gives "⟨tool⟩ · ⟨elapsed⟩" and its subject, a reply streaming gives "Writing a reply", and anything else "Thinking…" — a long tool name truncates within half the line, whole in its tooltip, so the elapsed time and the subject keep their room, the line reads aloud as one phrase with its parts set apart, and the line leaves when the call closes ([DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)).
+
+#### run-view-116
+
+When the reader activates a player pane's collapse or expand control — an icon button labelled "Collapse ⟨lane⟩" in the pane's header, "Expand ⟨lane⟩" on the rail — the run view shall fold that lane to a rail, or unfold the rail to its pane, remembering the session's collapsed lanes while the app runs ([DR-030](../decisions/030-workspace-chrome.md): collapse never hides a duty):
+
+- the rail is a column about 2.25rem wide at the pane's full height, holding the expand control, the lane's running mark while its call is open, and the lane's name read down its length — truncated with its whole in a tooltip rather than leaving the rail — and is exempt from the pane floor ([DR-041](../decisions/041-chrome-that-fits.md));
+- the remaining panes share the freed width;
+- focus lands on the rail's expand control after a collapse and on the pane's collapse control after an expand, never on the document body;
+- the collapsed set is the session's own, kept across tab switches for the app's run and never persisted, so a new launch opens every lane.
+
+#### run-view-117
+
+While a lane's pane is collapsed, when that lane's call opens, the run view shall unfold the rail to its pane in place — moving focus only when it sat on the rail's control, then to the pane's collapse control — so the working player never hides in a rail ([DR-010](../decisions/010-interface-craft.md) §5):
+
+- the rule holds whether or not the session's tab is shown when the call opens;
+- a lane folded while its call is already open stays folded, its rail wearing the running mark, until its next call opens.
+
+#### run-view-186
+
+While a player pane holds a traced call's entry [[run-view-183](#run-view-183)], that entry shall open with the call's place — its playbook and its step, "decide › Merge the proposals" [[run-view-188](#run-view-188)], with "round ⟨N⟩" after the step where the run walks that step again — and the whole path from the root run, "dev › decide › Merge the proposals", in its tooltip ([DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)):
+
+- activating the place brings the call's delegation line into view in the Captain pane, lit briefly [[run-view-178](#run-view-178)];
+- a delegation line, a return line or a working chip that leads to this call [[run-view-178](#run-view-178)] [[run-view-184](#run-view-184)] [[run-view-37](#run-view-37)] unfolds the lane where it stands as a rail, brings it into view and scrolls only the lane's own transcript to the entry, lit briefly.
+
+#### run-view-79
+
+While a player pane holds a call the core resolved to a role [[core-service-36](core-service.md#core-service-36)], that call shall be labelled with its role where the call opens ([DR-032](../decisions/032-session-players.md)), so a lane several roles share reads as a sequence of calls rather than one voice:
+
+- A call the core resolved no role for is labelled with none: the view invents no label.
+
+### Agent Active Time
+
+#### run-view-143
+
+While a session tab is shown, the run view shall present each agent's core-folded completed-call active time [[core-service-102](core-service.md#core-service-102)] in that agent's pane header as a muted `active · ⟨duration⟩` phrase, using the duration vocabulary [[run-view-145](#run-view-145)] and adding no session-level rollup ([DR-070](../decisions/070-agent-active-time.md), [DR-071](../decisions/071-active-time-follows-held-calls.md)):
+
+- the Captain and every roster player read only their own entry from the summary, and the run view never derives active time from records;
+- an absent entry produces no phrase and no zero, while a measured zero reads `active · <1s`;
+- while a player's call is open, its existing `⟨role⟩ running · ⟨elapsed⟩` reading [[run-view-7](#run-view-7)] occupies the same at-a-glance slot; summaries update the cached resting value whether they arrive before or after `player_finished`, closing the live reading reveals the latest received phrase or silence, and a later summary updates it in place;
+- the Captain's phrase remains a completed-call total rather than ticking while `Captain is thinking…` supplies the turn's non-player progress signal; the indicator itself does not advance the figure, which changes only with a new folded summary [[run-view-37](#run-view-37)];
+- the phrase's title and accessible description read `Completed active time this session: ⟨duration⟩ · parallel calls overlap`;
+- the phrase stands apart from the agent-settings chip [[run-view-139](#run-view-139)], carries no combined total, share, ranking or cost, appears nowhere in the transcript, and leaves each player's per-call token usage on its result line [[run-view-6](#run-view-6)];
+- the visible phrase yields first as a pane narrows, before agent identity, controls or a live elapsed reading, while its full reading remains in the pane's accessible description ([DR-041](../decisions/041-chrome-that-fits.md));
+- a folded player's rail [[run-view-116](#run-view-116)] does not print the phrase and includes the same full reading in the rail label's tooltip and accessible description where that player has a measured figure.
+
+### Attachments and Media
+
+#### run-view-153
+
+Where a composer offers file attachments, it shall acquire browser `File` objects through one multiple-file picker, file drop, or file paste and present each selected file with its name and current upload state ([DR-097](../decisions/097-media-and-browser-tools-across-hosts.md)):
+
+- ordinary text paste and text dragging retain their native behavior;
+- an uploading file shows progress when reported, a failed file keeps its reason and Retry, and every file has a Remove control;
+- removing a file returns focus to Attach files, and a disabled attachment control accepts no files;
+- local image previews use owned object URLs released when their bytes leave the view, never an agent-supplied URL.
+
+#### run-view-154
+
+Where a composer holds attachments, it shall consider its content ready to send only when text or at least one file is present and every selected file has completed upload, preserving empty user text for an attachment-only submission ([DR-097](../decisions/097-media-and-browser-tools-across-hosts.md)).
+
+#### run-view-158
+
+When a first-message, session, queued-intent, or authoring composer acquires files, the UI shall preserve their content through this submission flow:
+
+- upload browser bytes through the authenticated bounded transfer protocol [[media-1](media.md#media-1)] [[media-2](media.md#media-2)], using the selected project for first-message, session, and intent files and the selected draft for authoring files;
+- retain the original browser file and transfer identity after failure, so Retry resumes the same upload or restarts it after a core restart, with removal canceling an incomplete transfer;
+- retain unsent files across tab and surface changes and failed submissions, and clear only the files acknowledged by a successful submission;
+- send exact user text and ordered completed references alongside it [[media-5](media.md#media-5)], including attachment-only turns and queued authoring messages;
+- preserve an intent's selected files through editing, staging, and dispatch, deriving an empty-text display title from their names without changing user text.
+
+#### run-view-155
+
+Where a conversation presents structured media, it shall render the supplied trusted bytes as a bounded raster image, controlled audio or video, or a named download, with any reported origin alongside it ([DR-097](../decisions/097-media-and-browser-tools-across-hosts.md)):
+
+- previews and downloads use owned object URLs released when their bytes leave the view;
+- audio and video never autoplay, and an image can expand in place through a named keyboard control;
+- loading and unavailable content retain the name and state, with Retry where supplied;
+- an external reference renders only an explicit HTTP(S) link or its literal reference text, without fetching it or passing it to a media element;
+- a preview decoding failure leaves the download available and names the unavailable preview.
+
+#### run-view-160
+
+When durable input or working-call media records reach a conversation, the UI shall render their content in record order through the trusted media presentation [[run-view-155](#run-view-155)] and bounded owner-scoped reads [[media-3](media.md#media-3)] [[media-6](media.md#media-6)]:
+
+- Boss bubbles retain their ordered attachment descriptors, including attachment-only turns;
+- Captain figures come only from visible evidence records and retain their originating actor and turn, their Playbook or host invocation identity, and any reported Playbook runtime and native tool identity, without revealing hidden controller events or duplicating the worker's native event in that pane;
+- worker and authoring transcripts render their native media events with the recorded actor, turn, and reported native session/tool identity alongside each figure, without inventing a missing playbook call identifier or fetching external references;
+- large tool-result asset references load their original JSON only when the tool card is expanded, preserving unavailable details as a retryable failure;
+- navigation, history reopen, and replay use the record's asset owner and digest, never the original local file path or model-generated Markdown.
+
+### Boss Composer
+
+#### run-view-8
+
+The Boss composer shall accept free text and `/`-prefixed command text, be the only input control in the run view, and dispatch each Boss submission by the core's published turn state [[core-service-32](core-service.md#core-service-32)]:
+
+- while no turn is active, a submission dispatches without queueing, the primary control reading "Send";
+- while a turn is active, the field and Send are disabled with the draft preserved and Abort available; a late busy rejection preserves the draft instead of queueing it ([DR-085](../decisions/085-boss-talks-through-captain.md));
+- when the active turn settles with no pending question, an already saved queued submission dispatches; a refused submission preserves its queued text and draft with the error shown, and uncertainty holds the queue until explicit recovery [[run-view-110](#run-view-110)];
+- a reply or replayed turn-start record does not establish settlement or current activity; a non-live session has no active turn, including after recovery, and its already saved queued submissions dispatch once its turn has settled without a pending question — the runtime is held only for a turn [[core-service-91](core-service.md#core-service-91)];
+- while a submission is being sent — the runtime opening on the current settings [[core-service-92](core-service.md#core-service-92)], then the turn starting — the primary control reads "Sending…" and stays disabled ([DR-010](../decisions/010-interface-craft.md) §3), and a refusal lands in the composer's frame with the draft kept;
+- asynchronous question, turn-state, and submission-completion updates restore focus to the available composer only when its field still holds focus or focus is otherwise unclaimed, preserving its draft and selection and any other surviving control or region the reader selected, including a player lane control [[run-view-116](#run-view-116)] or open agent editor [[run-view-138](#run-view-138)], except the working line's pending Drop handoff [[run-view-113](#run-view-113)]; explicit conversation arrival retains its navigation focus [[run-view-49](#run-view-49)];
+- the primary control's tooltip names its keys — Enter sends, Shift+Enter adds a line — and, while a turn is active, says Captain is working.
+
+#### run-view-106
+
+The Boss composer — on the Captain home and in a session alike — shall take one shape ([DR-041](../decisions/041-chrome-that-fits.md)):
+
+| Part | Form |
+| --- | --- |
+| Field | on top at full width, one row when empty and never shorter whatever height the viewport reports, growing with its text to eight lines or two fifths of the viewport, shrinking toward that one-row floor when the Captain column has less room so its caption and actions remain inside the column, and scrolling excess text, refitted whenever the viewport or the field's own box resizes — a divider dragged or a sidebar folded rewraps the draft with no window resize behind it — with no native resize grip |
+| Caption | one line under the field reading "/ for playbooks · Enter sends" in a session or while no project is chosen; the project home's resting composer omits it because its slash guidance sits outside the box [[run-view-25](#run-view-25)]; an acknowledgment or staged intent chip occupies that line when present |
+| Action row | beneath, wrapping: the secondary action at the left, then Abort while a turn runs, and the primary control last at the right |
+| Placeholder | at most 24 characters — "Message the Captain…", "Reply to ⟨player⟩…" for a waiting question, "Captain is working…" while a turn runs, "Connecting…" without the core |
+| Queued indicator | above the field, the queued submissions [[run-view-8](#run-view-8)] in their own positioned scrolling frame a few entries tall, kept at its end so the newest shows; the composer yields around it, so the field, the caption, and the action row keep their place at any queue length and the pane the composer sits in is never pushed out of the window |
+
+#### run-view-9
+
+While an engagement awaits one or more Boss replies, the run view shall display Captain's explanation and keep the wait visible until the runtime reports that the questions are gone ([DR-085](../decisions/085-boss-talks-through-captain.md)):
+
+- Captain's reply is the question's visible wording; raw question telemetry creates no additional message;
+- a compact banner names the waiting player when exactly one asks and explains that Boss can answer or ask Captain for clarification;
+- every submission goes to Captain through the ordinary Boss input route; a submission or Captain reply never clears the banner;
+- pending questions are read from runtime question data, including lists and keyed parallel questions, without requiring a particular state name; controller state changes alone never clear a question;
+- a restore's recorded position [[core-service-82](core-service.md#core-service-82)] reports the questions standing: those its runs hold, and none where they hold none;
+- an already saved queued message never automatically answers a pending question [[run-view-8](#run-view-8)].
+
+### Turn Control
+
+#### run-view-10
+
+The run view shall provide an abort control bound to the core's published active turn [[core-service-32](core-service.md#core-service-32)]:
+
+- while a turn is active, the abort control is presented; while no turn is active, it is hidden or disabled;
+- when the abort control is activated, the run view requests abortion of the active turn;
+- when the session record stream then delivers the turn-aborted record, the run view displays a visible aborted marker on the interrupted turn.
+
+### Turn Summaries
+
+#### run-view-11
+
+When a turn completes, the run view shall show turn summaries exactly as the active playbook declares:
+
+- a summary policy declared — the run view displays the turn summary produced for that turn;
+- no summary policy declared — the run view shows no summary entry.
+
+### Layout and Theme
+
+#### run-view-12
+
+The run view shall provide light and dark color themes and size the Captain and player panes from the shared configuration (see [DR-004](../decisions/004-config-and-persistence.md)):
+
+- layout weights declared — the panes are sized proportionally to those weights;
+- no layout configured — built-in default weights apply;
+- a theme configured — the configured theme is selected;
+- no theme configured — the view follows the OS appearance.
+
+#### run-view-119
+
+The app shell shall fill the window at every size, giving the surface it shows a box of the window's height that the surface scrolls its own content inside, so the page itself never scrolls and a window resized shorter or taller re-fits with no reload ([DR-041](../decisions/041-chrome-that-fits.md)):
+
+- the Captain home [[run-view-25](#run-view-25)] and a session's panes [[run-view-107](#run-view-107)] fill that box and scroll inside it rather than growing it;
+- a session's Captain column whose notices and one-row composer [[run-view-106](#run-view-106)] exceed its allocated height scrolls that chrome vertically inside its own positioned box, preserving the header's intrinsic height and the composer's caption and action rows rather than collapsing their boxes;
+- every box that scrolls — a pane, the sidebar [[run-view-67](#run-view-67)], the tab strip [[run-view-48](#run-view-48)] — is a positioned box, so the screen-reader-only text and other positioned content it holds is contained by that box instead of being carried by the page.
+
+### Session Start
+
+#### run-view-25
+
+Where a project is registered and no session tab is active, when the Projects surface is shown, the run view shall present a project task start with one composer and secondary Captain settings ([DR-007](../decisions/007-conversational-session-start.md), [DR-011](../decisions/011-project-workspace.md), [DR-141](../decisions/141-project-start-explains-the-task-and-slash-discovery.md), [DR-143](../decisions/143-start-with-a-goal-and-explain-specs-plainly.md)):
+
+- the heading and task field invite a goal for the named project; concise guidance aligned to the composer's width explains that AI helps write specs for how the system should work and how to check it, then follows playbooks to implement and review changes; the copy needs no completed specs or acceptance criteria to begin and makes no automatic spec-writing promise;
+- below the guidance, a compact per-project specs status links to the pinned Specs tab [[run-view-58](#run-view-58)]: when known it reports package and item counts, while a missing `specs/`, an empty package collection, a legacy tree, and a read failure receive distinct guidance; loading shall not display a false zero;
+- immediately above the composer, Captain wears the same avatar and name as the running Captain pane, beside a clickable chip showing its current adapter, model, effort, fast-mode mark, and readiness; that chip opens the in-place editor [[run-view-32](#run-view-32)], while blocking readiness remains at the composer;
+- the sole task field has an accessible label without a visible label, and a stable hint below the composer says to type `/` in that field to inspect all configured playbooks, naming their live count [[run-view-27](#run-view-27)]; its idle inside-caption is absent while staged-intent and acknowledgment captions still appear [[run-view-106](#run-view-106)];
+- the introduction and the Captain/composer group have more breathing room than the gaps within each group; a compact, borderless, low-emphasis footer directly below the composer explains a playbook as a workflow written in plain language that Spex can run to coordinate AI work and previews at most two configured examples in the same paragraph, preferring `/code` and `/review`; a final slash hint uses the same muted color and command typography, and the preview disappears when an Up next card takes priority [[run-view-27](#run-view-27)];
+- with no project current, the greeting directs the reader to pick one where projects exist;
+- Project choice lives in the sidebar and palette, not in the composer row.
+
+#### run-view-172
+
+While no local project is registered, the local Projects surface shall show a welcome page explaining specs as descriptions of system behavior and playbooks as workflows written in plain language for AI implementation and review, with one primary "Add a local project" action [[projects-42](projects.md#projects-42)], one secondary action to open the current Academy specs example [[projects-27](projects.md#projects-27)], and, beside them, "Open a project from your groups", opening the project palette at "From your groups" [[run-view-168](#run-view-168)], while the home is signed in to an instance, or "Sign in to your Space", showing the Space surface's sign-in [[space-3](space.md#space-3)], while it is not ([DR-135](../decisions/135-a-welcome-page-before-the-first-project.md), [DR-136](../decisions/136-the-first-project-picker-leads-with-a-folder.md), [DR-137](../decisions/137-specs-first-welcome-and-distinct-project-paths.md), [DR-138](../decisions/138-welcome-flow-copy-and-scoped-academy-note.md), [DR-139](../decisions/139-quieter-welcome-flow-and-academy-choice.md), [DR-143](../decisions/143-start-with-a-goal-and-explain-specs-plainly.md), [DR-159](../decisions/159-projects-in-groups-opened-where-you-work.md)):
+
+- the Academy action shall acknowledge seeding and report a refusal in place, and its copy shall not promise a recorded replay before one exists;
+- the value explanation shall show the path from specs through playbooks to implementation and review as three compact, connected steps with short, plain labels and descriptions; the Academy action shall have no caption below it;
+- the page shall hide the Captain chat, composer, agent identity, quick-start playbooks, and adapter-readiness warning;
+- the sidebar shall retain its compact project-palette control without a second prominent add control;
+- shared config errors shall remain visible with a Settings action [[run-view-44](#run-view-44)], and connection failures shall remain visible [[run-view-50](#run-view-50)].
+
+#### run-view-26
+
+While the Captain home is shown, when the user submits composer text, the run view shall act by whether the workspace has a current project:
+
+- a current project — the run view creates a session for that project, dispatches the text as the session's first Boss turn, and switches to the new session's tab;
+- session creation keeps its original request in flight until the core answers, without a UI reply deadline or automatic resend; a connection closing or a core refusal still rejects the pending start ([DR-181](../decisions/181-owned-session-start-wait.md));
+- no project chosen while projects exist — the workspace opens the project palette instead of dispatching, keeping the draft intact;
+- the send control's tooltip says how to send — Enter, with Shift+Enter for a new line — and, with no project, what to do first, naming the palette's binding the platform's way [[run-view-49](#run-view-49)].
+
+#### run-view-27
+
+The run view shall make configured playbooks discoverable at the composer ([DR-141](../decisions/141-project-start-explains-the-task-and-slash-discovery.md)):
+
+- when the user types `/` at the start of a composer, the run view shows the configured playbooks filtered by the typed prefix, each with its intent — a built-in's in the interface language [[localization-4](localization.md#localization-4)] — as the hint, and inserts the selected command into the composer without dispatching it;
+- at the project task start, a stable hint at the end of the compact footer below the composer explicitly tells the reader to type `/` in the task field to inspect all configured playbooks and names their live count, or, with no playbook available, reads "No playbooks available" as a link opening the project's Playbooks tab [[run-view-58](#run-view-58)] ([DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)); when playbooks are available and no Up next card is present, up to two configured examples appear in a low-emphasis, read-only explanation before that hint. Examples do not act as command selectors or quick-start controls.
+
+#### run-view-30
+
+The run view shall present conversations in instant-messaging form:
+
+- the user's submitted messages appear as their own chat bubbles in the Captain thread;
+- Captain speech appears as counterpart bubbles;
+- shell status lines appear as compact system lines between them.
+
+### At-Hand Operations
+
+#### run-view-32
+
+When the user opens the captain identity's editor control (or another agent's editor control elsewhere in the run view), the run view shall show an anchored popover in place — offering the embedded runtime's adapters with their readiness, and editing the agent's model, its adapter's effort vocabulary, and permissions ([DR-019](../decisions/019-inline-agent-configuration.md)) — writing changes as a merge patch through the shared configuration's validated edit path per [DR-009](../decisions/009-at-hand-interaction.md), without leaving the current surface:
+
+- the popover opens on the side of its anchor with the more room and takes at most what the window can show there, scrolling inside that bound, so it never lies past an edge the reader cannot scroll to and never grows the page ([DR-041](../decisions/041-chrome-that-fits.md)) — the Captain home's control sits at the foot of the surface, where the room above and below changes with the window's height;
+- the open popover refits whenever the window or its own box resizes, or a scrolling ancestor moves its anchor; a window resize also re-decides its side and its room.
+
+#### run-view-138
+
+When the reader opens an agent's settings control — the chip in the Captain pane's header, or the chip in a player pane's header [[run-view-139](#run-view-139)] — the run view shall show an anchored popover editing that agent's own model, subagent model, effort, subagent effort, fast mode, and browser choice [[settings-44](settings.md#settings-44)] for this conversation [[core-service-100](core-service.md#core-service-100)], without leaving the surface and without editing the shared configuration ([DR-068](../decisions/068-an-agents-settings-where-the-agent-is.md), [DR-067](../decisions/067-tuning-for-one-conversation.md), [DR-009](../decisions/009-at-hand-interaction.md)):
+
+- it edits the agent whose chip was opened and no other, anchored at that chip and taking the side and the bound of the agent editor's popover [[run-view-32](#run-view-32)], under the house popover idiom ([DR-010](../decisions/010-interface-craft.md) §6): focus enters on open and returns to the chip on close, and Escape, an outside click, and Cancel close it;
+- each field offers the configured value, the provider's current default, and a value pinned from the runtime's own choices [[settings-34](settings.md#settings-34)] in the model field [[settings-39](settings.md#settings-39)], the subagent effort's provider default reading "Agent chooses" and the subagent model offering "Off" in its place only while that choice stands [[settings-34](settings.md#settings-34)] ([DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md));
+- the configured value is named — a model by the display rule [[settings-38](settings.md#settings-38)], one the configuration leaves unset as the provider's default, an unset effort by the same "Provider default" words, an unset subagent model as "Same as agent" [[settings-38](settings.md#settings-38)], and an unset subagent effort as "Agent chooses" ([DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md));
+- fast mode, the subagent model and the subagent effort are each offered where the adapter accepts the request or a choice already stands, so a stale one is always clearable ([DR-093](../decisions/093-a-players-subagent-model.md), [DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md));
+- the model and the effort stand on one row and the subagent model and the subagent effort on the next, each pair stacking into one column where the editor's content box is narrower than 320 pixels, as it is at the 320-pixel viewport floor ([DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md), [DR-041](../decisions/041-chrome-that-fits.md));
+- it reads the agent's name with "This conversation only" beneath it, and explains neither Settings nor the adapter, instruction and permissions it does not offer, which a new session alone changes [[core-service-92](core-service.md#core-service-92)] ([DR-069](../decisions/069-key-phrases-not-sentences.md));
+- where a playbook's binding tunes this agent of its own accord, the editor names those roles in one phrase, because one choice here runs them alike and silence would be a lie;
+- one control returns the whole agent to its configured values while any of them stands, and a save is refused in the editor's own frame with the draft kept, unavailable model discovery showing its reason with a retry while every field stays usable ([DR-052](../decisions/052-runtime-model-options.md));
+- a session reporting external ownership [[run-view-125](#run-view-125)] or history the core cannot continue [[run-view-33](#run-view-33)] reads its agents' settings without writing them.
+
+#### run-view-139
+
+While a session's tab is shown, the run view shall read each agent's settings on the agent itself, naming its model as its runtime reported it wherever that report still holds, so a conversation running something other than its configured values never reads as one that is not ([DR-068](../decisions/068-an-agents-settings-where-the-agent-is.md), [DR-067](../decisions/067-tuning-for-one-conversation.md), [DR-091](../decisions/091-models-named-by-the-runtime.md)):
+
+- the Captain pane's header and each player pane's header carry their agent's chip — adapter, model, and effort, with the lightning mark while it runs in fast mode, as every agent chip wears it ([DR-038](../decisions/038-history-is-done-work.md)), and never the subagent model or the subagent effort, which the editor alone reads because two models fit no chip ([DR-093](../decisions/093-a-players-subagent-model.md), [DR-095](../decisions/095-a-subagents-effort-and-the-agents-own-model.md)) — and that chip is the control that edits them [[run-view-138](#run-view-138)];
+- a chip reads what its agent is set to run — this conversation's own value for a field [[core-service-32](core-service.md#core-service-32)], else the configured one — so a choice shows the moment it is taken, as a setting does;
+- while the agent still runs on the adapter and model setting its latest reporting call began under, the chip's model reads the model the runtime reported for that call [[core-service-115](core-service.md#core-service-115)] in place of the set value, and a change to either returns the chip to the set value at once, while a change of effort, fast mode, subagent model or subagent effort, which leaves the model it runs unchanged, keeps the report;
+- a chip reading a reported model carries both what is set — the value, or the provider-default words where none is — and what the runtime reported in its title and its accessible name;
+- a chip whose agent this conversation changed says so, in its accessible name as well as in its form, so the reading is told apart from the default it departs from without color alone carrying it ([DR-010](../decisions/010-interface-craft.md) §7);
+- a folded lane's rail carries its chip's reading in its tooltip [[run-view-116](#run-view-116)], and unfolding the lane is the way to its settings — a lane the reader folded is his own doing, and nothing summons from it ([DR-030](../decisions/030-workspace-chrome.md)).
+
+#### run-view-33
+
+When a session that is not live is opened [[run-view-68](#run-view-68)], the run view shall show a loading note while its stored transcript loads and, once it is shown, render it as a conversation a message continues, or — where the core lists it as history it cannot continue ([DR-042](../decisions/042-sessions-continue.md)) — a history notice carrying the core's reason and a "New session" control that starts a new session for the same project, in the composer's place — nothing the user produced becomes unreachable ([DR-009](../decisions/009-at-hand-interaction.md), [DR-051](../decisions/051-runtime-held-for-a-turn.md)):
+
+- an uncertain session shows recovery controls [[run-view-110](#run-view-110)];
+- a continuable session shows no notice at all: its composer is an ordinary composer, and nothing names it ended;
+- the notice wraps its control under its words when its pane is too narrow for both ([DR-041](../decisions/041-chrome-that-fits.md));
+- when the transcript fails to load, the run view says so and offers a retry that reloads it — a failed load never presents as an empty run.
+
+#### run-view-123
+
+When the core reconnects or reports replaced history [[core-service-92](core-service.md#core-service-92)], the run view shall reload affected cached conversations from sequence zero while retaining drafts and queued input:
+
+- session announcements received during an initial session-list read, including removals, remain current when that read finishes; a superseded session reading cannot replace the newer one, and later reads can still refresh every session.
+
+#### run-view-110
+
+While a stored session is uncertain, the run view shall show "Interrupted turn" with the saved input, a Restore control using the core's restore command [[core-service-82](core-service.md#core-service-82)], and a Discard control using its discard command [[core-service-83](core-service.md#core-service-83)] only where the session summary calls the attempt discardable [[core-service-32](core-service.md#core-service-32)] ([DR-047](../decisions/047-explicit-session-recovery.md), [DR-088](../decisions/088-playbook-17-slc-0-12-cligent-0-27-adoption.md)):
+
+- normal submission and queued sends remain blocked; drafts and queued input remain available;
+- Restore acts without a confirmation, its tooltip reading "Nothing is repeated";
+- Discard, where drawn, confirms that the unprocessed message is dropped, or a fresh session removed; where the summary says otherwise it is absent, and nothing explains its absence ([DR-069](../decisions/069-key-phrases-not-sentences.md));
+- confirmation focuses Cancel, Escape cancels, and pending or disconnected controls are disabled;
+- success follows the reported state in place, a restore's report standing as the Captain's reply, and the report's start — the lost turn started again under its own id and message after the restore's marker [[core-service-82](core-service.md#core-service-82)] — draws no second Boss message; refusal shows its cause with the transcript and draft preserved.
+
+#### run-view-125
+
+While a session reports external ownership [[core-service-32](core-service.md#core-service-32)], the run view shall show its history with the loading, failure and retry behavior of stored transcripts [[run-view-33](#run-view-33)] and its ownership reason without session mutation controls, preserving drafts and queued input until ownership is idle.
+
+#### run-view-128
+
+While a session a Boss message continues [[core-service-32](core-service.md#core-service-32)] holds a playbook run its record stream still reports underway [[run-view-14](#run-view-14)] [[run-view-74](#run-view-74)] standing parked on the Boss — in the recoverable failure state its machine card draws in the failure emphasis [[run-view-61](#run-view-61)], or awaiting the Boss's reply [[run-view-9](#run-view-9)] — the run view shall stand a parked-run notice between the Captain pane and the composer, saying in key phrases what that run waits for and what each of its controls does ([DR-010](../decisions/010-interface-craft.md) §2, [DR-069](../decisions/069-key-phrases-not-sentences.md), [DR-060](../decisions/060-failed-workflow-control.md), [DR-073](../decisions/073-letting-go-ends-the-parked-run.md)):
+
+- the notice names the parked workflow by the command a configured playbook gives that run, and by no name at all where none does — an identifier is never dressed as a command — with that run's playbook id and the raw state carried in its title;
+- on the failure park the notice says why, in the catalogue's phrase for the cause the runtime attached [[run-view-147](#run-view-147)], and what now — the Boss step that cause carries and the standing of each control it draws ([DR-075](../decisions/075-a-failure-says-what-and-what-now.md));
+- on the failure park the notice draws one control per action the session summary publishes for that run [[core-service-32](core-service.md#core-service-32)], each labelled with that action's own label, and never chooses among them: a control the runtime called a no-op or blocked stands visible and disabled with its phrased reason in its tooltip;
+- the actions resuming from an earlier step — those whose id is `jump:<stateId>` — fold behind one secondary control reading "Resume from an earlier step…", which opens their list in place inside the notice, each row that action's control with its whole label wrapped, the list scrolling once it outgrows its bound; every other action stands in the notice's row beside Drop; both keep the summary's order ([DR-117](../decisions/117-the-earlier-steps-fold-behind-one-control.md));
+- Drop stands on either park and ends the run through the ending that summary publishes, and where no action is published — a run whose controls were never captured — Drop stands alone with the composer named as the way on [[run-view-8](#run-view-8)]; a run awaiting a reply carries Drop alone, its other door being the composer;
+- a control the opened run advertises nothing for refuses with its cause rather than being withheld, since a settled session holds no shell to read [[core-service-98](core-service.md#core-service-98)];
+- the notice wraps its row's controls under its words as one group when its pane is too narrow for both, and no control widens past the notice: a label too long for a row control's width ends there in an ellipsis, whole in that control's tooltip ([DR-041](../decisions/041-chrome-that-fits.md));
+- an uncertain session shows the interrupted-turn controls instead [[run-view-110](#run-view-110)], a session reporting external ownership shows no notice [[run-view-125](#run-view-125)], and history the core cannot continue shows its own notice [[run-view-33](#run-view-33)].
+
+#### run-view-129
+
+When one of the parked-run notice's recovery controls is activated [[run-view-128](#run-view-128)], the run view shall run that control's own action as the session's next turn [[core-service-98](core-service.md#core-service-98)] ([DR-062](../decisions/062-ending-a-failed-workflow.md), [DR-075](../decisions/075-a-failure-says-what-and-what-now.md)):
+
+- the control names the recovery kind and the id of the action it draws, as the summary published it [[core-service-32](core-service.md#core-service-32)], the core resolving that name against what the opened run advertises [[core-service-98](core-service.md#core-service-98)];
+- the turn renders in the thread as the Boss's own message carrying that action's own label, so the conversation records what was asked;
+- the submission carries no intent dispatch and stamps none [[core-service-47](core-service.md#core-service-47)] — a staged intent detaches rather than riding it [[run-view-86](#run-view-86)].
+
+#### run-view-112
+
+When the parked-run notice's Drop control is activated and its inline confirm taken [[run-view-128](#run-view-128)] ([DR-010](../decisions/010-interface-craft.md) §4), the run view shall end that run as the session's next turn, sending one command and no other ([DR-062](../decisions/062-ending-a-failed-workflow.md), [DR-073](../decisions/073-letting-go-ends-the-parked-run.md)):
+
+| The session serves | The one command |
+| --- | --- |
+| an open intent | that intent's Drop verdict, which ends the parked run before recording it [[core-service-46](core-service.md#core-service-46)] — one ruling taken once |
+| no intent | the ending control, named by the id the summary published for it [[core-service-32](core-service.md#core-service-32)] [[core-service-98](core-service.md#core-service-98)], ending the run being the whole of the act, with nothing further recorded |
+
+- the turn the core runs renders in the thread as the Boss's own message carrying the ending's own label, so the conversation records that the Boss stopped it;
+- the submission carries no intent dispatch and stamps none [[core-service-47](core-service.md#core-service-47)] — a staged intent detaches rather than riding it [[run-view-86](#run-view-86)].
+
+#### run-view-130
+
+While a command the parked-run notice sent is in flight [[run-view-129](#run-view-129)] [[run-view-112](#run-view-112)], the run view shall show the activated control's busy form in place without widening it, accept no further activation of any of its controls, and present the outcome only as the conversation reports it ([DR-010](../decisions/010-interface-craft.md) §3, §5, [DR-041](../decisions/041-chrome-that-fits.md)):
+
+- every control the notice draws is disabled while the core connection is down and while a turn is active;
+- a refused command shows its cause beside the notice with the transcript and draft preserved, as a refused composer submission does [[run-view-8](#run-view-8)];
+- the notice stands until the record stream reports that run left its park or ended [[run-view-14](#run-view-14)], so a turn that answers without leaving it keeps the way back in place while a control's success, or a reply the park itself awaited, takes it away.
+
+#### run-view-135
+
+While the shown session carries a failure entry [[dashboard-1](dashboard.md#dashboard-1)] with no run of its standing parked on the Boss [[run-view-128](#run-view-128)], no turn in flight, and an ordinary Boss message continuing it [[core-service-32](core-service.md#core-service-32)], the run view shall stand a notice where the parked-run notice stands saying that the last turn failed and that a message picks it up, with the composer beneath it ([DR-066](../decisions/066-every-summons-has-a-door.md)):
+
+- the notice says why, in the catalogue's phrase for the cause the runtime attached to that failure, and the Boss step that cause carries, each omitted where the catalogue gives none [[run-view-147](#run-view-147)] ([DR-075](../decisions/075-a-failure-says-what-and-what-now.md));
+- nothing is stuck, so the notice carries no control of its own: the act is the composer's, and the notice is void wherever the composer is [[run-view-8](#run-view-8)];
+- the notice leaves when the entry does — the next Boss turn starting [[dashboard-4](dashboard.md#dashboard-4)].
+
+#### run-view-136
+
+When a player's records carry historical permission telemetry, that player's pane shall render the tool and native reason as history without presenting it as an answerable request ([DR-066](../decisions/066-every-summons-has-a-door.md), [DR-098](../decisions/098-live-tool-approvals.md)):
+
+- only the live core approval inbox supplies actionable controls [[approvals-5](approvals.md#approvals-5)];
+- stored telemetry raises no attention entry and proves neither a host answer nor successful native execution.
+
+#### run-view-34
+
+The run view shall keep cross-project attention and playbook creation at hand:
+
+- while the Dashboard's published attention count [[dashboard-9](dashboard.md#dashboard-9)] is non-zero, the sidebar's Dashboard entry shows a badge with that count across all projects and every place [[run-view-168](#run-view-168)] ([DR-029](../decisions/029-session-history-home.md)), surviving the sidebar's collapse [[run-view-71](#run-view-71)];
+- while a non-current project needs a human, that project's sidebar row carries a dot in the most severe color [[run-view-67](#run-view-67)];
+- the project palette's rows carry each project's count of sessions summoning a human, read from that one published fold [[dashboard-9](dashboard.md#dashboard-9)] and never derived again here, with the most severe of a session's entries naming its mark ([DR-066](../decisions/066-every-summons-has-a-door.md));
+- the slash menu ends with a compile-a-new-playbook entry that opens the compile flow on the current project's Playbooks tab [[run-view-58](#run-view-58)] ([DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)).
+
+### Conversation Life (DR-010 §1/§3)
+
+#### run-view-37
+
+While a turn is active and the Captain is not streaming speech, the Captain thread shall show what runs, so the thread is never inert mid-turn and a long call reports its progress ([DR-010](../decisions/010-interface-craft.md) §5, [DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)):
+
+| While | The thread shows |
+| --- | --- |
+| a traced call runs [[run-view-183](#run-view-183)] | one chip per open traced call — the player's mark and name [[run-view-177](#run-view-177)], the call's step [[run-view-188](#run-view-188)] and the span since the call started, ticking each second in the duration vocabulary [[run-view-145](#run-view-145)] — each activating to its lane at that call [[run-view-186](#run-view-186)], appearing as its call starts and leaving as it ends |
+| a player runs with no traced call | "⟨role⟩ running · ⟨elapsed⟩", the roles of the running lanes' latest calls [[run-view-7](#run-view-7)] and the span since the earliest open call's prompt, ticking likewise |
+| neither | "Captain is thinking…" |
+
+#### run-view-38
+
+A queued Boss submission shall never read as sent:
+
+- queued submissions render as pending outgoing bubbles in full, each captioned "sends when this turn ends" and each individually removable by a control of full hit size [[run-view-50](#run-view-50)];
+- while a turn is active, the composer placeholder and the primary control's tooltip read "Captain is working…" [[run-view-8](#run-view-8)] ([DR-085](../decisions/085-boss-talks-through-captain.md)); the queued bubbles keep their caption.
+
+#### run-view-39
+
+Composer drafts (per session and on the Captain home) shall survive switching tabs and surfaces, clearing only on send ([DR-051](../decisions/051-runtime-held-for-a-turn.md)).
+
+#### run-view-40
+
+When the abort control is activated, it shall acknowledge instantly — disabled with an "Aborting…" label until the turn ends or the failure is shown:
+
+- The abort control is disabled while the core connection is down.
+
+#### run-view-41
+
+The Captain thread shall keep every moment legible in time: visible time separators before the first message, after gaps of more than ten minutes, and on day boundaries, and a clock stamp on every message bubble — the Boss's, the Captain's, and a question's — with exact timestamps staying available on hover:
+
+- the stamp is the message's clock time in the reader's locale, at the type scale's small step in tabular figures and a quiet neutral, standing at the bubble's outer foot — before a Boss bubble, after a counterpart's — outside the text's measure so it never reflows a message, the way chat clients keep it ([DR-010](../decisions/010-interface-craft.md) §8);
+- the stamp is a time element carrying the moment in machine-readable form and the exact date and time in its tooltip;
+- a narration line, a failure line, and a settled machine card keep their moment in the tooltip alone — a stamp on every glyph line would be noise beside the messages;
+- a player pane's call header prints the call's clock in the same form, so one clock runs across the panes ([DR-010](../decisions/010-interface-craft.md) §2).
+
+#### run-view-59
+
+The session state chip shall show a human-readable label in the status vocabulary [[run-view-189](#run-view-189)] with the raw state id in its tooltip, never as the primary copy ([DR-010](../decisions/010-interface-craft.md) §2):
+
+- while a reply is owed the Boss, the chip reads "waiting for you";
+- while a turn is active and the state names no leaf — no state yet, or the shell's own rest state — the chip reads "running" while a player runs and "deciding" while the Captain has the floor, never "idle";
+- while no turn is active, no reply is owed the Boss [[run-view-9](#run-view-9)], and a playbook run underway [[run-view-74](#run-view-74)] stands in its recoverable failure state — the deepest such run, the leaf that failed — the chip reads "failed", or "aborted" where the Boss's stop parked it there [[run-view-189](#run-view-189)], with that run's own state id in its tooltip, the session's last reported state being whichever machine reported it last and never the leaf's answer ([DR-061](../decisions/061-run-state-from-frames.md)).
+
+#### run-view-46
+
+When new content arrives below the fold of a scrolled-up Captain or player pane, the pane shall show a jump-to-latest pill that scrolls to the bottom and resumes following:
+
+- a record that renders only in another pane is not new content in this one and raises no pill;
+- earlier entries the reader reveals above are not new content below and raise no pill.
+
+#### run-view-120
+
+While a Captain or player pane is following its end, when its box or rendered content changes size, the pane shall keep following ([DR-010](../decisions/010-interface-craft.md), [DR-041](../decisions/041-chrome-that-fits.md)):
+
+- chrome moving — the sidebar folding, the divider dragged [[run-view-81](#run-view-81)], panes stacking [[run-view-107](#run-view-107)], a lane unfolding [[run-view-117](#run-view-117)] — and content growing through live cards or delayed media are not reader scrolling and owe no jump pill;
+- actual upward reader movement detaches even when content grows before its scroll event is delivered, and subsequent size changes leave that reader detached until they return to the end or activate Latest [[run-view-46](#run-view-46)].
+
+#### run-view-162
+
+While the Captain pane is following its end, when its rendered conversation changes through the record stream or a loaded machine definition, the pane shall stay at its end, including a reply arriving with turn settlement [[run-view-1](#run-view-1)] and a live machine mounting or changing its drawing [[run-view-60](#run-view-60)] [[run-view-64](#run-view-64)].
+
+### Machine Cards
+
+#### run-view-60
+
+While a playbook run's trace records flow in a live session, the Captain pane shall draw that run as a live statechart card — one labeled box per state, one directed edge per transition, laid out top to bottom from the initial state, deterministically per machine ([DR-031](../decisions/031-machine-call-tree.md)):
+
+- the card renders read-only, never intercepting the composer;
+- the card takes the form its disclosure assigns — the full drawing or the strip [[run-view-75](#run-view-75)];
+- while the run's frame is open, the glyph progress lines of that run fold into the card instead of the thread [[run-view-1](#run-view-1)], while failure lines always stay in the thread [[run-view-2](#run-view-2)];
+- state labels are the human labels with raw ids in tooltips, matching the chip's law [[run-view-59](#run-view-59)] — a nested state, whose id carries its parent's path as a region of a parallel state does, goes by its own last segment, wears its parent's name as its caption when no role captions it, and keeps its whole path in its tooltip, in its exit labels' tooltips, and in the card's status line;
+- a state name reads at 13px and its caption at 12px — the type scale's small step ([DR-010](../decisions/010-interface-craft.md) §8) — and a box is as wide as its column's longest name or caption needs, from a 132px floor to a 240px cap, so a name such as "reported review failure" reads whole; a name past the cap is trimmed with its whole in the box's tooltip.
+
+#### run-view-61
+
+While a machine card is live, the Captain pane shall show the run's state through the status palette, one voice per state kind ([DR-031](../decisions/031-machine-call-tree.md)):
+
+- every active state — the run's one state, or each step a parallel state holds active [[run-view-185](#run-view-185)] — carries the running emphasis with the app's one running mark — the pulsing dot the sidebar's running rows wear [[run-view-73](#run-view-73)], worn identically by the running player's pane — static under the reduced-motion preference;
+- a parked state awaiting the Boss carries the attention emphasis and a failed state the failure emphasis, the derivations of the attention count [[run-view-34](#run-view-34)], save a failure state the Boss's stop parked the run in, which stays quiet [[run-view-187](#run-view-187)], and every other state stays quiet ink;
+- a firing transition flashes once and decays in well under a second, instantly under reduced motion;
+- every transition shows its direction at rest with a constant-size glyph, drawn lines and exit labels alike [[run-view-76](#run-view-76)];
+- an active state names the player it runs — the role the machine asked for and the player answering it, by name [[run-view-177](#run-view-177)], once where the two read alike — and shows that player's running activity, when the trace attributes one; where the pair does not fit its box, the caption falls back to the role alone with the pair in the box's tooltip.
+
+#### run-view-185
+
+While a machine card is drawn, every state whose calls reach a player shall wear that player's mark and name [[run-view-177](#run-view-177)] — the player its latest call reached, else the player the configuration recorded with the run's context binds its role to, so a run reopened after the bindings changed keeps its own — the mark standing at the head of the state's caption and serving as its running mark while that call runs ([DR-031](../decisions/031-machine-call-tree.md), [DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)):
+
+- while a run stands in a parallel state, each step the state's value holds active — the value's leaves, never the parallel state or its regions the runtime's active ids also list — stands active with its own call and its own player, so two players proposing at once read as two running steps;
+- a step drawn from the trace alone, where no definition is served [[run-view-64](#run-view-64)], is matched by the calls the run made from it.
+
+#### run-view-62
+
+When a playbook run's trace settles, the Captain pane shall settle that run where it belongs — a child run as a strip under its calling state's position, in invocation order among that state's calls, a root run into the thread at the position of the record that settled it [[run-view-75](#run-view-75)] — and shall empty the live region of that frame ([DR-031](../decisions/031-machine-call-tree.md)):
+
+- the settled run carries its own reported final status in the status vocabulary [[run-view-189](#run-view-189)]: a finished run "done", a failed one "failed", and "aborted" reserved for a run that ended unfinished;
+- a disposal report closes only a frame still open, with that same status rule.
+
+#### run-view-63
+
+While a machine frame has a caller the pane knows, the Captain pane shall draw the call as containment ([DR-031](../decisions/031-machine-call-tree.md)):
+
+- the child card nests indented under its caller's card, joined by a drawn connector that leaves the calling state itself, so the line reads "this state is running that machine";
+- from the call onward, the calling state names its callee in the call voice — in the live drawing and the settled one — carrying the running mark while the call is open, and the child card's header names its calling state in return;
+- while the caller renders as a strip [[run-view-75](#run-view-75)], the strip names the calling state and its callee and the connector leaves the strip — the containment never disappears with the fold;
+- nesting recurses by the trace's parent link, never by depth arithmetic;
+- each card stays live and independently drawn.
+
+#### run-view-64
+
+When rendering a stored run, the machine card shall use its historical graph and participant context [[core-service-80](core-service.md#core-service-80)], drawing only observed states/transitions when that context is unavailable, without blocking or substituting the current module's graph ([DR-045](../decisions/045-unified-session-storage.md)).
+
+#### run-view-74
+
+While trace records fold into the run view's state [[run-view-14](#run-view-14)], a machine frame shall exist exactly for a playbook run underway ([DR-031](../decisions/031-machine-call-tree.md)):
+
+- a frame opens only on evidence that a run is underway — its start, a transition, or a call it makes;
+- events that merely report on a run — statuses, turn settlements, disposal — never open one;
+- a settled run's trace session is tombstoned in the folded state, so later records for it change nothing, in live folding and replay alike;
+- a restore's recorded position [[core-service-82](core-service.md#core-service-82)] is where every run stands after it: each run it names stands underway in its named state with no call running, on its card or on any lane [[run-view-7](#run-view-7)], and every other open frame settles unfinished;
+- the captain shell's own frame is not a playbook run and never draws a card.
+
+#### run-view-75
+
+While machine cards are shown, each card shall render as either its full drawing or a one-line strip — the playbook, its current state or outcome, its calling state for a child, and its status mark — with defaults partitioning the whole tree ([DR-031](../decisions/031-machine-call-tree.md)):
+
+- every running leaf card is expanded, and so is a running root while it is the tree's only root — the one drawing never folds the moment it calls; every other card — a running ancestor beside another root, and settled runs — is a strip;
+- a disclosure toggle on each card overrides the default for that card, altering no fold state — a replay renders identically whatever was expanded ([DR-027](../decisions/027-linked-views-contract.md));
+- expanding a settled strip shows the machine's final drawing with its settled descendants in place, identical under replay;
+- a strip carries an accessible name stating the run, its status, and its caller, so the relation never depends on the connector alone.
+
+#### run-view-76
+
+When a machine card draws its edges, an edge shall render as a drawn line only between layout neighbours — one rank apart or side by side with nothing between — and every other transition shall render as an exit label inside its source state, a constant direction glyph naming its target with the event in its tooltip ([DR-031](../decisions/031-machine-call-tree.md)):
+
+- a drawn head touches the target's border at a port no other head shares, and no drawn path crosses a state box;
+- reciprocal drawn pairs stay offset;
+- a state's exit labels stack inside its box without overlap, and its box grows to hold them;
+- exit labels walk, fire, and dash exactly as drawn edges do;
+- an exit label reads at 11px — the one text on the card a step under the small step, since a box and not a line carries its meaning ([DR-010](../decisions/010-interface-craft.md) §8);
+- a state's unwalked exits into rest states — a parked state, or a failure state — fold into one "+N" marker whose tooltip lists them, each unfolding as it is walked and all of them while the box is hovered, so a box's every escape hatch never shouts over its work.
+
+#### run-view-78
+
+Where a frame's trace names a caller the pane does not know, the frame's card shall render at the top level rather than vanishing ([DR-031](../decisions/031-machine-call-tree.md)).
+
+#### run-view-65
+
+When the session record stream delivers a captain turn result reporting an error, the Captain pane shall display the synthesized failure line naming the underlying cause [[core-service-30](core-service.md#core-service-30)] as a ◆ failure line [[run-view-2](#run-view-2)], never only the captain's composed reply.
+
+#### run-view-187
+
+Where a playbook run stands in its recoverable failure state with the runtime's `aborted` cause — the Boss stopped it — the run view shall read that run as aborted rather than failed, in quiet colours, on its machine card [[run-view-61](#run-view-61)], its failure card [[run-view-147](#run-view-147)] — "/⟨command⟩ aborted at ⟨step⟩" — and its parked-run notice [[run-view-128](#run-view-128)] — "The /⟨command⟩ workflow is aborted." — the notice keeping the controls the session summary publishes for it, and shall show no failure line for the runtime's error repeating the turn's abort reason just before the turn's aborted line, where that reason is one the core stops a turn with — the Boss's abort or Spex closing — a runtime failure ending its turn with its own error keeping its line ([DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)).
+
+#### run-view-188
+
+Wherever the run view names a traced call's step or outcome [[run-view-178](#run-view-178)] [[run-view-184](#run-view-184)] [[run-view-186](#run-view-186)] [[run-view-37](#run-view-37)], it shall read the step table's words for a built-in playbook's player step and outcome, and the words of the id otherwise, the table also naming which outcome fields the runtime writes from the repository ([DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)):
+
+| Playbook | Step | Words | Repository fields |
+| --- | --- | --- | --- |
+| dev | planAnalysis | Choose the approach | — |
+| decide | askCoderProposal, askReviewerProposal | Propose a design | — |
+| decide | synthesizeCommit | Merge the proposals | latestCommit |
+| code | firstPhase | Implement | latestCommit |
+| code | irTaskPhase | Implement an IR task | latestCommit |
+| review | firstReview | Review | evaluatedRevision |
+| review | fixFindings | Fix the findings | latestCommit |
+| review | reviewAfterFix | Review the fixes | evaluatedRevision |
+| review | reviewAfterRejection | Review again | evaluatedRevision |
+| branch | createBranch | Create a branch | baseRevision |
+| pr | openPullRequest | Open a pull request | — |
+| inspect | inspecting | Inspect | — |
+
+| Outcome | Words |
+| --- | --- |
+| directCommit, committed | committed |
+| irCommit | committed an IR |
+| moreTasks | committed a task |
+| finalTask | committed the last task |
+| hasFindings | found problems |
+| noFindings | found no problems |
+| rejectedAll | rejected the findings |
+| proposed | proposed a design |
+| discussionComplete | closed the discussion |
+| code | chose /code |
+| decideThenCode | chose /decide, then /code |
+| codeViaPullRequest | chose /code with a pull request |
+| decideThenCodeViaPullRequest | chose /decide, then /code with a pull request |
+| branched | created the branch |
+| refused | refused |
+| opened | opened the pull request |
+| notPublished | did not publish |
+| completed | finished the inspection |
+| unavailable | could not inspect |
+| needsBossReply | asks you |
+
+- the words render in the interface language [[localization-4](localization.md#localization-4)];
+- a step the table does not list shows no repository identity.
+
+#### run-view-189
+
+Wherever the run view says where a run, a step, a lane or a call stands — a machine card's badge and states [[run-view-61](#run-view-61)] [[run-view-62](#run-view-62)], a lane's frame and header [[run-view-7](#run-view-7)], a call's result line, the state chip [[run-view-59](#run-view-59)], a return line [[run-view-184](#run-view-184)] — it shall use one vocabulary of five words, each in one colour: "running" (green), "done" (quiet), "aborted" (quiet), "failed" (red) and "waiting for you" (amber), the Captain's own "deciding" and "Captain is thinking…" standing apart ([DR-160](../decisions/160-the-captain-dispatches-in-plain-sight.md)):
+
+- a live run's badge reads "failed" in its failure state, "aborted" where the Boss's stop parked it there [[run-view-187](#run-view-187)], "waiting for you" where it waits on the Boss, and "running" otherwise;
+- a live run that would read "running" while a run it called still stands open reads as that called run where the called run, or one it called in turn, reads otherwise, so no caller reads running over a stopped call;
+- a lane's frame is green while its call is open and red where its last call failed.
+
+### Session Home
+
+#### run-view-67
+
+While the app is connected, the sidebar shall present navigation as surface entries around a Projects section listing every registered project ([DR-029](../decisions/029-session-history-home.md)) [[core-service-32](core-service.md#core-service-32)]:
+
+- Dashboard stands first, then the Projects section — its projects under a heading per place while any seat holds a project or is opening one [[run-view-168](#run-view-168)], and under no heading otherwise — then Playbooks, Space and Settings ([DR-150](../decisions/150-spex-space-product-and-destination.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md), [DR-175](../decisions/175-projects-shown-where-they-are-open.md), [DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md));
+- each project node discloses its sessions on a control of its own, an axis independent of which project is current ([DR-027](../decisions/027-linked-views-contract.md)) — the current project starts disclosed, and thereafter the reader's arrangement stands;
+- activating a project row makes it the current project and changes no disclosure;
+- a disclosed project lists its sessions by last activity, a working one first, the five most recent shown with one control revealing the rest in place and one control opening that project's start tab — a project holds at most one turn in flight [[core-service-4](core-service.md#core-service-4)], so starting a session is a composer away, never a conflict away ([DR-051](../decisions/051-runtime-held-for-a-turn.md));
+- a project row ends in a pointer control opening that project's Specs tab [[spec-view-1](spec-view.md#spec-view-1)], so the specs are a sidebar's step away — shown on the current project's row, and on another's while it is hovered or holds focus — standing outside the tree's one tab stop, as the disclosure does, the keyboard reaching the Specs tab by its shortcut;
+- a project whose sessions need a human carries a dot in the most severe of their colors on its own row, disclosed or not [[run-view-73](#run-view-73)];
+- the Projects section heading and its plus control each provide a target at least 24px high; the plus control opens the local-project add form [[projects-42](projects.md#projects-42)], where projects are added and created;
+- the surface entries are a navigation list publishing the current surface, and the projects and their sessions are one tree publishing disclosure, selection, and a single focus stop;
+- the tree's selection follows the surface: the current project's row and the session row whose tab is shown are selected only while Projects is the surface — on the Dashboard, Playbooks, Space, or Settings no row is selected and that surface's entry alone reads as current — and choosing Projects again selects the remembered project once more.
+- the surface the reader stands on is remembered across launches ([DR-030](../decisions/030-workspace-chrome.md)), so reopening the app — or reloading the page after a failure — returns them to it rather than to Projects ([DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md)).
+
+
+#### run-view-73
+
+Each session row in the sidebar shall read as its conversation — its title (the first Boss turn, or a never-spoken marker), its compact age with the exact moment in its tooltip, and a status mark — with its turn count and its qualified age in the row's accessible description [[core-service-32](core-service.md#core-service-32)] ([DR-029](../decisions/029-session-history-home.md)):
+
+- the age clamps a future moment to zero, rounds the difference to whole seconds, and at each boundary rounds that current unit into the next — seconds to minutes at 60, minutes to hours at 60, hours to days at 24, and days to weeks at 7; its visible form is `now` while the rounded seconds remain below 60, then one unit such as `3m`, `2h`, `5d` or `3w` with no `ago`, while its accessible form is `just now` or appends ` ago` to that unit;
+- the mark speaks attention first and life second, in the app's one status palette: red while the session holds an unacknowledged failure and amber for its every other entry — the one published fold naming which [[dashboard-9](dashboard.md#dashboard-9)] — then running while a turn is in flight, then idle ([DR-051](../decisions/051-runtime-held-for-a-turn.md));
+- the description says what the entry asks for in its own words — "failed", "waiting for your reply", "waiting for your verdict", "unread turn" — and a session the core cannot continue keeps that limitation in its description beside them, so a claim that a reply is owed never displaces it;
+- an idle session whose failure still stands [[core-service-32](core-service.md#core-service-32)] while it summons nothing wears a quieter historical mark that counts toward no attention signal;
+- every mark's meaning is in the row's accessible description, so color is never the only channel;
+- the active session's row carries the app's interaction hue, the treatment the surface entries already use;
+- the row's own controls — the project's disclosure caret above it and every non-live session's delete control — are 24px targets, the delete control revealed on hover and on keyboard focus alike; a session the terminal wrote asks its inline confirm in those words, its history going too ([DR-042](../decisions/042-sessions-continue.md)), and a session holding an unsent draft names the draft in its confirm ([DR-010](../decisions/010-interface-craft.md) §4).
+
+
+#### run-view-68
+
+When a session is activated in the sidebar, the workspace shall show that session's project and open the session as a tab, whatever project was current before ([DR-029](../decisions/029-session-history-home.md)):
+
+- a working session opens as its running tab, an idle one as a conversation a message continues, and history the core cannot continue as its read-only tab ([DR-042](../decisions/042-sessions-continue.md), [DR-051](../decisions/051-runtime-held-for-a-turn.md));
+- a session already open is focused rather than opened twice;
+- the project the switch made current is named where a new session would be dispatched [[run-view-25](#run-view-25)], so the target is never guessed;
+- the tab's close control files the session back to the sidebar, stopping nothing [[run-view-48](#run-view-48)], where it stays reachable.
+
+
+#### run-view-69
+
+While a session's tab is shown, the run view shall render it working, idle, or read-only by the session's own state, never navigating on that change ([DR-029](../decisions/029-session-history-home.md), [DR-051](../decisions/051-runtime-held-for-a-turn.md)):
+
+- a turn settling keeps the transcript on screen with the composer ready for the next message, nothing on the tab or the sidebar row saying "ended" — the runtime's release is not the reader's business;
+- a read-only session renders the identical fold of its stored records [[run-view-14](#run-view-14)], settled machine cards included [[run-view-62](#run-view-62)], headed by its title and the time it was last active;
+- each open session keeps its own scroll position as tabs change.
+
+
+#### run-view-71
+
+The sidebar shall collapse between its two states — the tree, and the icon rail alone — behind a control at its foot and a keyboard binding, persisting across launches ([DR-030](../decisions/030-workspace-chrome.md)):
+
+- collapsed entries keep their accessible names and gain tooltips, the config-and-playbooks foot indicator and the Projects section's palette control [[run-view-42](#run-view-42)] included — the control stays under the Projects entry in icon-only form, since collapse never hides a duty;
+- the attention count survives on the collapsed Dashboard entry [[run-view-34](#run-view-34)];
+- collapse is chrome only: the open tabs remain the reach [[run-view-48](#run-view-48)], so it makes nothing unreachable;
+- collapsing never strands focus.
+
+#### run-view-108
+
+While the attention count [[run-view-34](#run-view-34)] exceeds nine, the sidebar's Dashboard badge shall print "9+" — in the collapsed rail [[run-view-71](#run-view-71)] a positioned badge of at most two characters that never covers the entry's glyph — with the count itself in the entry's accessible name and tooltip ([DR-041](../decisions/041-chrome-that-fits.md)).
+
+#### run-view-81
+
+The run view shall divide the Captain column from the player panes at a divider the reader sets, persisting across launches ([DR-030](../decisions/030-workspace-chrome.md)):
+
+- the divider drags — landing under the pointer, the share read against the same box it resolves against, so the rule never trails the hand that moves it — nudges by arrow key, and restores its default on a double-click or Home;
+- the split is bounded so neither side can be squeezed away;
+- a machine drawing [[run-view-60](#run-view-60)] wider than its column by less than a quarter scales down to the column — the drawing's own container decides, as a container query and never a width hook ([DR-041](../decisions/041-chrome-that-fits.md)) — and one wider than that keeps its size and scrolls, the column showing that more lies beyond its edge — a drawing cut without a sign reads as broken rather than scrollable — the sign following the column's width as well as the reader's scrolling, so a drawing read to its end regains it when the column narrows behind more drawing;
+- the default is a 45% share, at which the built-in machines' drawings scale into a 1280px window's Captain column rather than scroll, and it holds whether or not a drawing is up — chrome never moves by itself ([DR-030](../decisions/030-workspace-chrome.md)).
+
+#### run-view-107
+
+While a session's tab is shown, the run view shall lay the Captain column and the player grid by the split's own container width — layout, never chrome moving by itself ([DR-041](../decisions/041-chrome-that-fits.md)): side by side with the divider [[run-view-81](#run-view-81)] between them from 42rem, and below that stacked, the Captain column above the player grid with the divider hidden and the split's setting kept for the wider form.
+
+### Keyboard and Guardrails (DR-010 §4/§6)
+
+#### run-view-42
+
+The project palette shall be fully keyboard-operable ([DR-011](../decisions/011-project-workspace.md)):
+
+- its searchable switcher opens from Cmd/Ctrl+P or submitting a composer with no project chosen, while the sidebar's Projects plus — in the expanded tree and the collapsed rail alike [[run-view-71](#run-view-71)] — and the welcome page's local-project action [[run-view-172](#run-view-172)] open its add form [[projects-42](projects.md#projects-42)];
+- the switcher's filter input holds focus — or, where no project is registered, the folder choice when a native picker exists and the path field otherwise [[projects-22](projects.md#projects-22)] — while the add form focuses the folder choice or its existing-path fallback [[projects-42](projects.md#projects-42)];
+- arrow keys move the highlight over the Academy row where it leads the list, the project rows, and "Open folder…";
+- Enter picks, in an empty path field too, while a typed path adds;
+- the palette announces itself modal, and Tab and Shift+Tab wrap inside it;
+- Escape closes from anywhere inside the palette and returns focus to the opener with any composer draft intact, never auto-sending.
+
+#### run-view-43
+
+While a slash menu is open, when Escape is pressed, the slash menu shall hide without touching the composer draft, with typing reopening it:
+
+- The slash menu exposes listbox semantics (options with selection state reflected to assistive technology via the composer's active-descendant).
+
+#### run-view-48
+
+The tab strip shall show the current project's open sessions, working and idle alike:
+
+- the strip holds the sessions the reader has opened — the working set, not the archive, which the sidebar keeps [[run-view-67](#run-view-67)];
+- session tabs are titled by the session's first Boss turn (truncated; "new session" before the first turn) with the full prompt and start time in the tooltip — never by the project name, which the sidebar carries ([DR-011](../decisions/011-project-workspace.md));
+- tabs carry the shared attention signal [[dashboard-9](dashboard.md#dashboard-9)]: a red dot for a failure and an amber one for every other entry, standing on the active tab as well as a background one — showing a session clears what showing settles [[run-view-134](#run-view-134)], so a dot that stands is one the reader still owes — with the detail in the tab tooltip — a failure entry's tooltip carrying the catalogue's phrase for the cause that entry names [[run-view-147](#run-view-147)] [[dashboard-1](dashboard.md#dashboard-1)] ([DR-075](../decisions/075-a-failure-says-what-and-what-now.md)) — and the tab's accessible name ending in that entry's own words — "failed", "needs your reply", "needs your verdict", "unread turn" — so the dot is never the only channel, and a tab of history the core cannot continue says "history" ([DR-051](../decisions/051-runtime-held-for-a-turn.md));
+- each tab's close control files the session out of the working set, stopping nothing and confirming nothing ([DR-029](../decisions/029-session-history-home.md)), and after a tab closes focus moves to a neighboring tab, never to the document body;
+- the strip scrolls horizontally when tabs overflow, keeps the new-task control — a plus glyph and a visible name identifying the task composer, with the same destination in its accessible name and tooltip ([DR-041](../decisions/041-chrome-that-fits.md)) — reachable, exposes tab-list semantics, and keeps the active tab scrolled into view; choosing it opens the composer but does not submit a task;
+- the strip has one Tab stop — the active tab — and Arrow Left, Arrow Right, Home, and End move focus between session tabs, the new-session control, and the pinned tabs without activating any;
+- a tab tooltip that names a shortcut prints it with the platform's own modifier (⌘ on a Mac, Ctrl elsewhere).
+
+#### run-view-49
+
+The app shall provide keyboard shortcuts implemented in the web UI (so they work identically in a browser), each preventing the host's own default: Cmd/Ctrl+1..5 switch surfaces in the sidebar's order [[run-view-67](#run-view-67)] ([DR-172](../decisions/172-surfaces-a-fresh-user-reads.md), [DR-176](../decisions/176-global-playbooks-and-a-placed-playbook-runs.md)), Cmd/Ctrl+, opens Settings, Cmd/Ctrl+P opens the project palette, Cmd/Ctrl+N opens the new-session tab (or the palette when no project is chosen), Cmd/Ctrl+B collapses and restores the sidebar [[run-view-71](#run-view-71)], Cmd/Ctrl+Shift+S toggles the Specs tab with the previous tab, Cmd/Ctrl+Shift+[ and ] cycle the current project's open tabs including the pinned ones [[run-view-48](#run-view-48)], and a printable key pressed outside any input and outside the sidebar refocuses the Boss composer:
+
+- every control that names its binding prints the platform's own modifier — ⌘ on a Mac, Ctrl elsewhere — from one shared table of the bindings;
+- that table is listed as a sheet on the Settings surface [[settings-10](settings.md#settings-10)], the modifier bindings and the plain keys alike;
+- a binding that opens a surface lands focus inside it — on its Boss composer where it shows one, else on the surface's region named for it — and Cmd/Ctrl+B lands focus on the sidebar's collapse control in both of its states, unless the project palette is open, which keeps focus [[run-view-42](#run-view-42)].
+
+### First-Hour Integrity (DR-010 §5)
+
+#### run-view-44
+
+While the shared config is invalid or missing, the Captain home shall say so in the thread — listing the actual errors, or saying there is no config file yet where it is missing — with an in-place link to Settings, where the missing file's remedy waits [[settings-24](settings.md#settings-24)], never rendering the captain identity blank; with no project registered, the welcome page shall show the same failure and Settings action [[run-view-172](#run-view-172)].
+
+#### run-view-45
+
+While the selected Captain adapter reports not ready on a project's home, the run view shall explain beside the composer that a task cannot start, keep its draft editable, block dispatch, and offer Settings and an in-place re-check ([DR-135](../decisions/135-a-welcome-page-before-the-first-project.md)):
+
+- where a different adapter is ready, the notice shall also open the Captain's in-place agent editor to switch to it [[run-view-32](#run-view-32)];
+- the app re-checks readiness when its window regains focus while anything is not ready;
+- readiness covers every adapter any configured agent names.
+
+#### run-view-50
+
+The app shall fail loudly and stay accessible:
+
+- when the app is connected but its initial state failed to load, a banner says so and offers retry — never a silently empty app;
+- when the page has never reached its core, a banner names the endpoint it keeps dialing with a Retry once eight seconds have passed since the page opened — a first connect is "Connecting", never "Reconnecting", and a slow core gets that long before the alarm; a remote place's banner names the server, not an endpoint, and its Retry redials that place alone [[run-view-168](#run-view-168)];
+- one persistent polite live region announces a player waiting for a reply, connection loss and restoration, and attention-count increases to assistive technology;
+- icon-only controls carry accessible names and at-least-24px hit targets, and the navigation exposes the current surface and badge meaning to assistive technology;
+- one glyph carries one meaning across the app ([DR-010](../decisions/010-interface-craft.md) §8): the gear names the Settings surface, and an in-place editor wears the pencil;
+- color is never the only channel: a player pane's running mark says "running" in text, a tool card's outcome is a mark with its word — ✓ ok, ✗ failed, ✗ denied — and a failure count and a tab's attention dot each carry their meaning in text;
+- a box the reader can scroll that holds nothing focusable of its own takes the keyboard stop itself, with an accessible name for what it holds, so what a pointer can reach the keyboard reaches too;
+- no action strands focus on the document body: ending a session lands focus on the session's tab, backing out of the end confirm returns it to the end control, and aborting a turn keeps it in the Captain pane until input becomes available.
+
+#### run-view-51
+
+Where the Captain home has nothing to report (no warnings or errors), it shall center its whole cluster — project task guidance, Captain role, and composer — on the canvas, reverting to the bottom-docked layout once real content exists; session history lives in the sidebar [[run-view-67](#run-view-67)], never on the home ([DR-141](../decisions/141-project-start-explains-the-task-and-slash-discovery.md)).
+
+### Project Workspace (DR-011)
+
+#### run-view-56
+
+The Projects surface shall name the current project in the sidebar's Projects section rather than in a bar of its own [[run-view-67](#run-view-67)] ([DR-029](../decisions/029-session-history-home.md)):
+
+- the project switcher opens from its keyboard binding [[run-view-49](#run-view-49)], and the sidebar's Projects plus opens the add form [[projects-42](projects.md#projects-42)];
+- while no project is chosen, the tab strip (including pinned tabs) is absent and the sidebar plus the Captain home's guidance is the whole surface.
+
+
+#### run-view-57
+
+Each project shall keep its own working set — the sessions open as tabs and which tab is active — restored when the project becomes current again, with only the current project persisting across launches ([DR-029](../decisions/029-session-history-home.md)):
+
+- a session activated again is focused rather than opened twice, and removing a project discards its working set with it;
+- when the user arrives via an attention affordance (a Dashboard row or a palette row with a needs-you signal), the workspace focuses the session that needs the human instead of the remembered tab;
+- a fresh launch opens the current project's working session if it has one and the start tab otherwise — the sidebar, not the working set, is what carries history across launches [[run-view-67](#run-view-67)];
+- a launch with no remembered project adopts one wherever the workspace holds any — a live session's project, else any registered one — so a workspace with projects never opens asking which.
+
+#### run-view-58
+
+After its session tabs and the new-task control [[run-view-48](#run-view-48)], the tab strip shall hold the pinned tabs Specs, Playbooks, Packages and Overview, in that order — per project one spec view, the playbooks a session in it can run [[playbook-library-1](playbook-library.md#playbook-library-1)], its packages [[environments-14](environments.md#environments-14)] and one project overview [[projects-4](projects.md#projects-4)] — with the applets' tabs after them [[applets-1](applets.md#applets-1)], each taking part in the tab list and the tab-cycling shortcut ([DR-038](../decisions/038-history-is-done-work.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)):
+
+- Switching projects swaps the whole strip; sessions of other projects keep running and stay reachable through the sidebar [[run-view-67](#run-view-67)], the palette's live-state rows, and the Dashboard.
+- When the current project's specs tree is known and contains spec items, the Specs tab shows the item count as a plain text suffix, spoken with the item unit; loading, empty, legacy, and unreadable trees keep the unnumbered tab. This is navigation context, not an attention badge [[run-view-25](#run-view-25)].
+
+### Intent Ledger (DR-035)
+
+#### run-view-85
+
+When the composer's add-to-Up-next action is activated, the Boss composer shall capture the typed text as a queued intent for the session's project with chat provenance and acknowledge the capture in place, sending nothing ([DR-035](../decisions/035-intent-ledger.md), [DR-077](../decisions/077-up-next-is-a-committed-queue.md)):
+
+- the capture starts no turn and queues no submission [[run-view-8](#run-view-8)] — the text joins Up next but is not sent by capture;
+- the acknowledgment is an inline note in the composer's caption line [[run-view-106](#run-view-106)] naming where the row landed — "Added to Up next — see the project's Overview.", the project's Up next in its Overview tab, where the row's Remove waits [[dashboard-29](dashboard.md#dashboard-29)] — the run view's form of the shelf reveal;
+- the action stands beside send as the composer's one secondary action, labeled "Add to Up next" — by where the text goes, never by a mechanism — with no Start capture action beside it; on the Captain home it uses a text treatment so Start task remains the dominant action.
+
+#### run-view-86
+
+When Start is activated on a queued intent, the run view shall stage the intent's text into the project's composer, focused — the current conversation's [[core-service-93](core-service.md#core-service-93)], or the Captain home's where the project has none — under a visible chip carrying the intent's title, and the chip governs what a send stamps ([DR-035](../decisions/035-intent-ledger.md), [DR-051](../decisions/051-runtime-held-for-a-turn.md)):
+
+- emptying the composer or dismissing the chip detaches the intent, and a send then stamps nothing — the intent simply stays queued;
+- sending with the chip attached passes the intent's id with the Boss submission [[core-service-5](core-service.md#core-service-5)];
+- while the submission waits in the composer queue [[run-view-8](#run-view-8)], the chip rides the pending bubble [[run-view-38](#run-view-38)] and the intent stays queued until its turn starts.
+
+#### run-view-87
+
+When a dispatched intent's final turn ends finished, the run view shall render the intent's delivery card at that turn's end in the Captain thread — a first-class settled card carrying the intent's title, its provenance chip where the intent carries a source, a run-stats line, and a primary Confirm control with Drop beside it ([DR-035](../decisions/035-intent-ledger.md)):
+
+- the run-stats line folds from the intent's own turns — its review rounds foremost, omitted when zero, then its turn count and its elapsed time from dispatch to the last turn's end, in the duration vocabulary [[run-view-145](#run-view-145)] — so the verdict is informed before the click;
+- the provenance chip with a canonical URL is a link that opens outside the page — a new browsing context, with no referrer — so the session never navigates away, and the same chip is the one the bound turn's bubble wears [[run-view-89](#run-view-89)];
+- the card says visibly that a follow-up message continues the intent only while it is the newest open dispatched intent owning the conversation [[run-view-90](#run-view-90)]; a successor admitted by clean settlement leaves this card and its verdict controls in place ([DR-077](../decisions/077-up-next-is-a-committed-queue.md));
+- when a verdict is given, the card resolves in place into the project's core-published next queued intent and standing [[core-service-49](core-service.md#core-service-49)], with its `Queued` mark and, from the published standing, the exact scheduling phrase where one applies and Start exactly when manual start is available [[dashboard-59](dashboard.md#dashboard-59)];
+- the visible Start label stays short while its accessible name identifies that queued intent ([DR-041](../decisions/041-chrome-that-fits.md));
+- only when the project queue holds no row does the card resolve into the inline add affordance;
+- the resolved row's queued-intent title and its standing phrase share its sole shrinkable text region and one line at and above the `@md` container step, each truncating with its full text in its title; below `@md` the phrase takes its own line within that region, while the `Queued` mark and available Start remain visible ([DR-041](../decisions/041-chrome-that-fits.md));
+- in an ended session the card replays identically from the stored fold [[run-view-14](#run-view-14)], its verdict controls still live wherever the intent is open — the ruling reads no runtime state and the Dashboard row takes the same act [[dashboard-56](dashboard.md#dashboard-56)] — and any resolved-card Start or add is inert there, a new turn being what it needs.
+
+#### run-view-88
+
+While the Captain home is shown and the current project's queue holds an unblocked intent, the Captain home shall present a next card naming the core-published next intent and standing [[core-service-49](core-service.md#core-service-49)], with its `Queued` mark and, from the published standing, the exact scheduling phrase where one applies and Start exactly when manual start is available [[dashboard-59](dashboard.md#dashboard-59)], Remove beside it [[run-view-114](#run-view-114)], and a count of the remaining queued intents alongside the project task guidance [[run-view-25](#run-view-25)] ([DR-035](../decisions/035-intent-ledger.md), [DR-077](../decisions/077-up-next-is-a-committed-queue.md)):
+
+- the queued-intent title, standing, and remaining count occupy the card row's sole shrinkable text region; the title and standing share one line at and above the `@md` container step, each truncating with its full text in its title, while below `@md` the standing takes its own line and the count keeps its own line within that region; the `Queued` mark, available Start, and Remove remain visible ([DR-041](../decisions/041-chrome-that-fits.md));
+- the visible Start label stays short while its accessible name identifies the queued intent ([DR-041](../decisions/041-chrome-that-fits.md));
+- where Start is available, it stages through [[run-view-86](#run-view-86)] into the current conversation's composer when one exists, or into the home composer when none does, where sending creates the session and dispatches the text in one motion [[run-view-26](#run-view-26)].
+
+#### run-view-89
+
+While a Boss turn is bound to an intent, that turn's outgoing bubble [[run-view-30](#run-view-30)] shall wear the intent's source chip, so the thread shows the provenance of what it dispatched ([DR-035](../decisions/035-intent-ledger.md)):
+
+- the chip names the intent's source — issue, PR, record, or chat — and an unsourced intent's bubble wears none;
+- a trailing line of the dispatched text that only repeats the source's URL stays out of the bubble, since the chip carries it.
+
+#### run-view-90
+
+While a session's lane holds an open dispatched intent, the run view shall show a slim working line above the Boss composer naming that intent — the newest open intent, which owns the conversation — with Drop beside it [[run-view-113](#run-view-113)], so re-entry is answered where the eye lands ([DR-035](../decisions/035-intent-ledger.md)).
+
+#### run-view-134
+
+While a session is the workspace's shown session with its transcript loaded [[run-view-14](#run-view-14)], the run view shall keep that session's last-viewed marker at that session's greatest ended turn [[core-service-48](core-service.md#core-service-48)] ([DR-066](../decisions/066-every-summons-has-a-door.md)):
+
+- the condition holds however the reader arrived and whether or not this core can continue the conversation, so a session synced from another device or written by the CLI clears like any other;
+- a turn still in flight is never named, so a turn the reader has not seen end still summons [[dashboard-4](dashboard.md#dashboard-4)];
+- a session listed, streamed, prefetched, or restored into a tab the reader has not shown is never marked — being drawn in a list is not a gesture taken on a conversation ([DR-065](../decisions/065-repairs-the-reader-answers.md));
+- a refused write [[core-service-48](core-service.md#core-service-48)] [[core-service-86](core-service.md#core-service-86)] leaves the condition standing, so the next fold the core publishes asserts it again;
+- the marker clears the session's unread-turn entry alone and no intent entry, whose verdict is owed regardless of reading [[dashboard-4](dashboard.md#dashboard-4)].
+
+#### run-view-91
+
+When the workspace opens a session from an attention entry [[dashboard-1](dashboard.md#dashboard-1)], the run view shall focus that entry's place in the thread ([DR-035](../decisions/035-intent-ledger.md)):
+
+| The entry stands on | The focused place |
+| --- | --- |
+| a pending question | the question's incoming bubble [[run-view-9](#run-view-9)] |
+| an unacknowledged failure | the failure's ◆ line [[run-view-2](#run-view-2)] |
+| a finish awaiting its verdict | the delivery card at the intent's final turn [[run-view-87](#run-view-87)] |
+| a turn the reader has not read | the end of that turn [[run-view-134](#run-view-134)] |
+
+#### run-view-113
+
+While the working line names an open intent [[run-view-90](#run-view-90)], the run view shall offer Drop on the line, which — behind an inline confirm, Drop or Keep, since work is underway ([DR-010](../decisions/010-interface-craft.md) §4) — closes that intent dropped over the protocol while the turn keeps running ([DR-035](../decisions/035-intent-ledger.md)):
+
+- the outcome — the drop, or the refusal with its reason — announces in a status line where the working line stood, lasting six seconds;
+- Keep returns focus to the control; a drop hands it to the enabled composer, or to its outcome notice while input is disabled, once the line has left with its control ([DR-010](../decisions/010-interface-craft.md) §6);
+- while its outcome has continuously retained focus, the handoff reaches the composer when input becomes enabled, or before the notice expires if input is already enabled; if the notice expires while input is disabled, ordinary readiness hands body focus to the composer [[run-view-8](#run-view-8)]; a control the reader chose meanwhile retains focus through readiness and expiry.
+
+#### run-view-114
+
+While the next card names the queue's head [[run-view-88](#run-view-88)], the Captain home shall offer Remove on that card, beside Start where Start is available, acting on the click with no confirmation and leaving no history ([DR-038](../decisions/038-history-is-done-work.md)), then a status line — "Removed “⟨title⟩” — Undo", lasting six seconds beyond the last moment its control holds focus, which it takes from a keyboard-driven removal alone — that re-queues the same text and provenance with its capture time kept, at its place by age:
+
+- a pointer removal leaves the pointer where it is, so the line lapses on schedule and never stands as a prompt;
+- the card stays while the Undo line stands, even once no queued intent is left behind it, and a restored intent's Start takes focus where available, otherwise its Remove does.
+
+### Places
+
+#### run-view-168
+
+While the app is connected, the window shall hold one connection per core — the local core and each seat the person has open [[core-service-128](core-service.md#core-service-128)], reached at its relay path [[core-service-129](core-service.md#core-service-129)] — each a **place**, "This computer" or the server's name, and shall keep each core's state in a store of that core's own ([DR-133](../decisions/133-one-desktop-over-several-cores.md)):
+
+- no protocol id is re-keyed; per-project preferences are kept by place and project, the local place's under today's keys;
+- the sidebar's Projects section lists each place's projects under a heading naming the place while any seat holds a project or is opening one [[run-view-67](#run-view-67)], a seat holding none adding no heading and no page of its own, activating a heading showing that place's current project on the Projects surface, and, while any heading stands, the project palette names the place of each open project ([DR-175](../decisions/175-projects-shown-where-they-are-open.md));
+- the project palette lists, under one "From your groups", every spex repository the signed-in instances list that this computer lacks, each once, its row reading the project's name and its group — "Personal" for the person's own — and never the records' key; every row of the palette, an open project's or a group's, carries the Open control of its Space row [[space-111](space.md#space-111)] — "Open here", "Show", "Open on <server>" and "Show on <server>" as that row offers them, a server entry reading "Signing in to <Space>…" disabled while that seat's sign-in still runs [[run-view-170](#run-view-170)] — Enter activating the first; an open sends that place's core `space.join` — with the folder the picker opened by the act takes on this computer [[space-63](space.md#space-63)], with no folder on a seat [[run-view-169](#run-view-169)] — the row reading "Opening…" while that open runs and offering "Try again", which sends it again, once it stopped; the list reads "No projects in your groups yet" while the instances list no project of the person's groups, and "All your groups' projects are open here" while this computer holds every one they list ([DR-159](../decisions/159-projects-in-groups-opened-where-you-work.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md), [DR-175](../decisions/175-projects-shown-where-they-are-open.md));
+- a project opened from the palette is its place's current project at once, the Projects surface showing that place: while its open runs at a place [[space-63](space.md#space-63)], the sidebar lists it under that place after the place's projects, reading "Opening…" with the step in flight as its title and selected where it is current [[run-view-67](#run-view-67)], and the Projects surface shows its name over the step in flight in place of the greeting [[run-view-25](#run-view-25)] or the welcome page [[run-view-172](#run-view-172)]; an open that stopped shows its cause there with "Open Space", whose row holds the way on [[space-63](space.md#space-63)]; once the place's core lists the project, its own view replaces them, its specs and config read then and not before ([DR-159](../decisions/159-projects-in-groups-opened-where-you-work.md));
+- Settings and Space show one place at a time, named, where any seat is open, by a selector that reads "This computer" or the server's name, a seat's being the seat's own, while a project's tabs stand at the project's place [[run-view-58](#run-view-58)] ([DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)); a Dashboard link to a project opens it at the project's place;
+- a connection, its banner and a protocol mismatch are per place [[run-view-50](#run-view-50)]: one core failing leaves the others;
+- the page's language stays the local home's, a remote place's phrases arriving as its core composed them.
+
+#### run-view-169
+
+While a project stands at a remote place [[run-view-168](#run-view-168)], the app shall offer for it no folder picker, no reveal and no path entry — a repair's "Use <folder>" and "Choose folder…", a package's folder, a draft's picked file and pasted path among them — and shall open a project on a seat by naming it among the projects of the member's groups, sending that place's core a join with no folder ([DR-133](../decisions/133-one-desktop-over-several-cores.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md)):
+
+- one spex repository cloned here and on a seat is one project shown under each place, its sessions and intents reading "Runs on <label>" at the place that does not hold them [[core-service-107](core-service.md#core-service-107)].
+
+#### run-view-170
+
+While this computer's Space surface shows an instance that lists servers [[core-service-128](core-service.md#core-service-128)], the surface shall list each server as one line under the heading of its group [[space-1](space.md#space-1)], by its name, reading "Connected" with Disconnect in its overflow while a seat is open at it and its name alone otherwise, a seat opening there on "Open on <server>" of any spex repository's row [[space-111](space.md#space-111)] and on nothing else ([DR-133](../decisions/133-one-desktop-over-several-cores.md), [DR-159](../decisions/159-projects-in-groups-opened-where-you-work.md), [DR-172](../decisions/172-surfaces-a-fresh-user-reads.md), [DR-175](../decisions/175-projects-shown-where-they-are-open.md)):
+
+- the first open of a seat at a server on this device shows the instance's contract as bullets, no paragraph, in the words its record fixes, rendered in the page's language, explicitly naming the placed credential as the Space sign-in and private packages as requiring a separate registry sign-in on that seat [[core-service-143](core-service.md#core-service-143)], with "I understand" as the control that sends `server.open` with consent, and a later open sends it at once;
+- while `server.open` runs, the line reads "Connecting to <server>…", titled, past ten seconds, "The first connection can take a minute", the page waiting as long as the admission may take [[core-service-128](core-service.md#core-service-128)];
+- once the seat is open and until its sign-in at the instance completes [[core-service-128](core-service.md#core-service-128)], the line reads "Signing in to <Space>…" while the sign-in is pending and, where the instance asks for its page, "Approve Spex on <server> in your browser" with the approval's link in its place, the desktop shell having opened it, and a sign-in that fails reads its cause with "Sign in again", which starts the seat's sign-in afresh ([DR-164](../decisions/164-the-seat-signs-in-on-its-ticket.md));
+- a refusal of the open reads the core's relayed cause on the server's line, the row's "Open on <server>" offered again;
+- Disconnect sends `server.close`, the seat's projects leaving the sidebar and the selector.
+
+## Internal Behavior
+
+### Protocol Boundary
+
+#### run-view-13
+
+Where the run view renders a project session, the run view shall consume only messages of the versioned WebSocket protocol defined in `packages/core` ([DR-002](../decisions/002-desktop-app-architecture.md)):
+
+- the run view imports no Node-only modules and calls no `@sublang/cligent` or `@sublang/playbook` APIs directly;
+- every record it renders arrives as a protocol message ([DR-003](../decisions/003-runtime-reuse.md)).
+
+#### run-view-14
+
+Where the run view receives a session's summaries and ordered record stream, the run view shall render pane structure and content as a function of those received protocol messages alone, so replaying the same messages reproduces an identical view with no live runtime attached:
+
+- Unknown kinds and records lacking a string `type` or finite numeric `timestamp` advance only the sequence cursor.
+
+### Transcript Rendering
+
+#### run-view-15
+
+Where a player transcript exceeds the visible viewport, the transcript view shall mount only the entries in and near the viewport, keeping the mounted entry count bounded regardless of transcript length:
+
+- When the user scrolls, the transcript view reveals previously unmounted entries with content identical to an unvirtualized render.
+
+#### run-view-16
+
+While consecutive text deltas for the same player message are pending within one render frame, the transcript view shall coalesce them into a single append, preserving delta order and content byte-for-byte and never merging deltas across different messages or players.
+
+### Captain Pane Rendering
+
+#### run-view-17
+
+When the session record stream delivers a captain record whose kind is outside the glyph vocabulary of [[run-view-1](#run-view-1)], the Captain pane shall render the record's text as a plain line rather than dropping the record.
+
+#### run-view-180
+
+Where a session's records name `dev.reviewer`, `docs.reviewer` and `dev.coder`, the test suite shall assert `dev.coder`'s lane header and rail read coder with a "C" mark of the players' neutral colour, distinct from the Captain's, and its id in the tooltip, while each reviewer reads as its full id [[run-view-177](#run-view-177)].
+
+#### run-view-181
+
+Where a fixture stream calls `dev.coder` and then `dev.reviewer` twice, the second reviewer call after a context changing its model, with one call reporting its model in `init`, one bound to a role two bindings disagree on, and one whose setting names no model, the test suite shall assert, rendering it live and again from stored records, one delegation line per first call and per changed model at its call's place, each reading as the table of [[run-view-178](#run-view-178)] says — the reported model, the configured one, "provider default", or the adapter alone — earlier lines keeping their model after the change, the lines standing after the run's card closed, a failed delegation with no player record adding none, and activating a line scrolling the grid to that lane [[run-view-178](#run-view-178)].
+
+#### run-view-182
+
+Where failures arrive for the Captain's own turn and for causes naming `dev.reviewer` — an expired sign-in, a rate limit, a command not installed, an unknown adapter and an unrecognized message — the test suite shall assert each line names its agent by name and offers exactly the entries of [[run-view-179](#run-view-179)]'s table; that "Adjust reviewer" brings the reviewer's lane into view, highlights its chip and opens its popover there, and opens it from the failure where no lane stands; that "Adjust Captain" opens the popover from the Captain pane's chip and is absent where the Captain's chip is; and that "Change reviewer in Settings" asks for Settings at that player's row [[run-view-179](#run-view-179)].
+
+#### run-view-190
+
+Where a fixture stream recorded from the real runtime on substitute agents runs `/dev`, whose analyst picks deciding before coding, through `decide` — the coder's and the reviewer's proposals in parallel, the reviewer's ending later, the coder merging and committing, its nested review passing — and then `code`, whose commit its own review passes, the test suite shall assert, rendering it from its records taken one at a time, as live, and again from the stored records at once, with the same lines, labels and cards:
+
+- one delegation line per call naming its player and step, the model only at each player's first call [[run-view-178](#run-view-178)] [[run-view-188](#run-view-188)];
+- one return line per call with its outcome's words, the merge's and the code step's commits matching the receipts their transitions carry and the reviews' evaluated revisions likewise, and the merge's reply's first line [[run-view-183](#run-view-183)] [[run-view-184](#run-view-184)];
+- before the merge's outcome arrives, its line reads "← coder handed back" marked "judging" with no commit [[run-view-183](#run-view-183)] [[run-view-184](#run-view-184)];
+- the coder's lane names its three calls "decide › Propose a design", "decide › Merge the proposals" and "code › Implement", the merge's tooltip naming "dev › decide › Merge the proposals" [[run-view-186](#run-view-186)];
+- while both proposals run, the `decide` card holds both proposal steps active, each wearing its own player's running mark, and the thread shows one chip per proposal [[run-view-185](#run-view-185)] [[run-view-37](#run-view-37)];
+- activating a delegation line brings the lane into view, and activating the call's place lights its delegation line [[run-view-178](#run-view-178)] [[run-view-186](#run-view-186)];
+- the merge's delegation line is named "Handed to coder, Merge the proposals" and its return line "← coder committed ⟨commit⟩, ⟨duration⟩" [[run-view-178](#run-view-178)] [[run-view-184](#run-view-184)];
+- rendered with Chinese resolved, the merge's delegation line reads "交给 coder · 合并方案", its return line "← coder 已提交", and the coder's lane "decide › 写方案", "decide › 合并方案" and "code › 实现" [[run-view-188](#run-view-188)].
+
+#### run-view-191
+
+Where a fixture stream recorded from the real runtime on substitute agents runs `/dev` into `decide`'s parallel proposals and the Boss aborts the turn after the coder's proposal came back and while the reviewer's runs, the test suite shall assert that the `decide` card's badge, the state chip, the parked-run notice and the failure card read aborted and no failure line stands [[run-view-187](#run-view-187)] [[run-view-189](#run-view-189)], that the reviewer's return line reads "← reviewer aborted", and that the coder's reads "← coder handed back" marked "unconfirmed" [[run-view-184](#run-view-184)].
+
+#### run-view-192
+
+Where synthetic trace streams pose what a recording cannot, the test suite shall assert each case [[run-view-183](#run-view-183)] [[run-view-184](#run-view-184)]:
+
+| Case | Asserted |
+| --- | --- |
+| review walks its first step twice | each round's return line takes its own round's outcome, and the reviewer's lane names the second call's step with "round 2" [[run-view-186](#run-view-186)] |
+| two branches start and end apart | each branch's line takes its own step's outcome, a sibling's later call cutting off neither |
+| one transition accepts two outcomes, another run's record and the state telemetry between them | both lines read their outcome's words and neither names a commit |
+| a transition's outcomes are never followed by another record of their run | the line reads its outcome's words and names no commit |
+| a run ends with a call back and no outcome for it | the line reads "unconfirmed" |
+| a call's judgment fails and its run moves to its failure state | the line reads "failed" |
+| a call comes back asking the Boss | its line reads "← coder asks you", marked "waiting for you", without the question's words |
+| a traced call fails before its player records anything | its delegation line stands and leads nowhere, no lane appears, and no return line follows [[run-view-178](#run-view-178)] |
+| a playbook the step table does not list | its step and outcome read as their ids' words and no commit is named [[run-view-188](#run-view-188)] |
+| another run's transition and disposal come between a transition and its outcome | the line names its own transition's commit |
+| a transition accepts an outcome no call takes beside one a call takes | the line reads its outcome's words and names no commit |
+| the process dies in a call and a restore follows | the call runs no more, and its player's next prompt goes to that player's next call |
+| a runtime failure ends its turn with its own error | its failure line stands [[run-view-187](#run-view-187)] |
+| a run's step not called yet, the bindings changed since the run started | the step wears the player the run's context bound [[run-view-185](#run-view-185)] |
+
+### Pane Management
+
+#### run-view-18
+
+The pane manager shall key each pane by its player id [[run-view-7](#run-view-7)] and route no record carrying `hidden` visibility to any pane, so judge and router traffic reaches no transcript.
+
+### Session Start Rendering
+
+#### run-view-28
+
+The start view shall obtain projects, playbooks, captain identity, and readiness exclusively through existing protocol commands and broadcasts, detecting the native picker by feature-testing the shell bridge ([DR-008](../decisions/008-native-shell-bridge.md)) and falling back to manual path entry when the bridge is absent so the identical build serves browser deployments.
+
+## Verification
+
+### Attachment and Media Controls
+
+#### run-view-156
+
+Where a rendered composer holds a controlled upload lifecycle, when the integration suite picks, drops, and pastes real browser files and settles or rejects their uploads, it shall verify acquisition, named states, progress, removal focus, retry, disabled behavior, and unaffected ordinary text input [[run-view-153](#run-view-153)], with attachment-only sending enabled only after every selected upload succeeds and the submitted user text remaining empty [[run-view-154](#run-view-154)].
+
+#### run-view-157
+
+Where a rendered conversation receives trusted image, audio, video and document bytes alongside unavailable content and external references, the integration suite shall verify bounded previews, explicit image expansion, native non-autoplay media controls, named downloads, loading and failure states, object URL cleanup and no external media fetch [[run-view-155](#run-view-155)].
+
+#### run-view-161
+
+When persisted fixture records are replayed into session and authoring conversations, integration verification shall assert ordered attachment-only Boss messages, actor-attributed Captain figures, native worker and authoring media captioned with their recorded turn, native session and tool identity, Captain figures distinguishing their Playbook runtime and invocation identity, and no invented identifiers, hidden-controller exclusion, deferred original tool detail, unavailable-content retry, external-link non-fetching, and owner-scoped reads after remount [[run-view-160](#run-view-160)].
+
+#### run-view-159
+
+When rendered first-message, session, authoring and queued-intent flows use the protocol client, the integration suite shall verify byte upload and retry, removal cancellation, drafts retained after failed sends and navigation, attachment-only admission, and ordered references retained through queued-intent editing, staging and dispatch [[run-view-158](#run-view-158)].
+
+### Recovery Journey
+
+#### run-view-111
+
+When a browser journey opens an interrupted CLI-created session, it shall verify the recovery controls [[run-view-110](#run-view-110)]:
+
+- the saved input is visible, submission is blocked, and Discard's confirmation supports keyboard cancellation;
+- Restore sends only the session ID without a confirmation and displays the Captain's report, with no agent's reply;
+- an attempt with a recorded step shows Restore alone;
+- Discard refusal preserves the error, transcript and draft; successful discard shows the restored state or closes the removed session;
+- pending requests cannot be submitted twice — a double activation of Restore reports once — and disconnected controls cannot dispatch.
+
+
+### Fixture Replay Coverage
+
+#### run-view-20
+
+Where a recorded fixture stream of a completed playbook session is replayed into the run view over the protocol [[run-view-14](#run-view-14)], the test suite shall assert that the rendered result matches the fixture's expectations: the Captain pane holds the expected glyph lines in arrival order [[run-view-1](#run-view-1)], the fixture's status line `START_PROPOSE` reads "start propose" and its `→ needsBossReply` reads "→ needs boss reply", each with its name as written in its tooltip and neither name in the copy [[run-view-1](#run-view-1)], one pane exists per player the fixture's call records reach, in the order of their first records, a bound player no record reaches has none, and a record narrowing the engaged players removes none [[run-view-7](#run-view-7)], player transcripts render the expected Markdown text [[run-view-3](#run-view-3)], tool-use entries appear as collapsed cards labeled by tool name and input subject, with a subject-less input labeled by name alone, their bodies printing string fields verbatim and other values as JSON with fixture result spans rendering `<1s`, `12s`, `3m 12s`, and `2h 5m` rather than raw milliseconds [[run-view-4](#run-view-4)] [[run-view-145](#run-view-145)], each pane's header naming its latest call's role [[run-view-7](#run-view-7)], a transcript's Markdown link to a target the shell cannot open renders as plain text while an `https` one stays a link [[run-view-83](#run-view-83)], every completed call with a token report shows its token totals and no pane shows a monetary figure though the fixture records a cost [[run-view-6](#run-view-6)], opaque records only advance the cursor, and later supported records still render [[run-view-14](#run-view-14)], and the machine card assertions of [[run-view-66](#run-view-66)] hold over the same replay.
+
+#### run-view-144
+
+Where a fixture session summary reports the Captain's active time at 3,840,000 milliseconds, one player's at zero, another player's figure absent because it has no matched closed call, and settings for each agent, when that summary and subsequent record and state messages are replayed into the run view over the protocol [[run-view-14](#run-view-14)], the test suite shall assert the active-time reading through rest, work, settlement, and a folded lane [[run-view-143](#run-view-143)]:
+
+- at rest the Captain reads `active · 1h 4m`, the measured-zero player reads `active · <1s`, and the unmeasured player has no active-time phrase or invented zero [[run-view-145](#run-view-145)] [[run-view-143](#run-view-143)];
+- each present reading's title and accessible description include its duration, name completed active time, and disclose that parallel calls overlap [[run-view-143](#run-view-143)];
+- while the thread reads `Captain is thinking…` and no new summary arrives, the Captain's phrase stays at `active · 1h 4m` rather than ticking [[run-view-37](#run-view-37)] [[run-view-143](#run-view-143)];
+- a `player_prompt` replaces the player's cumulative phrase with its `working` reading and a terminal `done` carrying a duration and token totals changes no active-time phrase; on one call an updated summary stays cached until `player_finished` reveals it, while on the next `player_finished` restores the prior resting phrase until a later summary updates it in place [[run-view-7](#run-view-7)] [[run-view-143](#run-view-143)];
+- a terminal `done` carrying a duration for the unmeasured player creates no active-time phrase and does not replace its live reading without a summary, rather than deriving a figure from the event [[run-view-143](#run-view-143)];
+- the completed call's token totals appear once on its result line and not in the header, each active-time phrase stays outside the transcript and the settings control, and each settings chip's accessible reading carries no active time [[run-view-6](#run-view-6)] [[run-view-139](#run-view-139)] [[run-view-143](#run-view-143)];
+- collapsing the measured player's pane removes its visible phrase while the folded rail's tooltip and accessible description retain the full qualified reading, and expanding the lane restores the header phrase [[run-view-116](#run-view-116)] [[run-view-143](#run-view-143)];
+- no header or transcript gains a combined total, share, ranking, graphic or cost [[run-view-143](#run-view-143)].
+
+#### run-view-66
+
+Where a fixture stream carries a playbook run's trace records — an invocation start, transitions, a player call attributed to a state, a nested invocation carrying the parent link, a settled finish, and the post-terminal reports a real runtime emits (a status, a turn settlement, and a disposal after the closing transition) — the test suite shall assert the machine cards over a replay [[run-view-14](#run-view-14)]:
+
+- a live card opens with the frame and draws the machine with the active state emphasized and wearing the running mark, static when reduced motion is preferred [[run-view-60](#run-view-60)] [[run-view-61](#run-view-61)];
+- the glyph progress lines of the framed run leave the thread while failure lines stay [[run-view-60](#run-view-60)];
+- the active state names its attributed player while that player runs [[run-view-61](#run-view-61)] and its callee while the nested run is open [[run-view-63](#run-view-63)];
+- the nested invocation renders nested directly under the card of the run that called it, with the connector and the mutual naming [[run-view-63](#run-view-63)];
+- while the child runs, the caller — the tree's only root — stays drawn with its calling state in the call voice, and its accessible name states its run, status, and callee [[run-view-75](#run-view-75)];
+- collapsing the drawn caller while the child runs is arrangement only: the strip stands with the connector, the child is unchanged, and the fold state is untouched [[run-view-75](#run-view-75)];
+- the boxes take their column's longest label's width with names at 13px, captions at 12px, and exit labels at 11px, and a role-and-player caption no box holds falls back to the role with the pair in the tooltip [[run-view-60](#run-view-60)] [[run-view-61](#run-view-61)] [[run-view-76](#run-view-76)];
+- a state's unwalked exits into rest states fold to one counted marker listing them, unfolding while the box is hovered, while an exit into a working state stays a label [[run-view-76](#run-view-76)];
+- the child's settled finish lands as a strip under its calling state, and the root's settles into the thread as a strip whose expansion shows the final drawing [[run-view-62](#run-view-62)] [[run-view-75](#run-view-75)];
+- the post-terminal reports open no frame and change no settled card — exactly one card per run, its outcome "done" [[run-view-74](#run-view-74)] [[run-view-62](#run-view-62)];
+- a second fixture run that ends by disposal alone, without a terminal transition, settles exactly one card with the outcome "aborted" [[run-view-62](#run-view-62)] [[run-view-74](#run-view-74)];
+- a fixture child naming an unknown caller renders at the top level [[run-view-78](#run-view-78)];
+- removing the module or changing current configuration leaves the stored graph unchanged; with no historical definition, the same replay renders observed states alone [[run-view-64](#run-view-64)];
+- a fixture captain reply record renders as Captain speech in the thread [[run-view-1](#run-view-1)];
+- a fixture captain result reporting an error renders the synthesized cause as a failure line [[run-view-65](#run-view-65)].
+
+#### run-view-77
+
+Where a fixture machine holds a neighbour edge, a same-rank pair, a rank-skipping edge, a backward edge, and a fan of transitions into one state, the test suite shall assert the solved geometry of [[run-view-76](#run-view-76)] over the card's computed drawing — the same solved layout the replayed card renders [[run-view-14](#run-view-14)] — and over each installed built-in machine's served graph: every transition is exactly one drawn line or one exit label, every drawn head lies on its target's border at an unshared port, no drawn path intersects any state box, reciprocal drawn pairs yield distinct paths, and each exit label names its target from an unshared slot in its source.
+
+#### run-view-70
+
+Where a fixture store holds two projects — the current one with a titled session awaiting a Boss reply, more idle sessions than the recent window holds (one of them with a failure still standing), and a session with no turns; the other with a session awaiting a reply and an idle session — the test suite shall assert the sidebar contract: Dashboard stands first carrying the attention count [[run-view-34](#run-view-34)], the current project's rows carry their titles, compact ages spanning `now`, minutes, hours, days and weeks with exact-moment tooltips, and attention-first marks, while their accessible descriptions carry `just now` or the same rounded unit followed by `ago`, their turn counts, and the standing failure as history rather than attention while an idle session with none reads idle [[run-view-73](#run-view-73)], and the other project's row carries its own attention signal [[run-view-67](#run-view-67)]; disclosing that project leaves the current project unchanged [[run-view-67](#run-view-67)]; activating its session shows that project and opens the session as a read-only tab, and activating it again focuses rather than duplicates [[run-view-68](#run-view-68)]; a turn settling keeps its transcript on screen with the composer ready and no ended word on its tab or row [[run-view-69](#run-view-69)]; closing that tab leaves the session listed and running nothing [[run-view-68](#run-view-68)]; the rest-revealing control lists the sessions the recent window omitted [[run-view-67](#run-view-67)]; the other project's Specs control shows that project with its Specs tab [[run-view-67](#run-view-67)]; and, with Projects showing the waiting session's tab, the current project's row and that session's row are selected, showing Space leaves no row selected with its own entry current, and Projects selects the remembered project again [[run-view-67](#run-view-67)].
+
+
+#### run-view-84
+
+Where a fixture launch reports registered projects with nothing remembered and no live session, the test suite shall assert the workspace adopts one of them as current [[run-view-57](#run-view-57)].
+
+#### run-view-72
+
+Where the workspace renders with the sidebar expanded, the test suite shall assert the chrome contract of [[run-view-71](#run-view-71)]: the binding collapses the sidebar to icons that keep their accessible names and the Dashboard attention count, the state survives a remount, and the foot control restores the tree.
+
+#### run-view-21
+
+Where a fixture stream contains records marked hidden (judge or router traffic), when the fixture is replayed into the run view, the test suite shall assert that no rendered pane contains the hidden records' content [[run-view-18](#run-view-18)] and that a player named only by hidden records — no call record of it reaching the view — has no pane [[run-view-7](#run-view-7)].
+
+### Interaction Coverage
+
+#### run-view-22
+
+Where a replayed fixture stream ends in an await-Boss-reply state carrying a player question, the test suite shall assert the await-reply round trip:
+
+- Captain's explanation appears above the Boss composer, without requiring the player pane [[run-view-9](#run-view-9)];
+- a clarification goes to Captain and leaves the question waiting; a later answer goes through Captain and clears the wait only when the runtime reports its departure [[run-view-9](#run-view-9)].
+
+#### run-view-23
+
+While a replayed fixture stream holds a turn active, when the abort control is activated and the turn-aborted record is then delivered, the test suite shall assert that an abort command was sent over the protocol [[run-view-10](#run-view-10)], that the interrupted turn shows a visible aborted marker, and that a submission made after the abort is dispatched immediately rather than queued [[run-view-8](#run-view-8)].
+
+#### run-view-24
+
+When fixture turn and question states, real record-folded turns and deferred submission outcomes reach the rendered run view, integration verification shall assert the composer behavior through these cases:
+
+- an active turn disables input and preserves its draft, a stale busy submission is refused without queueing, and settlement re-enables input even when a question arrived first [[run-view-8](#run-view-8)];
+- question arrival, settlement, and a pending submission's success or refusal preserve another control's focus selected by the reader [[run-view-8](#run-view-8)];
+- settlement and submission completion return unclaimed focus to the available composer, preserving its draft and selection [[run-view-8](#run-view-8)];
+- a surviving agent-editor control keeps focus through settlement, and explicit new-conversation arrival still focuses the composer [[run-view-8](#run-view-8)].
+
+#### run-view-29
+
+Where no session is live, when the Projects surface renders with a fixture config of one project and one playbook, the test suite shall assert the Captain home's one-motion start:
+
+- in English and Chinese, the Captain home names the current project, presents one task composer, invites a goal, explains how AI helps write specs for system behavior, and describes playbooks as workflows written in plain language [[run-view-25](#run-view-25)];
+- with no project current but projects registered, the greeting offers picking one [[run-view-25](#run-view-25)]; with no local project registered, the local welcome page explains specs and playbooks in English and Chinese and offers the Academy example and own-project paths without a composer, and beside them, in English and Chinese, "Open a project from your groups" while this computer's Groups state reads it signed in to an instance or "Sign in to your Space" while it reads it signed in to none — neither before it is read, the page asking the read — the first opening the palette at "From your groups" and the second asking for the Space surface [[run-view-172](#run-view-172)];
+- when text is submitted with a current project, a session is created for that project and the text is dispatched as its first Boss turn [[run-view-26](#run-view-26)];
+- when text is submitted with no project chosen, the palette opens and the draft survives [[run-view-26](#run-view-26)].
+
+#### run-view-31
+
+When the Captain home composer and thread render against the fixture playbook, the test suite shall assert playbook discovery and IM presentation:
+
+- when `/` is typed at the start of the composer, the slash menu lists the fixture playbook with its intent, filters as more is typed, and inserts the command without dispatching on selection [[run-view-27](#run-view-27)];
+- the project task start aligns its guidance with the composer, shows Captain's avatar and configured agent chip immediately above it, keeps slash discovery below its sole task field, and shows the complete configured playbook list when `/` is typed [[run-view-25](#run-view-25)] [[run-view-27](#run-view-27)];
+- rendered with no playbook configured, the task start's hint reads "No playbooks available" as a link that opens the project's Playbooks tab [[run-view-27](#run-view-27)];
+- when a fixture stream containing a boss turn is replayed, the submitted text renders as a user bubble in the Captain thread [[run-view-30](#run-view-30)].
+
+#### run-view-35
+
+When the captain editor popover is opened from the Captain home's agent chip with a fixture captain block, the test suite shall assert it offers the runtime's adapters with their readiness, that changing the adapter or model issues a captain merge patch through the configuration edit path, that the patch carries the editor's surfaced fields and never a hand-written one, and that the popover opens on the roomier side of its chip under a cap of the room the window can show there — all without a surface change [[run-view-32](#run-view-32)].
+
+#### run-view-36
+
+Where a fixture holds one history-only session with a stored transcript and one session awaiting a Boss reply, the test suite shall assert that opening the history session shows a loading note and then its transcript with the history notice and a start-a-new-session affordance, that an idle continuable session shows its composer with no notice, that a failed load offers a retry instead of an empty run [[run-view-33](#run-view-33)], that a session assigned to another runtime shows its reason "Runs on <label>" as the history notice with no composer, Restore or Discard [[run-view-33](#run-view-33)], and that the Dashboard navigation badge shows the count 1 [[run-view-34](#run-view-34)].
+
+#### run-view-52
+
+When the awaitBossReply fixture stream is replayed, the test suite shall assert the question renders as one incoming Captain bubble from Captain reply records, that question telemetry creates no raw duplicate, and that the banner names the player without repeating the question [[run-view-9](#run-view-9)].
+
+#### run-view-80
+
+Where a fixture stream calls one player under two roles, the test suite shall assert each call carries its own role label where it opens and an unresolved call carries none [[run-view-79](#run-view-79)].
+
+#### run-view-82
+
+Where the run view renders with its default split, the test suite shall assert the divider contract of [[run-view-81](#run-view-81)]: an arrow key moves the split and a double-click restores the default of 45%, the split survives a remount, a nudge past either bound stops at that bound, a drag against a padded container leaves the rule within a pixel of the pointer rather than the padding's width away from it, and a machine drawing carries the scale-or-scroll rule — its natural width, the floor at four fifths of it, and the container query choosing between them — inside a scrolling box that masks its edge, which a box read to its end and then narrowed masks again, and which is itself the keyboard stop that names the drawing it holds [[run-view-50](#run-view-50)].
+
+#### run-view-142
+
+Where the run view renders a player grid whose panes are wider than its box, the test suite shall assert the grid's edge fade of [[run-view-7](#run-view-7)]:
+
+- an edge with a pane beyond it is faded, and both edges are faded at once while the grid stands between them;
+- scrolled to an end, that end's fade retires because nothing lies beyond it;
+- the box narrowing with no scroll of its own brings the fade back.
+
+#### run-view-53
+
+While a fixture turn is active, the test suite shall assert the Captain thread shows the working indicator — the Captain thinking while no player runs, and a running player's role with the ticking span since its prompt, the same span in that player's pane header [[run-view-37](#run-view-37)] [[run-view-7](#run-view-7)] — queued entries render in full with the sends-when-this-turn-ends caption [[run-view-38](#run-view-38)] inside a frame kept at its end that the composer's own box holds its place beside [[run-view-106](#run-view-106)], the composer renders a store-provided draft — disabled while the turn runs, editable once it settles, reporting edits to the store [[run-view-39](#run-view-39)] [[run-view-8](#run-view-8)] — and activating Abort disables it with an "Aborting…" label [[run-view-40](#run-view-40)].
+
+#### run-view-194
+
+While a fixture turn's player call is open with a tool use whose result has not arrived, when the stream is replayed into the run view, the test suite shall assert that the lane reads at work with its tool cards folded:
+
+- the card with no result stays collapsed, wears the running mark and reads "running · 12s" twelve seconds after its use, ticking to "running · 13s" a second later, with no ending mark [[run-view-4](#run-view-4)];
+- the pane's foot reads the tool, its span and its subject, "Bash · 12s" beside `rm -rf build` [[run-view-7](#run-view-7)];
+- a long tool name in the foot truncates within half the line and keeps its whole name as the tooltip, while the span and the subject keep their room, and the foot's text reads "running: Bash · 12s, rm -rf build" with its parts apart [[run-view-7](#run-view-7)];
+- once the result arrives the card takes its ending's mark and leaves its running reading, and the foot reads "Thinking…" [[run-view-4](#run-view-4)] [[run-view-7](#run-view-7)];
+- a finished call leaves no card running and no foot, and its usage reads "120→30 token" [[run-view-7](#run-view-7)] [[run-view-6](#run-view-6)].
+
+#### run-view-54
+
+The test suite shall assert time separators appear before the first line, after >10-minute gaps, and on day changes, and that every Boss, Captain, and question bubble carries a clock stamp at its outer foot — its clock time as text, the exact moment in its tooltip and on the element — while narration lines carry no stamp [[run-view-41](#run-view-41)]; that known states map to human labels with unknown ids humanized [[run-view-59](#run-view-59)]; that the project palette is driven end-to-end by keyboard (opens focused, arrows highlight, Enter picks, Escape closes with the composer draft intact) [[run-view-42](#run-view-42)]; and that Escape hides the slash menu without touching the draft [[run-view-43](#run-view-43)].
+
+#### run-view-55
+
+The test suite shall assert first-hour failures surface at hand:
+
+- where a fixture config is invalid, the Captain home thread lists the errors with a Settings link [[run-view-44](#run-view-44)];
+- where a fixture readiness entry is not ready, the heads-up bubble offers a re-check that invokes the readiness refresh [[run-view-45](#run-view-45)].
+
+#### run-view-131
+
+Where a replayed fixture stream ends with a playbook run standing parked on the Boss [[run-view-14](#run-view-14)], the test suite shall assert the parked-run notice:
+
+- the thread draws that failure as a card in the bare status line's place, its what line naming the run's command and the step it left in human words, its why line the catalogue's phrase for the fixture's own cause with its paths, its what-now line the Boss step and the published no-op's standing, and the runtime's message with the raw state in its tooltip [[run-view-147](#run-view-147)] [[run-view-2](#run-view-2)];
+- later recovery, a successful different run, and another failure in the same or a different run preserve each historical card's original command and step, with current control standings confined to the current failure park; a failure recorded before any run remains unnamed after a run appears [[run-view-147](#run-view-147)];
+- the notice stands between the Captain pane and the composer, naming the parked workflow by its command in key phrases with the raw state in its title, saying why the run failed and what to do about it, while a run no configured playbook claims names no command and carries its playbook id in that title instead [[run-view-128](#run-view-128)];
+- the notice draws one control per action the fixture summary publishes, in the summary's order and each in the action's own label, with the no-op among them visible, disabled, and carrying its phrased reason in its tooltip and in the what-now line, and Drop's tooltip carrying the published ending's own label [[run-view-128](#run-view-128)];
+- a published action whose label runs long draws a control holding no width of its own open and a label set to ellipse at that control's width, the whole of the label in the control's tooltip, while Drop holds its own width beside it [[run-view-128](#run-view-128)];
+- a summary publishing one retry, six resumes and an ending draws the retry in the row and, beside Drop, one collapsed "Resume from an earlier step…" control and no resume; opened, it lists the six in the summary's order, each in its whole label set to wrap rather than ellipse, the list bounded to scroll, and activating one dispatches exactly one control naming that resume's id [[run-view-128](#run-view-128)] [[run-view-129](#run-view-129)];
+- the same fixture whose summary publishes no controls draws Drop alone, no recovery, and names the composer as the way on [[run-view-128](#run-view-128)];
+- a fixture whose run waits for a Boss reply carries Drop with no recovery control beside it, the composer standing as that park's other door [[run-view-128](#run-view-128)];
+- activating a recovery control dispatches exactly one control over the protocol naming the recovery kind and that action's own id — not the first the run advertises — which then renders as a Boss bubble carrying that action's own label, while a staged intent detaches and no intent id rides it [[run-view-129](#run-view-129)];
+- activating Drop asks its confirm first — backing out sends nothing — and then sends exactly one command: for a fixture serving an open intent that intent's close as dropped and no control, the ending riding it, and for one serving none exactly one ending control naming the published ending's id and no close [[run-view-112](#run-view-112)];
+- while a command is in flight the activated control shows its busy form under the width rule it held at rest and no control of the notice can be activated; a refused command shows its cause beside the notice, which stands, with the transcript and draft intact [[run-view-130](#run-view-130)];
+- a fixture whose stream then reports the run leaving its failure state removes the notice, one whose stream reports the run ended removes it too, and one whose next turn only answers leaves it standing [[run-view-130](#run-view-130)];
+- a fixture run calling its player when its writer stopped, then restored as a real core streams it — the marker, the report started again under the lost turn's id and message, and a recorded position holding the run in its failure state with no traced move — draws that run failed with no call running on its card or its lane, the saved message once, and a failure card at the position's place whose what line names the step it left and whose why line phrases the position's cause, and stands the notice saying the same why with the summary's controls under the Captain's report [[run-view-74](#run-view-74)] [[run-view-110](#run-view-110)] [[run-view-147](#run-view-147)] [[run-view-128](#run-view-128)];
+- a recorded position holding a run already parked in its failure state draws no second card, the notice keeping the cause the stop reported [[run-view-147](#run-view-147)];
+- a recorded position holding no run settles that run's card unfinished and stands no notice [[run-view-74](#run-view-74)], and one holding a run's pending question raises the wait for its asker while one holding none clears a standing wait [[run-view-9](#run-view-9)];
+- the same fixture marked uncertain shows the interrupted-turn controls and no parked-run notice [[run-view-128](#run-view-128)] [[run-view-110](#run-view-110)], and marked externally owned shows neither [[run-view-125](#run-view-125)].
+
+#### run-view-133
+
+Where a replayed fixture stream parks a playbook run in its recoverable failure state and the Captain shell's own machine then reports its rest state on the same telemetry topic [[run-view-14](#run-view-14)], the test suite shall assert that the settled session still reads its leaf:
+
+- the state chip reads the failure label in red carrying the parked run's own state id in its tooltip, not the shell's rest state and not its "idle" label [[run-view-59](#run-view-59)];
+- the derived attention holds a failure for that session, and a later turn that settles with no failure of its own leaves it standing [[run-view-34](#run-view-34)];
+- a stream that then reports the run leaving its failure state returns the chip to the reported state's own label and clears that attention [[run-view-59](#run-view-59)] [[run-view-34](#run-view-34)].
+
+#### run-view-140
+
+Where a replayed fixture stream stands settled with a Captain and two player lanes, the test suite shall assert one agent's settings edited for one conversation, through the protocol:
+
+- a player pane's chip opens that player's editor and no other agent's, and the Captain pane's chip opens the Captain's [[run-view-138](#run-view-138)];
+- saving sends exactly one session-scoped agent command naming the session, the agent, and the chosen values, and sends no config edit [[run-view-138](#run-view-138)];
+- the pane's chip reads the chosen value as soon as the change is accepted, and says that this conversation changed it [[run-view-139](#run-view-139)];
+- a refused save keeps the editor open with its draft, and returning the agent to its configured values clears the chip's mark [[run-view-138](#run-view-138)];
+- with the runtime's catalog loaded, the model field's inherit choice names the configured model by the display rule, and one the configuration leaves unset as the provider's default, followed by the catalog's default model where it reports one and by nothing where it does not [[run-view-138](#run-view-138)];
+- the effort field's inherit choice names the configured effort, and an unset one by the "Provider default" words [[run-view-138](#run-view-138)];
+- the subagent-model field stands on the player whose adapter serves one, its inherit choice naming an unset value "Same as agent", its pinned value travels in the same session-scoped command, and it marks the chip as changed while never appearing in the chip's reading [[run-view-138](#run-view-138)] [[run-view-139](#run-view-139)];
+- the subagent-effort field stands beside it, its inherit choice naming an unset value "Agent chooses", its pinned list holding no orchestration value, and its pinned value travels in the same command and marks the chip as changed while never appearing in its reading [[run-view-138](#run-view-138)] [[run-view-139](#run-view-139)];
+- no session-wide roster or count of changed agents stands anywhere in the view [[run-view-139](#run-view-139)].
+
+#### run-view-152
+
+Where fixture session summaries report the model the runtime named for the Captain's and a player's latest calls with the settings each call began under, when those summaries and the session's records are replayed into the run view over the protocol [[run-view-14](#run-view-14)], the test suite shall assert each chip's reading [[run-view-139](#run-view-139)]:
+
+- an agent whose adapter and model setting still stand as its call began under reads the reported model with its effort, its title and accessible name naming the set value — or the provider-default words for an agent set to none — beside the reported model [[run-view-139](#run-view-139)];
+- an agent the summary reports no model for reads its set value [[run-view-139](#run-view-139)];
+- a change after the call of this conversation's own model for one agent, and of the configured adapter for another, returns each chip to its set value at once, while a change of the configured effort alone keeps the report; a later summary reporting a call under the new settings reads that report [[run-view-139](#run-view-139)];
+- a folded lane's rail carries the reported reading in its tooltip [[run-view-139](#run-view-139)].
+
+#### run-view-92
+
+While a replayed fixture stream holds a live session, when text is typed and the composer's queue-instead-of-send action is activated, the test suite shall assert the capture flow: Add to Up next is the one secondary action with no Start beside it, a queue-intent command carrying the typed text and chat provenance for the session's project is sent over the protocol, no Boss turn is dispatched and no submission queues [[run-view-85](#run-view-85)], and an inline acknowledgment names where the row landed in the project's queue [[run-view-85](#run-view-85)].
+
+#### run-view-93
+
+Where a fixture project holds a manually startable queued intent and an idle continuable session, the test suite shall assert the staging flow:
+
+- activating Start stages the intent's text into the session's composer, focused, under a chip carrying the intent's title [[run-view-86](#run-view-86)];
+- emptying the composer detaches the chip, and a subsequent send carries no intent id [[run-view-86](#run-view-86)];
+- staging again and sending passes the intent's id with the submission [[run-view-86](#run-view-86)];
+- while a fixture turn is active, an already saved queued submission carrying an intent renders with the chip riding its pending bubble [[run-view-86](#run-view-86)] [[run-view-38](#run-view-38)].
+
+#### run-view-94
+
+Where a replayed fixture stream dispatches a queued intent whose turn then ends finished, the test suite shall assert the delivery flow:
+
+- the bound turn's bubble wears the intent's source chip, and a trailing line repeating the source's URL leaves the bubble [[run-view-89](#run-view-89)];
+- while the intent is open, the working line above the composer names it [[run-view-90](#run-view-90)];
+- Drop on the working line asks the inline confirm — Keep leaves the intent open with focus back on the control; Drop sends the close command as dropped, the line leaves with the outcome announced where it stood and focus in the enabled composer or the outcome notice while busy, then in the composer when input becomes available only if the notice retained focus; choosing a lane control before that handoff preserves it; a refused drop keeps the line and names the refusal [[run-view-113](#run-view-113)];
+- the delivery card at the final turn's end carries the intent's title, its provenance chip, its review rounds, turn count, and elapsed time, a primary Confirm with Drop beside, and the visible follow-up note [[run-view-87](#run-view-87)];
+- while a clean-settlement successor runs, the earlier card retains Confirm and Drop, loses its follow-up note, and confirming it neither starts another turn nor changes the successor's attribution [[run-view-87](#run-view-87)];
+- giving a verdict sends a close command over the protocol and resolves the card in place into the project's next queued intent carrying `Queued` and its published scheduling phrase, with Start only in a manual-ready fixture and its accessible name identifying that intent [[run-view-87](#run-view-87)];
+- with an empty fixture queue, the card resolves into the inline add affordance instead [[run-view-87](#run-view-87)];
+- replaying the same stream as an ended session renders the identical card, its verdict controls still live and any resolved-card Start inert [[run-view-87](#run-view-87)] [[run-view-14](#run-view-14)].
+
+#### run-view-95
+
+Where fixture projects hold queues whose next intents span the published scheduling standings, when the Captain home renders, the test suite shall assert the next card case by case [[run-view-88](#run-view-88)]:
+
+- every next card names its intent with `Queued` and counts the rest beside the task-start guidance [[run-view-88](#run-view-88)];
+- a manual-ready next carries Start whose accessible name identifies that intent, and activation stages the intent under its chip into the current conversation's composer when one exists and otherwise into the home composer [[run-view-88](#run-view-88)] [[run-view-86](#run-view-86)];
+- a next behind active work reads `after current work`, one behind a question park reads `waiting — your reply`, and one behind a parked failure reads `waiting — current work failed` with its catalogue phrase, each with no Start [[run-view-88](#run-view-88)];
+- an unparked failure reads `waiting — previous work failed` and a stopped turn reads `waiting — previous work stopped`, each with Start [[run-view-88](#run-view-88)];
+- Remove on a manual-ready head closes it dropped on the click — the Undo line taking focus from a keyboard activation and lapsing untouched after a pointer one — the card stands on that line alone once no next is served, and Undo re-queues the same text and provenance at the head with the restored intent's Start focused [[run-view-114](#run-view-114)];
+- Remove remains available on an `after-current-work` head with no Start, and Undo restores that same standing with focus on Remove [[run-view-114](#run-view-114)].
+
+#### run-view-96
+
+Where fixture streams hold one intent standing on a pending question, one holding an unacknowledged failure — recorded naming its turn, and recorded naming none while that turn was open, as earlier cores recorded their own — one finished awaiting its verdict, and an unowned session's failure recorded between turns, when each session is opened from its attention entry, the test suite shall assert the run view focuses the question's bubble, the failure's line, and the delivery card respectively, with the between-turn failure focusing its onset's line from either this computer's or another core's Dashboard entry [[run-view-91](#run-view-91)].
+
+#### run-view-137
+
+Where a fixture holds a session whose last turn finished before the client learned of it, the fold already naming it unread, the test suite shall assert the marker contract of [[run-view-134](#run-view-134)]:
+
+- showing that session sends the marker naming the fold's own summoning turn, so an entry raised before the client connected clears with no live record arriving;
+- a session listed in the sidebar, subscribed, or held in a background tab is never marked, and neither is a pinned tab that is no conversation;
+- a fold naming no unread turn for the shown session sends nothing, so a turn in flight is never marked, and the marker is sent once per fold rather than on every render;
+- a session carrying a failure entry with no run parked stands the pick-it-up notice above its composer, carrying the catalogue's phrase for the cause its stream reported and that cause's Boss step [[run-view-135](#run-view-135)] [[run-view-147](#run-view-147)], which a parked run's own notice replaces [[run-view-135](#run-view-135)];
+- a player's permission request renders as its own line in that player's pane and raises no mark on the tab, the sidebar row, or the badge, and a recorded approval request reads as history naming its tool with the native reason where one was given [[run-view-136](#run-view-136)].
+
+### Protocol Boundary Coverage
+
+#### run-view-124
+
+When an integration suite reconnects the app store and delivers a history-replacement notification over its protocol boundary, it shall verify reloading from sequence zero with drafts and queued input preserved, initial-session-list races preserving newer settlement, creation and removal announcements and newer readings without canceling independent project-key migration [[run-view-123](#run-view-123)].
+
+#### run-view-126
+
+When an integration suite presents active and unprovable external ownership, it shall verify history loading and failed-load retry, the ownership reason, unavailable mutation controls and preserved drafts and queued input [[run-view-125](#run-view-125)].
+
+#### run-view-148
+
+Where the runtime's closed failure-code list is read at its boundary, the test suite shall assert that the failure catalogue phrases every code that list holds [[run-view-147](#run-view-147)] ([DR-075](../decisions/075-a-failure-says-what-and-what-now.md)):
+
+- the list under test is the runtime's own export reaching the interface through that boundary, never a copy the interface keeps, so the catalogue is never held against itself ([DR-076](../decisions/076-playbook-14-1-adoption.md));
+- each code has a row whose phrase is non-empty for a sample evidence carrying every member any code reads, and for no evidence at all;
+- the catalogue holds no code the list does not, so a code that leaves the runtime leaves the catalogue with it;
+- a code outside the list, and a standing reason the catalogue has no phrase for, still read as their own identifiers in words;
+- an adapter message the runtime mapping knows reads in its plain phrase with the Boss step that mapping gives it, and one it does not reads as the message itself, bounded with an ellipsis and carrying no step.
+
+#### run-view-19
+
+Where the run view's production modules are inspected, the test suite shall assert that project-session records reach the run view only as versioned protocol messages:
+
+- the modules import no Node-only modules and call no `@sublang/cligent` or `@sublang/playbook` APIs [[run-view-13](#run-view-13)];
+- every write to the rendered record state originates from the protocol client's message handling [[run-view-13](#run-view-13)].
+
+### Conversation Following
+
+#### run-view-163
+
+When the integration suite changes a rendered Captain conversation, it shall verify its following choice through this case matrix:
+
+- a reply and turn settlement folded together advance a following pane to the reply [[run-view-162](#run-view-162)];
+- a live frame mounting before a queued programmatic scroll is delivered, and a machine definition changing with no transcript change, leave a following pane at its end [[run-view-162](#run-view-162)];
+- a coalesced failure changing its count without adding a line, and replacement content at an existing delivery-card anchor, update the following pane [[run-view-162](#run-view-162)];
+- content growth reported by a native scroll event before its resize notification still offers Latest to a scrolled-up reader without moving that reader [[run-view-46](#run-view-46)];
+- the same changes preserve the position of a reader who scrolled up and offer the jump-to-latest control [[run-view-46](#run-view-46)];
+- a player-only record leaves a scrolled-up Captain pane without the pill, and a Captain line arriving below then offers it [[run-view-46](#run-view-46)].
+
+#### run-view-164
+
+When the integration suite reveals earlier entries of a long player transcript to a reader scrolled to its top, it shall assert the reader keeps their place with no jump-to-latest control, and an entry appended afterwards offers it [[run-view-46](#run-view-46)].
+
+### Browser Journeys
+
+#### run-view-97
+
+Where the browser journey harness ([DR-039](../decisions/039-browser-acceptance-journeys.md)) boots the served shell on an empty state root with no config and opens its token URL, the test suite shall assert the first run through the page alone:
+
+- the welcome page offers adding a local project and opening the Academy example without a composer, and, the home signed in to no instance, "Sign in to your Space", which shows the Space surface's sign-in card [[run-view-172](#run-view-172)];
+- once the Academy example seeds, the project task start names that project and the sidebar lists it [[run-view-25](#run-view-25)] [[run-view-67](#run-view-67)];
+- typing `/` lists the configured playbooks, Escape hides the menu with the draft intact, and typing reopens it [[run-view-27](#run-view-27)] [[run-view-43](#run-view-43)].
+
+#### run-view-98
+
+Where the harness boots the served shell with the demo project registered and the scripted Captain, when the journey sends a task from the Captain home, the test suite shall assert the first session through the page:
+
+- a session tab opens titled by the task and the sidebar row reads the same title [[run-view-48](#run-view-48)] [[run-view-73](#run-view-73)];
+- the Captain pane shows the run's status lines and a machine card for the code run with its review call nested [[run-view-1](#run-view-1)] [[run-view-60](#run-view-60)] [[run-view-63](#run-view-63)];
+- the coder's pane appears with its call while the reviewer takes no place until the nested review calls it, after which both stand, coder first [[run-view-7](#run-view-7)], with the coder's streaming text and collapsed tool cards, then its usage [[run-view-3](#run-view-3)] [[run-view-4](#run-view-4)] [[run-view-6](#run-view-6)];
+- returning to the session tab, reloading the page, and restarting the shell each retain both called panes in their first-call order [[run-view-7](#run-view-7)];
+- the composer refuses input while work runs, then accepts a follow-up after settlement [[run-view-8](#run-view-8)];
+- the turn settling leaves the composer ready with no end control and no ended word, the sidebar row reading idle [[run-view-69](#run-view-69)] [[run-view-73](#run-view-73)].
+
+#### run-view-99
+
+Where the harness boots with the demo project registered, when the journey sends a prompt the scripted Captain parks on a player question, the test suite shall assert the reply round trip through the page: the question renders as an incoming Captain bubble naming the player, with the composer inviting an answer or clarification [[run-view-9](#run-view-9)], the state chip reads waiting in amber [[run-view-59](#run-view-59)], no call having reached a player the Captain column stands alone with no player grid and no divider [[run-view-7](#run-view-7)], and the reply goes out as the next turn, after which the chip settles [[run-view-9](#run-view-9)].
+
+#### run-view-151
+
+Where the harness boots the served shell's real Captain with the demo project registered and a substitute coder whose first phase asks the Boss a question the hidden judgment returns as awaiting the Boss, when the journey sends the request, the test suite shall assert the relay through the page ([DR-085](../decisions/085-boss-talks-through-captain.md), [DR-088](../decisions/088-playbook-17-slc-0-12-cligent-0-27-adoption.md)):
+
+- the question reaches the Boss once, as the Captain's reply in its own words, and the runtime's raw question status adds no message of its own [[run-view-9](#run-view-9)];
+- the wait stands with the composer inviting the reply, and the Boss's answer is delivered to the run that asked, after which the wait clears [[run-view-9](#run-view-9)].
+
+#### run-view-100
+
+Where the harness boots the served shell, the test suite shall assert the page fails loudly when the core is out of reach [[run-view-50](#run-view-50)]:
+
+- opened with a wrong token, the page names the core it cannot reach and offers retry, and the composer does not read ready;
+- with the shell stopped while the page is open, the page says it is reconnecting; started again on the same root and port, the page recovers with its project list intact.
+
+#### run-view-101
+
+Where the harness boots with the demo project registered, the test suite shall assert the keyboard journey [[run-view-49](#run-view-49)]:
+
+- the platform modifier with P opens the palette, arrow keys move its selection, Enter picks, Escape closes [[run-view-42](#run-view-42)];
+- the modifier with 1 through 5 switches surfaces in the sidebar's order, the modifier with 3 opening the Playbooks surface and with 4 Space [[run-view-67](#run-view-67)] [[run-view-49](#run-view-49)], and the modifier with B collapses and restores the sidebar [[run-view-71](#run-view-71)];
+- after the modifier with 1, 3, 4, 5 or comma, focus stands inside the surface opened, and after the modifier with 2 it stands in the Boss composer [[run-view-49](#run-view-49)];
+- after the modifier with B, focus stands on the sidebar's collapse control in both of its states [[run-view-49](#run-view-49)];
+- in the composer Enter sends while Shift+Enter inserts a line break [[run-view-8](#run-view-8)];
+- a Tab sequence from the page start reaches the composer, and no shortcut leaves focus stranded on the document body.
+
+#### run-view-102
+
+Where the harness boots with the demo project registered, a finished session, and the authoring fake with a stub `slc` that fails once, when each surface — Captain home, a session, a session with a player's settings editor open [[run-view-138](#run-view-138)], a session whose playbook run stands in its recoverable failure state [[run-view-128](#run-view-128)], the Dashboard with an unread turn's entry standing in its attention queue, the Overview, the Specs tab, the Playbooks tab, the Packages tab, the Playbooks surface, a playbook draft's workspace in each of its states (no source, paste mode, a turn with the source appearing, compiling, failed, compiled with each tab open, the editor, the agent picker), Space, Settings, and Settings with an agent editor's model list open — is scanned by axe-core at WCAG 2.1 AA in the light and the dark theme, and Settings is scanned again in a 360 by 640 viewport where its shortcut sheet scrolls sideways, the test suite shall assert no serious or critical violation [[run-view-50](#run-view-50)] [[run-view-12](#run-view-12)]:
+
+- in the narrow viewport the shortcut sheet is a keyboard stop named "Keyboard shortcuts" [[run-view-50](#run-view-50)].
+
+#### run-view-103
+
+Where the harness boots with the demo project registered, when the journey breaks the shared config on disk while the page is open and then repairs it, the test suite shall assert the Captain home lists the actual error with its in-place Settings link while broken, and returns to its greeting once repaired [[run-view-44](#run-view-44)].
+
+#### run-view-115
+
+Where the harness renders a session with a dispatched queued intent through the served page or the real run view and intent store, when the reader drops it from the working line, the test suite shall verify the handoff:
+
+- the served-page journey with the demo project and scripted Captain asserts that the confirm names work underway and Keep returns focus to the control, and that Drop removes the line with the outcome announced in its place and focus in the enabled composer or the outcome notice while busy [[run-view-113](#run-view-113)];
+- the record-folded busy-turn cases assert that settlement hands notice focus to the enabled composer, expiry before settlement allows ordinary readiness to focus it, and another control the reader chose keeps focus through both settlement and expiry [[run-view-113](#run-view-113)] [[run-view-8](#run-view-8)].
+
+#### run-view-118
+
+Where the harness boots with the demo project registered and the scripted Captain, when the journey runs a task the Captain narrates as the code run with its nested review, collapses the reviewer's lane that review left standing, and sends a follow-up narrated the same way, the test suite shall assert through the page that the reviewer's rail stands at its narrow width with the lane's name inside its box and the expand control focused while the coder's pane widened [[run-view-116](#run-view-116)] [[run-view-7](#run-view-7)], that the coder's pane is in view while its next call runs [[run-view-7](#run-view-7)], and that the reviewer's lane unfolded itself when the review's call opened, its transcript then filling [[run-view-117](#run-view-117)].
+
+#### run-view-176
+
+Where the harness boots with the demo project registered and the scripted Captain, when the journey parks a session on a player question and sends the reply from the keyboard so the code run calls the coder and then the reviewer, once side by side at 1024 by 800 pixels and once stacked at 600 by 500, the test suite shall assert through the page that each pane appearing or brought into view leaves the reader's place ([DR-146](../decisions/146-a-lane-appears-with-its-first-call.md)):
+
+- before the reply, no pane and no divider stand [[run-view-7](#run-view-7)];
+- the coder's pane appears first and the reviewer's beside or after it, in that order [[run-view-7](#run-view-7)];
+- each pane lies inside the player grid's visible box while its call runs [[run-view-7](#run-view-7)];
+- the page and the box holding the Captain column and the grid never scroll, and the composer stays inside the window throughout [[run-view-7](#run-view-7)];
+- keyboard focus never moves into the player grid [[run-view-7](#run-view-7)].
+
+#### run-view-109
+
+Where the hermetic lane's demo shell has run a task to its end ([DR-039](../decisions/039-browser-acceptance-journeys.md)), the test suite shall assert through the page that the settled session's composer stands ready with no notice, that a message sent there — after a model change in Settings — continues the session on the same tab with the Captain narrating again and the Captain's chip wearing its new model [[run-view-69](#run-view-69)] [[run-view-8](#run-view-8)], and that after the shell restarts underneath the page the same tab continues once more [[run-view-68](#run-view-68)]; and, with a session the terminal wrote listed for the project, that its sidebar row's delete control and inline confirm — worded for the terminal's history — remove it from the listing and its record and stream from the shared session store [[run-view-73](#run-view-73)].
+
+#### run-view-141
+
+Where the harness boots with the demo project registered, the Captain configured on the provider's default, and the scripted Captain, when the journey changes the Captain's and the coder's settings from their own panes and then sends a message, the test suite shall assert through the page that a conversation's own settings run and stay where they were made:
+
+- each chip is opened from its own pane and edits its own agent, both panes wearing the chosen values before the message is sent [[run-view-138](#run-view-138)] [[run-view-139](#run-view-139)];
+- each editor's inherit choice names what the configuration sets, the coder's model by the display rule and the Captain's unset one as the provider's default followed by the model the runtime reports running by default, and each unset effort by the "Provider default" words [[run-view-138](#run-view-138)];
+- the coder's editor names its unset subagent model "Same as agent" and its unset subagent effort "Agent chooses", and offers no orchestration value as a subagent effort [[run-view-138](#run-view-138)];
+- the turn runs on those values, the run's own record of what it applied naming them, the coder's subagent model and subagent effort set from its pane among them [[run-view-14](#run-view-14)];
+- the Settings surface still shows the configured values, and a second session of the same project opens with its panes wearing them [[run-view-139](#run-view-139)];
+- returning each agent to its configured values from its own chip leaves both panes reading them again [[run-view-138](#run-view-138)].
+
+#### run-view-105
+
+Where the harness boots with the demo project registered and carrying closed work, including a delivered intent closed by verdict whose card resolves into a long-titled queued next behind an unparked failure whose catalogue phrase carries a long path, the scripted Captain, the authoring fake with a passing stub `slc`, and ten further projects each holding a session parked on a player question, when fresh journeys cover each surface in cohesive groups — the Captain home, a session carrying reported active time for the Captain and a player, the Dashboard, the project's Overview, the Specs tab with the graph shown, the Playbooks tab, the Packages tab, the Playbooks surface, a playbook draft's workspace at rest after its compile, and Settings — at the widths 320, 480, 640, 800, 1024, and 1280 pixels, each at 800 and 400 pixels tall, with the sidebar collapsed and, from 480 pixels, open ([DR-041](../decisions/041-chrome-that-fits.md): the open sidebar is 224 pixels wide), and at 1280 pixels the Captain pane is dragged to its floor, while a separate fresh registered demo-project journey completes a scripted turn, then at 1280 pixels collapses the session's other lanes and drags its vertical split from a roomy measured-player pane to that pane's floor first at rest and then with that player's next call held until aborted, the test suite shall assert fit through the page, naming every offending element:
+
+- the page never scrolls sideways, and no element outside a sideways-scrolling canvas is wider than its box [[run-view-106](#run-view-106)] [[run-view-107](#run-view-107)] [[run-view-48](#run-view-48)];
+- the page never scrolls vertically, no scrolling box ends past the bottom of the viewport, and no positioned element lies past it with no scrolling box containing it — at either height, and again after the window is made short and tall within one page life [[run-view-119](#run-view-119)];
+- within every tab list, toolbar, header, list row, and composer box, no two visible siblings overlap and every child lies inside its parent [[run-view-106](#run-view-106)] [[run-view-71](#run-view-71)];
+- at 320 pixels the strip's five pinned tabs — the new-task control, Specs, Playbooks, Packages and Overview — each stand whole in the strip, reached by its own sideways scroll where they overflow it, no two overlapping, and the page still not scrolling sideways [[run-view-58](#run-view-58)] [[run-view-48](#run-view-48)];
+- every control's accessible name is the same at every width [[run-view-8](#run-view-8)] [[run-view-85](#run-view-85)] [[run-view-48](#run-view-48)];
+- the Captain-home next card and resolved delivery card each keep the queued intent's title, standing, and any remaining count in their sole shrinkable text region, keep the title and standing's full values in their respective titles, share title and standing on one line where the measured card is at or above `@md`, and give the standing its own line below `@md`, while the long phrase truncates and `Queued` plus every available control remain visible without overlap at 320 pixels and, for the resolved card, at the dragged Captain-pane floor [[run-view-87](#run-view-87)] [[run-view-88](#run-view-88)];
+- as the measured player pane narrows, its resting active-time phrase yields at a wider measured pane width than its live elapsed reading, each is visible in the roomy pane and has yielded at the pane floor, and agent identity and header controls remain without overlap throughout [[run-view-7](#run-view-7)] [[run-view-143](#run-view-143)]; every yielded active-time reading remains in the pane's accessible description [[run-view-143](#run-view-143)];
+- the collapsed sidebar's Dashboard badge prints "9+" with the count in the entry's accessible name [[run-view-108](#run-view-108)];
+- the Captain home's agent popover, opened at each height, lies inside the window both on opening and after model discovery grows its content, with its adapter picker reachable and the page unmoved [[run-view-32](#run-view-32)];
+- a disabled composer during a long turn keeps its primary control inside the window at every width and height [[run-view-106](#run-view-106)];
+- an agent's settings editor, opened from the narrowest player pane and again from the last pane of a sideways-scrolled grid, lies inside the box that must show it both on opening and after the grid scrolls with its fields reachable and the page unmoved, its model and effort stacked at 320 pixels and side by side at 900 [[run-view-138](#run-view-138)];
+- with the coder tuned to `xhigh` and two lanes sharing a 1280-pixel window's default split beside the open sidebar, no lane is wider than its pane, and the coder's agent reading ends in an ellipsis [[run-view-7](#run-view-7)].
+
+#### run-view-146
+
+Where the harness boots with the demo project registered and a scripted workflow that parks on a player's question, the test suite shall assert that park's door through the page [[run-view-128](#run-view-128)]:
+
+- the notice appears naming the waiting workflow by its command with the raw state in its title, carrying Drop and no Retry, above a composer that still names the player it replies to [[run-view-128](#run-view-128)] [[run-view-9](#run-view-9)];
+- Drop's confirm backs out having sent nothing, and an ending the opened run cannot satisfy refuses with its cause, leaving the notice and the question standing [[run-view-130](#run-view-130)] [[run-view-112](#run-view-112)] — the served harness opens a continued session with no engagement restored, so a successful ending is not this lane's to prove;
+- answering in the composer leaves the park and takes the notice with it [[run-view-130](#run-view-130)].
+
+#### run-view-121
+
+Where the harness boots with the demo project registered and the scripted Captain, when served-page journeys exercise sidebar changes and controlled rendered-content growth in a window too short for the thread, the test suite shall assert:
+
+- showing the sidebar leaves the narrowed field tall enough for the rewrapped draft [[run-view-106](#run-view-106)] and the following Captain thread at its end after its live machine and reply render [[run-view-162](#run-view-162)] [[run-view-120](#run-view-120)];
+- content growth without a transcript-counter change keeps a following thread at its end [[run-view-120](#run-view-120)];
+- upward reader movement, including movement concurrent with growth before a queued scroll event, detaches the thread through later growth and sidebar reflow, and Latest resumes following [[run-view-120](#run-view-120)] [[run-view-46](#run-view-46)].
+
+#### run-view-166
+
+Where a served Chinese session holds a player question and both players' delivered transcripts, when a long Chinese draft fills its composer at a 630 by 665 pixel viewport, the browser journey shall assert the draft scrolls above its one-row floor, the Send control stays wholly inside the Captain column with its center hit belonging to that control rather than a player pane, and one ordinary click submits exactly one durable Boss turn with the draft cleared [[run-view-106](#run-view-106)] [[run-view-8](#run-view-8)].
+
+#### run-view-167
+
+Where a served Chinese session holds delivered player transcripts and a long draft, when a player question and parked-run notice arrive before its viewport changes among 320 by 400 pixels with the rail collapsed, 630 by 665 pixels and 1280 by 800 pixels, the browser journey shall assert the chrome-capacity flow:
+
+- the arriving notices preserve the draft and its focus, with the field refitted without a value or viewport change [[run-view-106](#run-view-106)];
+- the page never grows, pane headers remain inside their panes, and the Captain header does not overlap the notice [[run-view-119](#run-view-119)];
+- at the short viewport the field yields to its one-row floor with excess text scrollable before the column scrolls its chrome [[run-view-106](#run-view-106)] [[run-view-119](#run-view-119)];
+- the header, notice and composer controls remain reachable within the Captain column's own scrolling box, with one ordinary Send click submitting exactly one durable Boss turn [[run-view-119](#run-view-119)] [[run-view-8](#run-view-8)].
+
+#### run-view-122
+
+Where the harness boots with the demo project registered, when the journey leaves Projects for the Dashboard, the Playbooks surface and Space and then returns, the test suite shall assert through the page that the sidebar names one place at a time [[run-view-67](#run-view-67)]: the project's row is selected on Projects, no other surface leaves any row in the tree selected while its own entry reads as current, Projects selects the remembered project's row again, and reloading the page while a surface stands returns to that surface rather than to Projects, a remembered Playbooks surface returning to the Playbooks surface itself and not to a project's Playbooks tab [[run-view-67](#run-view-67)].
+
+#### run-view-132
+
+Where the harness boots with the demo project registered and a scripted workflow that parks in its recoverable failure state with no control captured for it, the test suite shall assert the Drop-alone round trip through the page [[run-view-128](#run-view-128)]: the notice appears naming the failed workflow by its command with the raw state in its title, and stands through the turn's settlement [[run-view-128](#run-view-128)], the settled turn leaving the state chip reading the failure in red with the parked run's state in its tooltip rather than the Captain shell's rest state [[run-view-59](#run-view-59)], the notice drawing no recovery and naming the composer as the way on [[run-view-128](#run-view-128)], a control the opened run cannot satisfy refusing with its cause, leaving the notice, the transcript and the composer intact, and Drop's confirm backing out having sent nothing [[run-view-130](#run-view-130)] [[run-view-112](#run-view-112)]; and that at a 320-pixel viewport with the rail collapsed [[run-view-71](#run-view-71)] every control the notice draws sits under its words, none overlapping them nor each other nor leaving the notice's box [[run-view-128](#run-view-128)], with the page still not scrolling sideways [[run-view-119](#run-view-119)] ([DR-041](../decisions/041-chrome-that-fits.md): a simulated document cannot measure layout).
+
+#### run-view-193
+
+Where the browser journey harness ([DR-039](../decisions/039-browser-acceptance-journeys.md)) boots the served shell with the demo project registered and the real Captain shell running the built-in `/dev` on substitute agents that decide before coding, the reviewer's proposal running longer than the coder's, the test suite shall assert through the page:
+
+- while both proposals run, two chips name coder and reviewer each with "Propose a design", the `decide` card holds both proposal steps with their players' marks running, and activating the reviewer's chip brings its lane into view [[run-view-37](#run-view-37)] [[run-view-185](#run-view-185)];
+- once the run finishes, every call has its delegation and return line, the coder's code-step return line naming the commit the project's repository holds at HEAD, and the coder's lane names "decide › Merge the proposals", whose activation lights its delegation line [[run-view-178](#run-view-178)] [[run-view-184](#run-view-184)] [[run-view-186](#run-view-186)];
+- in a second session whose reviewer's proposal the Boss aborts, the card, the chip and the notice read aborted and no control reads "Retry" of its own making [[run-view-187](#run-view-187)].
+
+#### run-view-149
+
+Where the harness boots the served shell with the demo project registered and a substitute coder that commits its phase and leaves a file uncommitted, so the runtime parks the run it started over that residual and really advertises its controls, the test suite shall assert the published-control round trip through the page ([DR-076](../decisions/076-playbook-14-1-adoption.md)):
+
+- the notice names the failed workflow by its command and says why in the catalogue's phrase for the cause the runtime attached, carrying the residual's own path [[run-view-128](#run-view-128)] [[run-view-147](#run-view-147)];
+- it draws one control per advertised action in the action's own label, the reconciliation the runtime reports as a no-op visible and disabled with its phrased reason in its tooltip and in the what-now line, the abandonment beside it activatable, and Drop's tooltip carrying the ending the shell advertised [[run-view-128](#run-view-128)];
+- at a 320-pixel viewport with the rail collapsed [[run-view-71](#run-view-71)] every control it drew, each in the runtime's own label, sits under its words and inside the notice's box [[run-view-128](#run-view-128)], with the page still not scrolling sideways [[run-view-119](#run-view-119)] ([DR-041](../decisions/041-chrome-that-fits.md): a simulated document cannot measure layout);
+- activating the abandonment runs it as the next turn, which lands in the thread under that action's own label and leaves the notice with the park, no refusal reported [[run-view-129](#run-view-129)] [[run-view-130](#run-view-130)].
+
+#### run-view-165
+
+Where the harness boots the served shell with the demo project registered and a substitute coder whose call fails, so the runtime parks the run it started in its failure state and really advertises a retry of that step and a resume from an earlier one, the test suite shall assert the folded resumes through the page ([DR-117](../decisions/117-the-earlier-steps-fold-behind-one-control.md)):
+
+- the notice's row draws the retry in its own label and, beside Drop, one collapsed "Resume from an earlier step…" control, no resume drawn until it opens [[run-view-128](#run-view-128)];
+- opened, the list draws the resume in the runtime's own label, whole within its row [[run-view-128](#run-view-128)];
+- at a 320-pixel viewport with the rail collapsed [[run-view-71](#run-view-71)] and the list open, every control the notice draws sits under its words and inside the notice's box, each resume's label unclipped, with the page still not scrolling sideways [[run-view-128](#run-view-128)] [[run-view-119](#run-view-119)] ([DR-041](../decisions/041-chrome-that-fits.md): a simulated document cannot measure layout);
+- activating the resume runs it as the next turn, which lands in the thread under that action's own label with no refusal reported [[run-view-129](#run-view-129)] [[run-view-130](#run-view-130)].
+
+#### run-view-150
+
+Where the live journey lane runs with the machine's signed-in agents ([DR-089](../decisions/089-every-fresh-user-scenario-walked-for-real.md)) over a project created from the palette with specs scaffolded, when a `/decide` intent started from the Dashboard runs its real turn and the `/code` intent queued behind it follows, the test suite shall assert through the page:
+
+- the session's Captain pane shows each run's status lines to its finish with no failure, the return of its nested review among them [[run-view-1](#run-view-1)];
+- the coder's and the reviewer's panes carry their live output [[run-view-7](#run-view-7)] [[run-view-3](#run-view-3)], each showing a call labelled with its role opening in each cycle [[run-view-79](#run-view-79)];
+- the composer refuses input while each turn runs [[run-view-8](#run-view-8)];
+- a player's question, where a run asks one, stands as the Captain's bubble with the banner naming the asking player, the journey's answer through the composer goes to the Captain, and the wait clears only once the runtime reports the question gone [[run-view-9](#run-view-9)];
+- after the second settlement the session reads idle with its composer ready [[run-view-69](#run-view-69)].
+
+#### run-view-171
+
+Where the UI holds the local store and two seat stores with fake clients, the test suite shall assert the places [[run-view-168](#run-view-168)]: an approval snapshot, a ledger reply and a backfill in one store leave the others untouched; a seat's language state activates no language and writes none; the sidebar shows a heading per place with the local rows' test ids unchanged; one place's banner and one place's mismatch show alone; the selector switches Settings and Space; and the remote rules [[run-view-169](#run-view-169)] [[run-view-170](#run-view-170)]: a remote place offers no picker, reveal or path entry, one "From your groups" lists each project of the groups this computer lacks once, its row reading its project and group with no records' key and carrying its Space row's Open control, an open project's row carrying it too, "Open on <server>" sending `space.join` with no folder to that place's client and "Open here" sending it to the local client alone with the folder the shell's picker took, or, with no picker, the path named in place beneath its row, the list reading "No projects in your groups yet" while the groups list none and "All your groups' projects are open here" while this computer holds them all, the row reading "Opening…" while that join runs and offering "Try again" once it stopped, which sends the join again [[run-view-168](#run-view-168)], this computer's welcome page opening the palette there with its first project focused while signed in and showing the Space surface's sign-in while not [[run-view-172](#run-view-172)], "Open on <server>" on a row of this computer's Space opens no seat where one is open and sends that seat's `space.join` once it is signed in, the first "Open on <server>" shows the contract as bullets and sends `server.open` with consent only on "I understand", and a seat whose sign-in is pending reads "Signing in to <Space>…" on its line and one whose sign-in runs the approval's link there, and either "Signing in to <Space>…" in the palette [[run-view-168](#run-view-168)]; a remote place's repair row, package folder and draft source offer no folder picker and no path on this computer, a package's folder named relative to its project alone; a seat's row whose code clone failed offers "Try again", sending the join again, and "Add a credential", opening that seat's Credentials section at the host [[run-view-169](#run-view-169)]; the sidebar's attention marks leave out a place speaking another protocol version [[run-view-168](#run-view-168)]; a seat holding no project adds no heading to the sidebar and no page of its own, the headings standing once a seat holds or is opening a project [[run-view-67](#run-view-67)]; and activating a place's heading in the sidebar shows that place on the Projects surface [[run-view-168](#run-view-168)]; a project opened from this computer's "From your groups" is this computer's current project at once by its row's key, and one opened at a seat's is that seat's, the Projects surface showing that place [[run-view-168](#run-view-168)]; while a project's open runs at this computer, the sidebar lists it under this computer reading "Opening…", selected while current, with the step in flight as its title, and the Projects surface names it over that step with no task start, an open that stopped reading its cause with "Open Space" showing the Space surface, and the project's own view and sidebar row, selected, replace them once the core lists it [[run-view-168](#run-view-168)].
+
+#### run-view-173
+
+Where the browser journey harness ([DR-039](../decisions/039-browser-acceptance-journeys.md)) boots the served shell beside a stand-in instance listing two servers, a stand-in hub per server admitting tickets and relaying to a further core standing for that server's seat, and substitute agents ([DR-089](../decisions/089-every-fresh-user-scenario-walked-for-real.md)), when the journey opens both seats by "Open on <server>" on a group project's row of the Space surface — the first showing the contract and "I understand", a later one at a server already understood sending at once, the servers' lines standing under their group [[run-view-170](#run-view-170)] — the test suite shall assert through the page the places [[run-view-168](#run-view-168)]: each place's projects under its own heading, the selector naming the three places; one queue carrying the three cores' attention in each band's order with the badge counting them, an entry opened at its own place; an approval answered at its seat; a seat whose hello carries another protocol version read as mismatched alone while the other stays open; the seat's bearer absent from every message the renderer receives; and, after Disconnect, the seat's heading gone and its relay path refused [[run-view-169](#run-view-169)].
+
+#### run-view-195
+
+Where the browser journey harness ([DR-039](../decisions/039-browser-acceptance-journeys.md)) boots the served shell beside a stand-in instance listing one server of the member's group, a stand-in hub relaying to a further core standing for its seat, signed in at the same instance, this computer holding no project and the group holding one project repository whose code remote is a path the harness serves, when the journey reads the sidebar and the palette, opens the project on the server from the palette and reads them again, the test suite shall assert through the page, in English and in Chinese: before the open, the sidebar shows no heading and no page of the server [[run-view-67](#run-view-67)], and the palette lists the project once under "From your groups" with "Open here" and "Open on <server>" [[run-view-168](#run-view-168)]; "Open on <server>" shows the contract once and "I understand" sends `server.open`, the server's line reading "Connecting to <server>…" then "Connected" [[run-view-170](#run-view-170)]; the row reads "Opening on <server>…" and the server's heading appears in the sidebar with the project beneath it, "This computer" heading its rows from then on [[run-view-67](#run-view-67)] [[run-view-168](#run-view-168)] — the journey standing in for the seat's allocation of the code's folder; after Disconnect on the server's line the heading is gone and the line reads the server's name with no control [[run-view-170](#run-view-170)]; and, booted again with the group holding no project, the palette reads "No projects in your groups yet" under "From your groups" [[run-view-168](#run-view-168)].
+
+#### run-view-196
+
+Where the protocol client talks to a real loopback WebSocket peer with a controlled clock, integration verification shall hold one session-creation reply beyond two minutes, answer it and assert one request and the returned session identity, while an ordinary reply times out at its existing bound; it shall also assert an explicitly selected observation deadline, continued default waiting beyond ten minutes, and a connection closing reject without automatic resends [[run-view-26](#run-view-26)] [session-start-timeout.integration.test.ts](../../packages/ui/src/lib/session-start-timeout.integration.test.ts).

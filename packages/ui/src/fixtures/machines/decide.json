@@ -1,0 +1,306 @@
+{
+  "initial": "ready",
+  "nodes": [
+    {
+      "id": "ready",
+      "kind": "state",
+      "description": "Waiting for the caller to give a topic to decide.",
+      "tags": [
+        "playbook.parked"
+      ]
+    },
+    {
+      "id": "independentProposals",
+      "kind": "state",
+      "description": "Coder and Reviewer independently propose designs for the topic in parallel.",
+      "tags": []
+    },
+    {
+      "id": "independentProposals.coderProposalRegion",
+      "parent": "independentProposals",
+      "kind": "state",
+      "description": "Coder's independent proposal branch.",
+      "tags": []
+    },
+    {
+      "id": "independentProposals.coderProposalRegion.askCoderProposal",
+      "parent": "independentProposals.coderProposalRegion",
+      "kind": "state",
+      "role": "coder",
+      "description": "Coder is independently proposing a design for the topic.",
+      "tags": [
+        "playbook.busy"
+      ]
+    },
+    {
+      "id": "independentProposals.coderProposalRegion.awaitCoderProposalReply",
+      "parent": "independentProposals.coderProposalRegion",
+      "kind": "state",
+      "description": "Waiting for Boss to answer Coder's question about its independent proposal.",
+      "tags": [
+        "playbook.parked"
+      ]
+    },
+    {
+      "id": "independentProposals.coderProposalRegion.coderProposalStaged",
+      "parent": "independentProposals.coderProposalRegion",
+      "kind": "final",
+      "description": "Coder's independent proposal is complete and staged for the join.",
+      "tags": []
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion",
+      "parent": "independentProposals",
+      "kind": "state",
+      "description": "Reviewer's independent proposal branch.",
+      "tags": []
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion.askReviewerProposal",
+      "parent": "independentProposals.reviewerProposalRegion",
+      "kind": "state",
+      "role": "reviewer",
+      "description": "Reviewer is independently proposing a design for the topic.",
+      "tags": [
+        "playbook.busy"
+      ]
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion.awaitReviewerProposalReply",
+      "parent": "independentProposals.reviewerProposalRegion",
+      "kind": "state",
+      "description": "Waiting for Boss to answer Reviewer's question about its independent proposal.",
+      "tags": [
+        "playbook.parked"
+      ]
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion.reviewerProposalStaged",
+      "parent": "independentProposals.reviewerProposalRegion",
+      "kind": "final",
+      "description": "Reviewer's independent proposal is complete and staged for the join.",
+      "tags": []
+    },
+    {
+      "id": "synthesizeCommit",
+      "kind": "state",
+      "role": "coder",
+      "description": "Coder synthesizes both proposals into the necessary DRs and/or spec items and commits the result as one new commit.",
+      "tags": [
+        "playbook.busy"
+      ]
+    },
+    {
+      "id": "awaitBossReply",
+      "kind": "state",
+      "description": "Waiting for Boss to answer the acting agent's question.",
+      "tags": [
+        "playbook.parked"
+      ]
+    },
+    {
+      "id": "reviewCommit",
+      "kind": "state",
+      "description": "The review playbook examines the decide-owned commit.",
+      "tags": [
+        "playbook.suspended"
+      ]
+    },
+    {
+      "id": "failed",
+      "kind": "state",
+      "description": "DECIDE parked after a control-plane failure and waits for Boss to restart or resume it.",
+      "tags": [
+        "playbook.parked"
+      ]
+    },
+    {
+      "id": "reportedReviewFailure",
+      "kind": "final",
+      "description": "DECIDE reported review's abort, failure, or unestablished result to its caller with the last decide-owned commit.",
+      "tags": []
+    },
+    {
+      "id": "done",
+      "kind": "final",
+      "description": "DECIDE completed: review established no unsettled findings for the decide-owned commit at the reported evaluated revision.",
+      "tags": []
+    }
+  ],
+  "edges": [
+    {
+      "id": "ready::START_DECIDE::0::0",
+      "from": "ready",
+      "to": "independentProposals",
+      "event": "START_DECIDE"
+    },
+    {
+      "id": "independentProposals::done::0::0",
+      "from": "independentProposals",
+      "to": "synthesizeCommit",
+      "event": "done"
+    },
+    {
+      "id": "independentProposals.coderProposalRegion.askCoderProposal::done::0::0",
+      "from": "independentProposals.coderProposalRegion.askCoderProposal",
+      "to": "independentProposals.coderProposalRegion.awaitCoderProposalReply",
+      "event": "done"
+    },
+    {
+      "id": "independentProposals.coderProposalRegion.askCoderProposal::done::1::0",
+      "from": "independentProposals.coderProposalRegion.askCoderProposal",
+      "to": "independentProposals.coderProposalRegion.coderProposalStaged",
+      "event": "done"
+    },
+    {
+      "id": "independentProposals.coderProposalRegion.askCoderProposal::done::2::0",
+      "from": "independentProposals.coderProposalRegion.askCoderProposal",
+      "to": "independentProposals.coderProposalRegion.coderProposalStaged",
+      "event": "done"
+    },
+    {
+      "id": "independentProposals.coderProposalRegion.askCoderProposal::done::3::0",
+      "from": "independentProposals.coderProposalRegion.askCoderProposal",
+      "to": "failed",
+      "event": "done"
+    },
+    {
+      "id": "independentProposals.coderProposalRegion.askCoderProposal::error::0::0",
+      "from": "independentProposals.coderProposalRegion.askCoderProposal",
+      "to": "failed",
+      "event": "error"
+    },
+    {
+      "id": "independentProposals.coderProposalRegion.awaitCoderProposalReply::BOSS_REPLY::0::0",
+      "from": "independentProposals.coderProposalRegion.awaitCoderProposalReply",
+      "to": "failed",
+      "event": "BOSS_REPLY"
+    },
+    {
+      "id": "independentProposals.coderProposalRegion.awaitCoderProposalReply::BOSS_REPLY::1::0",
+      "from": "independentProposals.coderProposalRegion.awaitCoderProposalReply",
+      "to": "independentProposals.coderProposalRegion.askCoderProposal",
+      "event": "BOSS_REPLY"
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion.askReviewerProposal::done::0::0",
+      "from": "independentProposals.reviewerProposalRegion.askReviewerProposal",
+      "to": "independentProposals.reviewerProposalRegion.awaitReviewerProposalReply",
+      "event": "done"
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion.askReviewerProposal::done::1::0",
+      "from": "independentProposals.reviewerProposalRegion.askReviewerProposal",
+      "to": "independentProposals.reviewerProposalRegion.reviewerProposalStaged",
+      "event": "done"
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion.askReviewerProposal::done::2::0",
+      "from": "independentProposals.reviewerProposalRegion.askReviewerProposal",
+      "to": "independentProposals.reviewerProposalRegion.reviewerProposalStaged",
+      "event": "done"
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion.askReviewerProposal::done::3::0",
+      "from": "independentProposals.reviewerProposalRegion.askReviewerProposal",
+      "to": "failed",
+      "event": "done"
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion.askReviewerProposal::error::0::0",
+      "from": "independentProposals.reviewerProposalRegion.askReviewerProposal",
+      "to": "failed",
+      "event": "error"
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion.awaitReviewerProposalReply::BOSS_REPLY::0::0",
+      "from": "independentProposals.reviewerProposalRegion.awaitReviewerProposalReply",
+      "to": "failed",
+      "event": "BOSS_REPLY"
+    },
+    {
+      "id": "independentProposals.reviewerProposalRegion.awaitReviewerProposalReply::BOSS_REPLY::1::0",
+      "from": "independentProposals.reviewerProposalRegion.awaitReviewerProposalReply",
+      "to": "independentProposals.reviewerProposalRegion.askReviewerProposal",
+      "event": "BOSS_REPLY"
+    },
+    {
+      "id": "synthesizeCommit::done::0::0",
+      "from": "synthesizeCommit",
+      "to": "awaitBossReply",
+      "event": "done"
+    },
+    {
+      "id": "synthesizeCommit::done::1::0",
+      "from": "synthesizeCommit",
+      "to": "reviewCommit",
+      "event": "done"
+    },
+    {
+      "id": "synthesizeCommit::done::2::0",
+      "from": "synthesizeCommit",
+      "to": "failed",
+      "event": "done"
+    },
+    {
+      "id": "synthesizeCommit::error::0::0",
+      "from": "synthesizeCommit",
+      "to": "failed",
+      "event": "error"
+    },
+    {
+      "id": "awaitBossReply::BOSS_REPLY::0::0",
+      "from": "awaitBossReply",
+      "to": "failed",
+      "event": "BOSS_REPLY"
+    },
+    {
+      "id": "awaitBossReply::BOSS_REPLY::1::0",
+      "from": "awaitBossReply",
+      "to": "failed",
+      "event": "BOSS_REPLY"
+    },
+    {
+      "id": "awaitBossReply::BOSS_REPLY::2::0",
+      "from": "awaitBossReply",
+      "to": "synthesizeCommit",
+      "event": "BOSS_REPLY"
+    },
+    {
+      "id": "awaitBossReply::START_DECIDE::0::0",
+      "from": "awaitBossReply",
+      "to": "independentProposals",
+      "event": "START_DECIDE"
+    },
+    {
+      "id": "reviewCommit::done::0::0",
+      "from": "reviewCommit",
+      "to": "done",
+      "event": "done"
+    },
+    {
+      "id": "reviewCommit::done::1::0",
+      "from": "reviewCommit",
+      "to": "reportedReviewFailure",
+      "event": "done"
+    },
+    {
+      "id": "reviewCommit::error::0::0",
+      "from": "reviewCommit",
+      "to": "reportedReviewFailure",
+      "event": "error"
+    },
+    {
+      "id": "reviewCommit::error::1::0",
+      "from": "reviewCommit",
+      "to": "failed",
+      "event": "error"
+    },
+    {
+      "id": "failed::START_DECIDE::0::0",
+      "from": "failed",
+      "to": "independentProposals",
+      "event": "START_DECIDE"
+    }
+  ]
+}

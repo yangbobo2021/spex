@@ -1,0 +1,158 @@
+name: App Release
+
+# App tags build native desktop downloads; publish only when both platforms pass.
+on:
+  push:
+    tags:
+      - "app-v*"
+
+permissions: {}
+
+concurrency:
+  group: app-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  require-ci-green:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Require CI to be green for the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for CI (ci.yml) to succeed for commit $SHA"
+          for attempt in $(seq 1 60); do
+            line="$(gh api \
+              "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=1" \
+              --jq '(.workflow_runs[0].status // "missing") + " " + (.workflow_runs[0].conclusion // "none")')"
+            status="${line%% *}"
+            conclusion="${line##* }"
+            echo "attempt $attempt/60: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CI is green for $SHA."
+                exit 0
+              fi
+              echo "::error::CI for $SHA concluded '$conclusion'; refusing to release."
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "::error::Timed out waiting for CI to complete for $SHA; refusing to release."
+          exit 1
+
+  prepare:
+    needs: require-ci-green
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      title: ${{ steps.version.outputs.title }}
+      beta: ${{ steps.version.outputs.beta }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Verify version matches tag
+        id: version
+        run: node scripts/release-notes.mjs check --tag="$GITHUB_REF_NAME"
+      - name: Extract release notes
+        run: >-
+          node scripts/release-notes.mjs notes
+          --tag="$GITHUB_REF_NAME"
+          --repository="$GITHUB_REPOSITORY"
+          --out=release-notes.md
+      - name: Require published runtime dependencies
+        run: node scripts/dependency-closure.mjs --registry-only
+      - run: npm ci
+      - run: npm run build
+      - name: Tests
+        run: npm test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  package:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            script: package:mac
+            asset: mac-arm64.dmg
+          - os: windows-2022
+            script: package:windows
+            asset: win-x64.exe
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Build native desktop package
+        run: npm run ${{ matrix.script }} -w apps/desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.asset }}
+          path: apps/desktop/release/Spex-${{ needs.prepare.outputs.version }}-${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-release-notes
+          path: notes
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: artifacts
+      - name: Verify both downloads and write checksums
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          test -s "Spex-$VERSION-mac-arm64.dmg"
+          test -s "Spex-$VERSION-win-x64.exe"
+          sha256sum "Spex-$VERSION-mac-arm64.dmg" "Spex-$VERSION-win-x64.exe" > SHA256SUMS
+      - name: Create GitHub release with both native downloads
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.prepare.outputs.title }}
+          body_path: notes/release-notes.md
+          prerelease: ${{ needs.prepare.outputs.beta == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/*.dmg
+            artifacts/*.exe
+            artifacts/SHA256SUMS

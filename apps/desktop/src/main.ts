@@ -1,0 +1,438 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// Spex desktop main process (SHELL package): captures the login-shell
+// environment, boots the core in-process, and loads the built web UI
+// in a sandboxed renderer that speaks the same WebSocket protocol as
+// any browser (no Electron IPC for app features, SHELL-10).
+
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { renameSync, writeFileSync } from "node:fs";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  Menu,
+  nativeTheme,
+  Notification as ElectronNotification,
+  shell,
+} from "electron";
+import { CoreService } from "@sublang/spex-core";
+import { resolveLanguage } from "@sublang/spex-core/language";
+import type { I18n } from "@lingui/core";
+
+import { captureLoginShellEnv, mergeEnv } from "./shell-env.js";
+import { desktopCoreOptions } from "./core-options.js";
+import { speak } from "./i18n.js";
+import { notificationFor } from "./notifications.js";
+import { frameNavigationAllowed } from "./frame-navigation.js";
+import { openInstanceUrl } from "./open-external.js";
+import { resolveRevealTarget } from "./reveal-path.js";
+
+let service: CoreService | undefined;
+let window: BrowserWindow | undefined;
+let quitting = false;
+/** The main window's narrowest width: the spec view's stacked graph
+ * keeps its 320px floor beside the open sidebar (app-shell-40). */
+const MAIN_WINDOW_MIN_WIDTH = 600;
+
+/**
+ * The shell's tongue at this moment (app-shell-29, localization-2):
+ * the home's stored choice read from the embedded core, or with none
+ * the first of the operating system's preferred languages that is
+ * offered. Resolved per composed text, so a choice made in Settings
+ * reaches the next notification without a restart — and so a startup
+ * failure, which has no core to ask, still speaks the system's
+ * language.
+ */
+function reader(): I18n {
+  let preferred: readonly string[] = [];
+  try {
+    preferred = app.getPreferredSystemLanguages();
+  } catch {
+    // Before the app is ready on some platforms; English then.
+  }
+  return speak(resolveLanguage(service?.language() ?? null, preferred));
+}
+
+// A driven or acceptance run keeps its own user-data directory
+// (app-shell-24, DR-020). The redirect comes before the single-instance
+// lock, which Electron keys on that directory: otherwise a developer's
+// own running Spex holds the lock and the run quits without a word.
+const isolatedUserData =
+  process.env.SPEX_SMOKE_HANDSHAKE || process.env.SPEX_ACCEPTANCE
+    ? process.env.SPEX_SMOKE_USERDATA
+    : undefined;
+if (isolatedUserData) {
+  app.setPath("userData", isolatedUserData);
+}
+
+const singleInstance = app.requestSingleInstanceLock();
+if (!singleInstance) {
+  app.quit();
+} else {
+  // A terminal's Ctrl+C or a runner's SIGTERM stops the core the way a
+  // quit does — releasing the state root — without the active-turn
+  // confirmation, and exits 130 or 143 once the core has stopped or
+  // after a bounded wait (app-shell-39, DR-108). Electron would
+  // otherwise end the process at once, leaving `.lease/` behind.
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      const status = signal === "SIGINT" ? 130 : 143;
+      if (quitting) {
+        app.exit(status);
+        return;
+      }
+      quitting = true;
+      const bound = setTimeout(() => app.exit(status), 10_000);
+      void shutdown().finally(() => {
+        clearTimeout(bound);
+        app.exit(status);
+      });
+    });
+  }
+
+  app.on("second-instance", () => {
+    if (window) {
+      if (window.isMinimized()) window.restore();
+      window.focus();
+    }
+  });
+
+  // A startup refusal must reach the user, not vanish as an unhandled
+  // rejection with no window: another core holding the state root
+  // (core-service-61) or a failed migration (core-service-15) surfaces
+  // as a dialog naming the cause.
+  void main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("Spex could not start:", message);
+    const i18n = reader();
+    dialog.showErrorBox(i18n._("Spex could not start"), message);
+    app.exit(1);
+  });
+}
+
+function installApplicationMenu(): void {
+  // Electron localizes its own `role:` entries; only the Help item is
+  // the shell's own text (app-shell-29).
+  const i18n = reader();
+  const template: Electron.MenuItemConstructorOptions[] = [
+    ...(process.platform === "darwin"
+      ? [{ role: "appMenu" as const }]
+      : []),
+    { role: "editMenu" },
+    { role: "viewMenu" },
+    { role: "windowMenu" },
+    {
+      role: "help",
+      submenu: [
+        {
+          label: i18n._("Spex on GitHub"),
+          click: () =>
+            void shell.openExternal("https://github.com/sublang-ai/spex"),
+        },
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+async function main(): Promise<void> {
+  // Live-smoke handshake (DR-020, SHELL): when set, the driver owns a
+  // scratch home — user data redirects there before anything opens
+  // it, and the core's socket address lands in the handshake file.
+  // Mutually exclusive with acceptance mode, which exits seconds
+  // after first paint and could never host a driven turn.
+  const smokeHandshake = process.env.SPEX_SMOKE_HANDSHAKE;
+  if (smokeHandshake && process.env.SPEX_ACCEPTANCE) {
+    process.stderr.write(
+      "SPEX_SMOKE_HANDSHAKE and SPEX_ACCEPTANCE are mutually exclusive\n",
+    );
+    app.exit(2);
+    return;
+  }
+  await app.whenReady();
+
+  if (process.platform === "darwin") {
+    app.setAboutPanelOptions({
+      applicationName: "Spex",
+      applicationVersion: app.getVersion(),
+      copyright: "© 2026 SubLang International",
+    });
+    // Packaged builds get the bundle icon from electron-builder
+    // (SHELL-23); dev runs need the dock icon set explicitly.
+    if (!app.isPackaged) {
+      app.dock?.setIcon(join(app.getAppPath(), "build", "icon-512.png"));
+    }
+  }
+
+  // Credentials exported in shell profiles must be visible before
+  // any adapter readiness check (SHELL-12, DR-004).
+  const captured = await captureLoginShellEnv();
+  mergeEnv(process.env, captured);
+  if (process.platform === "win32") {
+    const { setupEnvironment } = await import("dugite");
+    const { env, gitLocation } = setupEnvironment({});
+    const { dirname, delimiter } = await import("node:path");
+    Object.assign(process.env, env);
+    const pathKey = Object.keys(process.env).find(key => key.toLowerCase() === "path") ?? "PATH";
+    // MinGit ships POSIX command helpers at the Git root, outside ucrt64.
+    const gitHelpers = join(dirname(dirname(gitLocation)), "usr", "bin");
+    process.env[pathKey] = `${dirname(process.execPath)}${delimiter}${dirname(gitLocation)}${delimiter}${gitHelpers}${delimiter}${process.env[pathKey] ?? ""}`;
+  }
+
+  // The shared state root (DR-036, SHELL-15): plain files under
+  // ${SPEX_HOME:-~/.spex}; userData keeps only the renderer profile.
+  // Smoke mode redirects the root beside the redirected user-data so
+  // a driven run touches no real state (SHELL-24). The legacy
+  // userData store rides along for the core's one-time import.
+  const dataDir = isolatedUserData
+    ? join(isolatedUserData, "spex-home")
+    : process.env.SPEX_HOME?.trim() ? process.env.SPEX_HOME : join(homedir(), ".spex");
+  // This Electron run as Node is the runtime of the compiler, the
+  // scaffold CLI and the Git credential helper alike, and sign-in runs
+  // the browser flow (app-shell-15, app-shell-33).
+  service = await CoreService.start(
+    desktopCoreOptions({
+      dataDir,
+      userData: app.getPath("userData"),
+      systemLanguages: app.getPreferredSystemLanguages(),
+      execPath: process.execPath,
+      moduleUrl: import.meta.url,
+    }),
+  );
+
+  // The menu waits for the core: its one item of the shell's own text
+  // reads the home's language choice (app-shell-29).
+  installApplicationMenu();
+
+  if (smokeHandshake) {
+    // Atomic-enough for the single local reader: write sidecar, then
+    // rename into place so the driver never sees a partial file.
+    const handshake = {
+      wsUrl: `ws://127.0.0.1:${service.port()}/?token=${service.token()}`,
+    };
+    const sidecar = `${smokeHandshake}.tmp`;
+    writeFileSync(sidecar, JSON.stringify(handshake));
+    renameSync(sidecar, smokeHandshake);
+  }
+
+  // The dock badge reads the one attention count the core reads
+  // (app-shell-4, core-service-129): its own ledger fold's badge
+  // (DR-035) plus each open seat's, re-read whenever either moves, so
+  // the dock and the app never disagree.
+  service.events.onLedgerChange = () => {
+    if (process.platform === "darwin") {
+      app.setBadgeCount(service?.attentionCount() ?? 0);
+    }
+  };
+  service.events.onRecord = (envelope) => {
+    const prefs = service?.notificationPrefs() ?? {};
+    const notification = notificationFor(envelope, prefs, reader());
+    if (notification?.sink === "bell") {
+      shell.beep();
+    } else if (notification && ElectronNotification.isSupported()) {
+      const shown = new ElectronNotification({
+        title: notification.title,
+        body: notification.body,
+      });
+      shown.on("click", () => {
+        window?.show();
+        window?.focus();
+      });
+      shown.show();
+    }
+  };
+
+  // Native bridge (DR-008): OS affordances only, one invoke channel
+  // each — the directory picker, the path reveal (DR-057), and the Git
+  // host's sign-in page opened in the system browser (DR-103).
+  ipcMain.handle("spex:pick-directory", async () => {
+    if (!window) return null;
+    const result = await dialog.showOpenDialog(window, {
+      properties: ["openDirectory", "createDirectory"],
+    });
+    return result.canceled ? null : (result.filePaths[0] ?? null);
+  });
+  // A reveal shows a path in the OS file manager and changes no state
+  // (app-shell-28, DR-008): only a path resolving inside the state
+  // root the core was started with is shown; anything else is false.
+  ipcMain.handle("spex:reveal-path", async (_event, requested: unknown) => {
+    const target = resolveRevealTarget(dataDir, requested);
+    if (!target) return false;
+    shell.showItemInFolder(target);
+    return true;
+  });
+  // An open hands the system browser a URL at the origin of an instance
+  // the home lists or is signing in to, read at the moment of the ask,
+  // and changes no state (app-shell-37, app-shell-20); any other URL, or
+  // one the OS fails to open, is false, and the page shows it as a link
+  // instead.
+  ipcMain.handle("spex:open-external", (_event, requested: unknown) =>
+    openInstanceUrl(service?.instanceOrigins() ?? [], requested, (url) => shell.openExternal(url)),
+  );
+
+  window = new BrowserWindow({
+    width: 1440,
+    height: 900,
+    // Below 600px the spec view's stacked graph would fall under its
+    // 320px floor beside the open sidebar (app-shell-40).
+    minWidth: MAIN_WINDOW_MIN_WIDTH,
+    title: "Spex",
+    // First paint matches the UI's page surface (DR-013) so launch
+    // and reload never flash stock white.
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#0a0a0a" : "#f7f4ef",
+    webPreferences: {
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      preload: join(app.getAppPath(), "preload.cjs"),
+    },
+  });
+
+  // The renderer only ever loads the bundled UI; anything else (window
+  // opens, markdown links) goes to the system browser or is dropped.
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/i.test(url)) void shell.openExternal(url);
+    return { action: "deny" };
+  });
+  window.webContents.on("will-navigate", (event, url) => {
+    if (!url.startsWith("file:")) {
+      event.preventDefault();
+      if (/^https?:/i.test(url)) void shell.openExternal(url);
+    }
+  });
+  // A frame inside the page — an applet's — navigates only at the
+  // in-app core endpoint's origin; anywhere else is prevented and opens
+  // nothing, so what the page read leaves in no URL (app-shell-41,
+  // DR-161). The main frame keeps the rule above.
+  const endpointOrigin = `http://127.0.0.1:${service.port()}`;
+  window.webContents.on("will-frame-navigate", (event) => {
+    if (!event.isMainFrame && !frameNavigationAllowed(endpointOrigin, event.url)) event.preventDefault();
+  });
+
+  // Acceptance mode (SPEX_ACCEPTANCE=<png path>): render, report the
+  // renderer's real state, capture a screenshot, and exit — so "it
+  // boots" can never again pass for "it shows a white window".
+  const acceptancePath = process.env.SPEX_ACCEPTANCE;
+  const consoleErrors: string[] = [];
+  if (acceptancePath) {
+    window.webContents.on("console-message", (_event, level, message) => {
+      // The CSP advisory is dev-only noise; it disappears when packaged.
+      if (level >= 2 && !message.includes("Electron Security Warning")) {
+        consoleErrors.push(message);
+      }
+    });
+    window.webContents.on(
+      "did-fail-load",
+      (_event, code, description, url) => {
+        consoleErrors.push(`did-fail-load ${code} ${description} ${url}`);
+      },
+    );
+  }
+
+  await window.loadFile(join(app.getAppPath(), "ui-dist", "index.html"), {
+    query: {
+      core: `ws://127.0.0.1:${service.port()}/?token=${service.token()}`,
+      version: app.getVersion(),
+    },
+  });
+
+  if (acceptancePath) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1500));
+    // SPEX_ACCEPTANCE_CLICKS: a comma-separated list of accessible
+    // names to activate before the capture, so a surface behind
+    // navigation can be proven to render too.
+    for (const label of (process.env.SPEX_ACCEPTANCE_CLICKS ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean)) {
+      const clicked = (await window.webContents.executeJavaScript(
+        `(() => {
+          const name = ${JSON.stringify(label)};
+          // "@prefix" selects by test id prefix; anything else matches
+          // the accessible name, the way a reader would find it.
+          const match = name.startsWith("@")
+            ? document.querySelector(\`[data-testid^="\${name.slice(1)}"]\`)
+            : [...document.querySelectorAll("button,[role=tab],a")]
+                .find((node) =>
+                  (node.getAttribute("aria-label") ?? node.textContent ?? "")
+                    .trim()
+                    .startsWith(name));
+          if (!match) return false;
+          match.click();
+          return true;
+        })()`,
+      )) as boolean;
+      if (!clicked) consoleErrors.push(`acceptance click missed: ${label}`);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 700));
+    }
+    const state = (await window.webContents.executeJavaScript(
+      `({
+        rootChildren: document.getElementById("root")?.children.length ?? 0,
+        bodyText: document.body.innerText.slice(0, 1200),
+        // Overflow report: any drawing wider than its scroller is a
+        // clipped card, which reads as broken rather than scrollable.
+        overflow: [...document.querySelectorAll("svg[role=img]")].map((svg) => ({
+          label: svg.getAttribute("aria-label"),
+          drawing: svg.getBoundingClientRect().width,
+          scroller: svg.parentElement?.clientWidth ?? 0,
+        })),
+        title: document.title,
+      })`,
+    )) as { rootChildren: number; bodyText: string; title: string };
+    // The window's floor, read back from the window itself so the
+    // smoke can hold it (app-shell-40).
+    const [minimumWidth] = window.getMinimumSize();
+    Object.assign(state, { minimumWidth });
+    const image = await window.webContents.capturePage();
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(acceptancePath, image.toPNG());
+    console.log(
+      JSON.stringify({ acceptance: state, consoleErrors }, null, 2),
+    );
+    quitting = true;
+    await shutdown();
+    app.exit(consoleErrors.length > 0 || state.rootChildren === 0 ? 1 : 0);
+    return;
+  }
+
+  app.on("before-quit", (event) => {
+    if (quitting) return;
+    if (service?.hasActiveTurns()) {
+      const i18n = reader();
+      const choice = dialog.showMessageBoxSync({
+        type: "warning",
+        buttons: [i18n._("Keep running"), i18n._("Quit anyway")],
+        defaultId: 0,
+        cancelId: 0,
+        message: i18n._("A playbook turn is still running."),
+        detail: i18n._(
+          "Quitting aborts the running turn; a message continues the conversation later.",
+        ),
+      });
+      if (choice === 0) {
+        event.preventDefault();
+        return;
+      }
+    }
+    event.preventDefault();
+    quitting = true;
+    void shutdown().then(() => app.quit());
+  });
+
+  app.on("window-all-closed", () => {
+    app.quit();
+  });
+}
+
+async function shutdown(): Promise<void> {
+  try {
+    await service?.stop();
+  } catch {
+    // Nothing actionable at quit time.
+  }
+  service = undefined;
+}

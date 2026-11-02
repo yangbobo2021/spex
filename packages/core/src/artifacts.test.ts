@@ -1,0 +1,343 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// PBLIB-25: pipeline artifacts from both layouts, with degradation,
+// and the Gears stage parsed into items (PBLIB-44).
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { resolveArtifacts } from "./artifacts.js";
+import { scratchDir } from "./testing/scratch.js";
+
+const FSM = `
+import { setup } from "xstate";
+export const demoMachine = setup({}).createMachine({
+  id: "demo",
+  initial: "ready",
+  states: {
+    ready: { on: { GO: "work" } },
+    work: { on: { DONE: "done" } },
+    awaitBossReply: {},
+    failed: {},
+    done: { type: "final" },
+  },
+});
+`;
+
+/** A Gears artifact is a GEARS package file: item headings with a
+ * statement, an attachment, and an enclosed citation of a sibling. */
+function gearsFile(id: string): string {
+  return [
+    `# ${id}: GEARS for ${id}`,
+    "",
+    `## ${id} roles`,
+    "",
+    `### ${id}-1`,
+    "",
+    "When the phase begins, Coder shall write the change:",
+    "",
+    "- the commit stands alone.",
+    "",
+    `### ${id}-2`,
+    "",
+    `When the change lands, Reviewer shall read it [[${id}-1](${id}.md#${id}-1)].`,
+    "",
+  ].join("\n");
+}
+
+function compiledLayout(id: string): { dir: string; from: string } {
+  const dir = scratchDir("spex-artifacts-");
+  writeFileSync(join(dir, `${id}.md`), `# ${id} workflow\n`);
+  const artifactDir = join(dir, `${id}.playbook`);
+  mkdirSync(artifactDir);
+  writeFileSync(join(artifactDir, `${id}.gears.md`), gearsFile(id));
+  writeFileSync(join(artifactDir, `${id}.fsm.ts`), FSM);
+  const from = join(dir, `${id}.registry.mjs`);
+  writeFileSync(from, "export default {};\n");
+  return { dir, from };
+}
+
+test("artifacts resolve from the compiled library layout with state ids", async () => {
+  const { from } = compiledLayout("demo");
+  const artifacts = await resolveArtifacts({ id: "demo", from });
+  assert.match(artifacts.source ?? "", /demo workflow/);
+  assert.match(artifacts.gears ?? "", /GEARS for demo/);
+  assert.match(artifacts.fsm ?? "", /createMachine/);
+  assert.deepEqual(artifacts.missing, []);
+  // playbook-library-36: the drawable graph rides beside the ids.
+  assert.ok(artifacts.machine, "machine graph must be served");
+  assert.equal(artifacts.machine?.initial, "ready");
+  assert.ok((artifacts.machine?.edges.length ?? 0) > 0);
+  const finals = artifacts.machine?.nodes.filter((n) => n.kind === "final");
+  assert.ok((finals?.length ?? 0) > 0);
+  assert.deepEqual(artifacts.stateIds, [
+    "ready",
+    "work",
+    "awaitBossReply",
+    "failed",
+    "done",
+  ]);
+  // playbook-library-24: the Gears stage also rides parsed, in the
+  // shape the outline's rows read — id, first line, body, citations.
+  const gears = artifacts.gearsItems;
+  assert.ok(gears, "gears items must be served");
+  assert.deepEqual(
+    gears.items.map((item) => item.id),
+    ["demo-1", "demo-2"],
+  );
+  assert.equal(
+    gears.items[0].firstLine,
+    "When the phase begins, Coder shall write the change:",
+  );
+  assert.match(gears.items[0].text, /the commit stands alone/);
+  assert.deepEqual(gears.items[1].cites, ["demo-1"]);
+});
+
+test("gears the parser reads no item from serve as markdown alone", async () => {
+  const { dir, from } = compiledLayout("plain");
+  writeFileSync(
+    join(dir, "plain.playbook", "plain.gears.md"),
+    "# plain\n\nProse with no item heading at all.\n",
+  );
+  const artifacts = await resolveArtifacts({ id: "plain", from });
+  assert.match(artifacts.gears ?? "", /Prose with no item heading/);
+  assert.equal(artifacts.gearsItems, undefined);
+});
+
+test("artifacts resolve from the published-package layout", async () => {
+  const root = scratchDir("spex-artifacts-pkg-");
+  writeFileSync(join(root, "code.md"), "# code source\n");
+  const pkgDir = join(root, "code.playbook");
+  mkdirSync(pkgDir);
+  writeFileSync(join(pkgDir, "code.gears.md"), "## code gears\n");
+  writeFileSync(join(pkgDir, "code.fsm.ts"), FSM);
+  const from = join(pkgDir, "code.registry.js");
+  writeFileSync(from, "export default {};\n");
+
+  const artifacts = await resolveArtifacts({ id: "code", from });
+  assert.match(artifacts.source ?? "", /code source/);
+  assert.match(artifacts.gears ?? "", /code gears/);
+  assert.match(artifacts.fsm ?? "", /createMachine/);
+  assert.deepEqual(artifacts.missing, []);
+});
+
+test("a removed stage is named missing while others still serve", async () => {
+  const { dir, from } = compiledLayout("gone");
+  rmSync(join(dir, "gone.playbook", "gone.gears.md"));
+  const artifacts = await resolveArtifacts({ id: "gone", from });
+  assert.equal(artifacts.gears, null);
+  assert.equal(artifacts.gearsItems, undefined);
+  assert.deepEqual(artifacts.missing, ["gears"]);
+  assert.match(artifacts.source ?? "", /gone workflow/);
+  assert.match(artifacts.fsm ?? "", /createMachine/);
+});
+
+test("an unresolvable registry yields all stages missing", async () => {
+  const artifacts = await resolveArtifacts({
+    id: "nope",
+    from: "@sublang/definitely-not-a-package/registry",
+  });
+  assert.deepEqual(artifacts.missing, ["source", "gears", "fsm"]);
+  assert.equal(artifacts.stateIds, null);
+});
+
+test("served source and gears drop leading comment headers", async () => {
+  const { dir, from } = compiledLayout("demo");
+  writeFileSync(
+    join(dir, "demo.md"),
+    "<!-- SPDX-License-Identifier: Apache-2.0 -->\n<!-- Vendored from elsewhere\n     for provenance -->\n\n# demo workflow\n\n<!-- an inline note stays --> body\n",
+  );
+  const artifacts = await resolveArtifacts({ id: "demo", from });
+  assert.ok((artifacts.source ?? "").startsWith("# demo workflow"));
+  assert.match(artifacts.source ?? "", /an inline note stays/);
+});
+
+test("a machine load leaves no bundle behind and loads unchanged content once", async (t) => {
+  const review = await resolveArtifacts({ id: "review", from: "@sublang/playbook/review/registry" });
+  assert.ok(review.fsm, "the built-in review machine must be readable");
+  // The real machine at a path no load has read yet, so the first load
+  // below bundles it rather than answering from memory. npm gives every
+  // file it extracts one mtime, so both versions share one here.
+  const { dir, from } = compiledLayout("kept");
+  const fsmPath = join(dir, "kept.playbook", "kept.fsm.ts");
+  const extracted = new Date("1985-10-26T08:15:00Z");
+  const place = (text: string): void => {
+    writeFileSync(fsmPath, text);
+    utimesSync(fsmPath, extracted, extracted);
+  };
+  place(`// A\n${review.fsm}`);
+
+  const bundles = scratchDir("spex-bundles-");
+  const previous = process.env.TMPDIR;
+  process.env.TMPDIR = bundles;
+  t.after(() => {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+  });
+
+  const first = await resolveArtifacts({ id: "kept", from });
+  assert.ok(first.machine, "the machine graph must be served");
+  assert.ok((first.machine?.edges.length ?? 0) > 0);
+  assert.deepEqual(readdirSync(bundles), [], "the bundle is removed once imported");
+
+  const second = await resolveArtifacts({ id: "kept", from });
+  assert.equal(second.machine, first.machine, "unchanged content is served from memory");
+  assert.equal(second.stateIds, first.stateIds);
+  assert.deepEqual(readdirSync(bundles), []);
+
+  // The shared result refuses a change rather than taking it for every
+  // later reader.
+  const machine = first.machine;
+  assert.throws(() => first.stateIds?.push("extra"), TypeError);
+  assert.throws(() => machine.nodes.push(machine.nodes[0]), TypeError);
+  assert.throws(() => machine.nodes[0].tags.push("extra"), TypeError);
+  assert.throws(() => { machine.edges[0].to = "elsewhere"; }, TypeError);
+  assert.throws(() => { machine.initial = "elsewhere"; }, TypeError);
+
+  // Other content of the same size and mtime is loaded afresh.
+  place(`// B\n${review.fsm}`);
+  const third = await resolveArtifacts({ id: "kept", from });
+  assert.notEqual(third.machine, first.machine, "changed content is loaded again");
+  assert.deepEqual(third.machine, first.machine);
+  assert.deepEqual(readdirSync(bundles), []);
+});
+
+test("a machine importing a sibling module reads the sibling's change", async () => {
+  const { dir, from } = compiledLayout("split");
+  const artifactDir = join(dir, "split.playbook");
+  writeFileSync(
+    join(artifactDir, "split.fsm.ts"),
+    [
+      'import { setup } from "xstate";',
+      'import { states } from "./states.ts";',
+      'export const splitMachine = setup({}).createMachine({ id: "split", initial: "ready", states });',
+      "",
+    ].join("\n"),
+  );
+  const place = (names: string[]): void => {
+    const states = Object.fromEntries([
+      ...names.map((name) => [name, {}]),
+      ["done", { type: "final" }],
+    ]);
+    writeFileSync(join(artifactDir, "states.ts"), `export const states = ${JSON.stringify(states)};\n`);
+  };
+
+  place(["ready"]);
+  assert.deepEqual((await resolveArtifacts({ id: "split", from })).stateIds, ["ready", "done"]);
+  // The entry file is unchanged; only the module it imports moved on.
+  place(["ready", "work"]);
+  assert.deepEqual((await resolveArtifacts({ id: "split", from })).stateIds, ["ready", "work", "done"]);
+});
+
+test("a failed machine load is retried with the same content", async () => {
+  // The entry names a package that is not installed yet: the same bytes
+  // fail to bundle at first and load once the package arrives.
+  const { dir, from } = compiledLayout("late");
+  writeFileSync(
+    join(dir, "late.playbook", "late.fsm.ts"),
+    [
+      'import { setup } from "xstate";',
+      'import { states } from "spex-late-states";',
+      'export const lateMachine = setup({}).createMachine({ id: "late", initial: "ready", states });',
+      "",
+    ].join("\n"),
+  );
+
+  const first = await resolveArtifacts({ id: "late", from });
+  assert.equal(first.stateIds, null, "an unresolved import fails the load");
+  assert.equal(first.machine, null);
+
+  const pkg = join(dir, "node_modules", "spex-late-states");
+  mkdirSync(pkg, { recursive: true });
+  writeFileSync(
+    join(pkg, "package.json"),
+    JSON.stringify({ name: "spex-late-states", type: "module", main: "index.js" }),
+  );
+  const states = { ready: {}, done: { type: "final" } };
+  writeFileSync(join(pkg, "index.js"), `export const states = ${JSON.stringify(states)};\n`);
+
+  const second = await resolveArtifacts({ id: "late", from });
+  assert.deepEqual(second.stateIds, ["ready", "done"], "the failed load is not kept");
+  assert.equal(second.machine?.initial, "ready");
+});
+
+test("playbook-library-37: every built-in serves a whole machine graph", async () => {
+  // The review machine targets its states by their declared ids, and
+  // the extractor used to read those as machine-id-prefixed paths —
+  // so every one of its edges resolved to nothing and the card drew
+  // states with no transitions at all.
+  const builtins = {
+    code: "@sublang/playbook/code/registry",
+    review: "@sublang/playbook/review/registry",
+    decide: "@sublang/playbook/decide/registry",
+    inspect: "@sublang/playbook/inspect/registry",
+  };
+
+  for (const [id, from] of Object.entries(builtins)) {
+    const artifacts = await resolveArtifacts({ id, from });
+    const machine = artifacts.machine;
+    assert.ok(machine, `${id} must serve a machine graph`);
+    assert.ok(machine.edges.length > 0, `${id} must serve edges`);
+    const known = new Set(machine.nodes.map((node) => node.id));
+    for (const edge of machine.edges) {
+      assert.ok(known.has(edge.from), `${id}: edge from ${edge.from} is a node`);
+      assert.ok(known.has(edge.to), `${id}: edge to ${edge.to} is a node`);
+    }
+  }
+
+  // Declared-id targets resolve: review opens into its first review
+  // state and resumes from a parked boss reply.
+  const review = (await resolveArtifacts({ id: "review", from: builtins.review }))
+    .machine;
+  assert.ok(
+    review?.edges.some(
+      (edge) => edge.from === "ready" && edge.to === "firstReview",
+    ),
+    "review's opening transition must resolve",
+  );
+  assert.ok(
+    review?.edges.some(
+      (edge) => edge.from === "awaitBossReply" && edge.event === "BOSS_REPLY",
+    ),
+    "review's boss-reply resume must resolve",
+  );
+
+  // A compound state's own done transition is the join out of its
+  // regions — a real edge, previously dropped entirely.
+  const decide = (await resolveArtifacts({ id: "decide", from: builtins.decide }))
+    .machine;
+  assert.ok(
+    decide?.edges.some(
+      (edge) => edge.event === "done" && edge.from === "independentProposals",
+    ),
+    "decide's parallel join must appear as an edge",
+  );
+});
+
+test("playbook-library-44: every built-in serves its gears as items", async () => {
+  // The shipped gears files carry ALLCAPS ids under role sections —
+  // the shape the outline's rows must draw without a fixture's help.
+  const builtins = {
+    code: "@sublang/playbook/code/registry",
+    review: "@sublang/playbook/review/registry",
+    decide: "@sublang/playbook/decide/registry",
+    inspect: "@sublang/playbook/inspect/registry",
+  };
+
+  for (const [id, from] of Object.entries(builtins)) {
+    const artifacts = await resolveArtifacts({ id, from });
+    const gears = artifacts.gearsItems;
+    assert.ok(gears, `${id} must serve parsed gears items`);
+    assert.ok(gears.items.length > 0, `${id} must serve at least one item`);
+    for (const item of gears.items) {
+      assert.match(item.id, /^[A-Za-z][A-Za-z0-9-]*-\d+$/, `${id}: item id`);
+      assert.ok(item.firstLine.length > 0, `${id}: ${item.id} has a first line`);
+      assert.ok(item.text.length > 0, `${id}: ${item.id} has a body`);
+    }
+    // Document order, and the markdown the rows fall back to stays.
+    assert.match(artifacts.gears ?? "", new RegExp(gears.items[0].id));
+  }
+});

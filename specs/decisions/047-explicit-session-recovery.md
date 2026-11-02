@@ -1,0 +1,31 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai> -->
+
+# DR-047: Explicit Session Recovery
+
+## Status
+
+Accepted (2026-09-05).
+Amends [DR-045](045-unified-session-storage.md) with desktop access to uncertain-turn recovery.
+Extended by [DR-060](060-failed-workflow-control.md) to the workflow parked in its recoverable failure state, a condition that never stands with uncertainty; the uncertain-turn decision below is unchanged.
+Amended by [DR-088](088-playbook-17-slc-0-12-cligent-0-27-adoption.md) in its two controls: Restore replaces Retry, restoring the saved position and reporting what was recorded without repeating it, and Discard is offered only where Playbook's discard predicate holds.
+Amended by [DR-134](134-execution-ownership.md) in "regardless of their originating host": Restore and Discard are offered on the assigned runtime alone.
+
+## Context
+
+Playbook already offers explicit CLI recovery for interrupted turns.
+Shared storage must make the same recovery available in desktop without making normal submission retry uncertain work.
+
+## Decision
+
+- Expose Retry and Discard for uncertain sessions, regardless of their originating host.
+- Retry uses the recorded input and attempted configuration after Playbook's reconciliation; it accepts no replacement input.
+- Discard restores the preceding settled checkpoint only if the effect ledger has not advanced; a never-settled fresh session may be removed under that same rule.
+- Both operations use Playbook's exclusive session lease and recovery lifecycle. Discard loads no agents or configuration.
+- Show the saved input and action consequences before confirmation; preserve history and the refusal reason when recovery is unsafe.
+- Block normal submissions and queued sends until uncertainty is resolved.
+
+## Consequences
+
+Desktop and CLI share recovery decisions and effect evidence.
+Discard cannot undo external work, and Retry is not permission to repeat effects.

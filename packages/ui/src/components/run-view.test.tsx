@@ -1,0 +1,4470 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// RUN-19/21 component coverage: the run view rendered from the
+// fixture stream shows the expected panes.
+
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen,
+  within, waitFor,
+} from "@testing-library/react";
+
+afterEach(cleanup);
+
+import { RunView } from "./RunView.js";
+import { PlayerPane, toolLabel, unwrapShell } from "./PlayerPane.js";
+import { applyRecords, initialSessionView } from "../state/reducer.js";
+import type { SessionView } from "../state/reducer.js";
+import {
+  deliverServerMessageForTests,
+  setClientForTests,
+  useAppStore,
+} from "../state/store.js";
+import type {
+  DerivedIntent,
+  IntentInfo,
+  LedgerState,
+} from "@sublang/spex-core/protocol";
+import {
+  FULL_RUN,
+  INITIAL_VISIBLE,
+  PLAYERS,
+  CALLED_LANES, TURN_ONE, TURN_ONE_REVIEWED,
+  TURN_TWO_QUESTION,
+} from "../fixtures/sample-run.js";
+import type {
+  PlaybookSummary,
+  SessionInfo,
+  TmuxPlayRecord,
+} from "@sublang/spex-core/protocol";
+import {
+  MACHINE_ANSWERED,
+  MACHINE_ASKED,
+  MACHINE_FAILED,
+  MACHINE_INTERRUPTED,
+  MACHINE_ORPHAN,
+  MACHINE_RECOVERED,
+  MACHINE_RUN,
+  MACHINE_STOPPED,
+  PARKED_FAILURE,
+  machineRestored,
+  type FixtureEntry,
+} from "../fixtures/sample-run.js";
+import codeGraph from "../fixtures/machines/code.json";
+import reviewGraph from "../fixtures/machines/review.json";
+import type { MachineGraph } from "@sublang/spex-core/protocol";
+import { activateLanguage, currentLocale } from "../i18n.js";
+
+const SESSION: SessionInfo = {
+  id: "s1",
+  projectId: "p1",
+  projectPath: "/tmp/demo",
+  createdAt: 0,
+  live: true,
+  endedAt: null,
+  players: PLAYERS,
+  initialVisible: INITIAL_VISIBLE,
+  turns: 0,
+  failed: false,
+};
+
+const restoreResizeObserver: (() => void)[] = [];
+afterEach(() => {
+  while (restoreResizeObserver.length) restoreResizeObserver.pop()!();
+});
+
+/** A stand-in for the browser's ResizeObserver: a simulated document
+ * has none, so the boxes that watch their own size are driven by
+ * hand. */
+function observeResizes(): { fire(target: Element): void } {
+  interface Watcher {
+    target: Element;
+    fire(): void;
+  }
+  const watchers = new Set<Watcher>();
+  const previous = Reflect.get(globalThis, "ResizeObserver");
+  class Stub {
+    private readonly mine = new Set<Watcher>();
+    constructor(private readonly callback: ResizeObserverCallback) {}
+    observe(target: Element): void {
+      const watcher: Watcher = {
+        target,
+        fire: () => this.callback([], this as unknown as ResizeObserver),
+      };
+      this.mine.add(watcher);
+      watchers.add(watcher);
+    }
+    unobserve(): void {}
+    disconnect(): void {
+      for (const watcher of this.mine) watchers.delete(watcher);
+      this.mine.clear();
+    }
+  }
+  Reflect.set(globalThis, "ResizeObserver", Stub);
+  restoreResizeObserver.push(() => {
+    if (previous === undefined) Reflect.deleteProperty(globalThis, "ResizeObserver");
+    else Reflect.set(globalThis, "ResizeObserver", previous);
+  });
+  return {
+    fire(target: Element): void {
+      for (const watcher of [...watchers]) {
+        if (watcher.target === target) watcher.fire();
+      }
+    },
+  };
+}
+
+/** A system line's words, glyph and all (run-view-1): the glyph sits
+ * in its own icon slot, so the line is found by its whole text. */
+function systemLine(text: string | RegExp): HTMLElement | null {
+  return (
+    screen.queryAllByTestId("system-line").find((el) =>
+      typeof text === "string"
+        ? el.textContent === text
+        : text.test(el.textContent ?? ""),
+    ) ?? null
+  );
+}
+
+function renderRun(
+  entries: typeof FULL_RUN,
+  storedGraphs = false,
+  session: SessionInfo = SESSION,
+) {
+  if (storedGraphs) entries = [{seq:1, record:{type:"session_context", timestamp:0, contextVersion:1, graphs:[{playbookId:"code",graph:codeGraph},{playbookId:"review",graph:reviewGraph}]} as unknown as TmuxPlayRecord},
+    ...entries.map((entry) => ({...entry, seq:entry.seq + 1, record:{...entry.record, contextSeq:1}}))];
+  const view = applyRecords(
+    initialSessionView(PLAYERS),
+    entries,
+  );
+  return render(
+    <RunView
+      session={session}
+      view={view}
+      composer={{ queued: [] }}
+      connected
+      onSubmit={async () => {}}
+      onAbort={() => {}}
+      onRemoveQueued={() => {}}
+      onDismissError={() => {}}
+    />,
+  );
+}
+
+describe("run-view-14: opaque records in the protocol stream", () => {
+  test("advances past opaque entries without changing the turn or dispatching its queue", () => {
+    const previous = useAppStore.getState();
+    const command = vi.fn(async () => ({}));
+    setClientForTests({ command } as never);
+    useAppStore.setState({
+      sessions: [SESSION],
+      activeSessionId: SESSION.id,
+      views: { s1: initialSessionView(PLAYERS) },
+      composers: { s1: { queued: [{ text: "Queued follow-up" }] } },
+      collapsedLanes: { s1: ["dev.reviewer"] },
+      specTrees: {},
+      ledger: undefined,
+      stagedIntents: {},
+    });
+
+    function ConnectedRun() {
+      const view = useAppStore((state) => state.views.s1);
+      const composer = useAppStore((state) => state.composers.s1);
+      return (
+        <RunView
+          session={SESSION}
+          view={view}
+          composer={composer}
+          connected
+          onSubmit={async () => {}}
+          onAbort={() => {}}
+          onRemoveQueued={() => {}}
+          onDismissError={() => {}}
+        />
+      );
+    }
+
+    let seq = 0;
+    function deliver(record: Record<string, unknown>): void {
+      act(() => {
+        deliverServerMessageForTests({
+          type: "record",
+          channel: "session",
+          sessionId: SESSION.id,
+          seq: ++seq,
+          record: record as unknown as TmuxPlayRecord,
+        });
+      });
+    }
+
+    const rendered = render(<ConnectedRun />);
+    try {
+      deliver({
+        type: "turn_started", turnId: 1, timestamp: 1,
+        turn: { id: 1, prompt: "Original task", timestamp: 1 },
+      });
+      for (const record of [
+        { opaque: { preserved: true } },
+        { timestamp: 2 },
+        { type: "turn_started" },
+        { type: "player_event", playerId: "dev.reviewer" },
+        { type: "player_prompt", playerId: "dev.reviewer", prompt: "Invisible" },
+        { type: "turn_finished", turnId: 1 },
+        { type: "turn_aborted", turnId: 1 },
+        { type: "future_record", timestamp: 3 },
+      ]) deliver(record);
+
+      expect(useAppStore.getState().views.s1).toEqual({
+        ...initialSessionView(PLAYERS),
+        captain: [{ kind: "boss", text: "Original task", turnId: 1, at: 1 }],
+        currentTurnId: 1,
+        turnActive: true,
+        lastSeq: seq,
+      });
+      expect(useAppStore.getState().collapsedLanes.s1).toEqual(["dev.reviewer"]);
+      // An opaque player record is no call record: it opens no lane
+      // (run-view-7).
+      expect(screen.queryByTestId("player-pane-dev.reviewer")).toBeNull();
+      expect(useAppStore.getState().composers.s1.queued).toEqual([
+        { text: "Queued follow-up" },
+      ]);
+      expect(command).not.toHaveBeenCalled();
+      expect(screen.getByTestId("boss-bubble").textContent).toContain("Original task");
+      expect(screen.queryByText("Invisible")).toBeNull();
+
+      deliver({ type: "captain_reply", turnId: 1, timestamp: 4, text: "A valid later reply" });
+      expect(screen.getByText("A valid later reply")).toBeTruthy();
+      expect(useAppStore.getState().views.s1.lastSeq).toBe(seq);
+      expect(command).not.toHaveBeenCalled();
+
+      deliver({ type: "turn_finished", turnId: 1, timestamp: 5 });
+      expect(useAppStore.getState().views.s1.turnActive).toBe(false);
+      expect(useAppStore.getState().views.s1.lastSeq).toBe(seq);
+      expect(useAppStore.getState().composers.s1.queued).toEqual([]);
+      // The marker is the workspace's standing condition now, not the
+      // record handler's event (run-view-134): a turn finishing sends
+      // nothing on its own.
+      expect(command.mock.calls).toEqual([
+        ["turn.submit", { sessionId: "s1", text: "Queued follow-up" }],
+      ]);
+    } finally {
+      rendered.unmount();
+      useAppStore.setState(previous);
+      setClientForTests(undefined);
+    }
+  });
+});
+
+describe("RUN-30: boss messages echo as user bubbles", () => {
+  // run-view-41: every message bubble wears its clock time at its
+  // outer foot, the exact moment in the tooltip; narration lines keep
+  // the moment in the tooltip alone.
+  test("every message bubble carries a quiet clock stamp", () => {
+    renderRun([...TURN_ONE, ...TURN_TWO_QUESTION]);
+    const stamps = screen.getAllByTestId("message-time");
+    const bubbles = [
+      ...screen.getAllByTestId("boss-bubble"),
+      ...screen.getAllByTestId("question-bubble"),
+    ];
+    expect(stamps.length).toBeGreaterThanOrEqual(bubbles.length);
+    for (const stamp of stamps) {
+      const at = Date.parse(stamp.getAttribute("dateTime") ?? "");
+      expect(Number.isFinite(at)).toBe(true);
+      expect(stamp.textContent).toBe(
+        new Date(at).toLocaleTimeString(currentLocale(), { hour: "numeric", minute: "2-digit" }),
+      );
+      expect(stamp.title).toBe(new Date(at).toLocaleString(currentLocale()));
+    }
+    // A Boss bubble's stamp stands on its outer side — before the
+    // bubble in a right-aligned row; a counterpart's stands after.
+    const boss = screen.getAllByTestId("boss-bubble")[0];
+    expect(boss.previousElementSibling?.getAttribute("data-testid")).toBe("message-time");
+    const question = screen.getByTestId("question-bubble");
+    expect(question.nextElementSibling?.getAttribute("data-testid")).toBe("message-time");
+    for (const line of screen.getAllByTestId("system-line")) {
+      expect(within(line).queryByTestId("message-time")).toBeNull();
+      expect(line.title).toBeTruthy();
+    }
+  });
+});
+
+describe("RUN-19: pane structure from the fixture stream", () => {
+  test("captain pane and both player panes render with content", () => {
+    renderRun(TURN_ONE);
+    expect(screen.getByTestId("captain-pane")).toBeTruthy();
+    expect(screen.getByTestId("player-pane-dev.coder")).toBeTruthy();
+    // A bound player no call has reached takes no place (run-view-7).
+    expect(screen.queryByTestId("player-pane-dev.reviewer")).toBeNull();
+    // A status line is a left-aligned system line at the small step,
+    // its glyph in an icon slot — never centered mono (run-view-1).
+    const started = systemLine("◇ /code started");
+    expect(started).toBeTruthy();
+    expect(started!.className).toContain("text-xs");
+    expect(started!.className).not.toContain("text-center");
+    expect(started!.className).not.toContain("font-mono");
+    expect(started!.firstElementChild?.textContent).toBe("◇");
+    // Markdown rendered: **auth** becomes a <strong>.
+    expect(screen.getByText("auth").tagName).toBe("STRONG");
+    // A collapsed tool card says the tool and what it acts on; an
+    // input naming nothing recognizable stays the name alone.
+    expect(screen.getByText("Edit", { exact: false })).toBeTruthy();
+    expect(screen.getByTestId("tool-subject-7").textContent).toBe("src/auth.ts");
+    const todo = screen.getByText("TodoWrite").closest("summary");
+    expect(todo?.querySelector('[data-testid^="tool-subject-"]')).toBeNull();
+    // The body prints each string field verbatim and only the rest as
+    // JSON; a span reads in the app's one duration vocabulary, never
+    // raw milliseconds (run-view-4).
+    const body = screen.getByTestId("tool-body-7");
+    const blocks = [...body.querySelectorAll("pre")];
+    expect(blocks.map((pre) => pre.getAttribute("data-kind"))).toEqual([
+      "text",
+      "text",
+      "text",
+      "text",
+    ]);
+    expect(blocks[0].textContent).toBe("src/auth.ts");
+    expect(blocks[3].textContent).toBe("ok");
+    expect(body.textContent).toContain("old_string");
+    expect(body.textContent).not.toContain('"src/auth.ts"');
+    expect([
+      screen.getByTestId("tool-duration-7").textContent?.trim(),
+      screen.getByTestId("tool-duration-9").textContent?.trim(),
+      screen.getByTestId("tool-duration-11").textContent?.trim(),
+      screen.getByTestId("tool-duration-13").textContent?.trim(),
+    ]).toEqual(["· <1s", "· 12s", "· 3m 12s", "· 2h 5m"]);
+    const todoBody = screen.getByTestId("tool-body-9");
+    expect(todoBody.querySelector("pre")!.getAttribute("data-kind")).toBe("json");
+    expect(todoBody.textContent).toContain('"content": "ship it"');
+    // A call the core resolved no role for names the lane alone
+    // (run-view-7).
+    expect(screen.getByTestId("player-name-dev.coder").textContent).toBe(
+      "coder",
+    );
+    // Only what the shell can open wears a link's affordance.
+    expect(screen.getByText("the SDK docs").tagName).toBe("A");
+    expect(screen.getByText("auth.md").tagName).toBe("SPAN");
+    expect(screen.getByText("auth.md").title).toBe(
+      "specs/packages/auth.md#auth-3",
+    );
+    // The turn's usage is its token totals alone: the fixture records
+    // a provider-reported cost, and no pane shows a currency sign or
+    // an estimate mark (run-view-6, DR-044).
+    const coder = screen.getByTestId("player-pane-dev.coder").textContent ?? "";
+    expect(coder).toContain("120→30 token");
+    expect(coder).not.toMatch(/[$≈]/);
+    expect(document.body.textContent).not.toMatch(/[$≈]/);
+  });
+
+  test("a narrowing visibility record takes no pane away", () => {
+    // What a nested call does when it returns: the runtime reports
+    // only the players it still engages. A lane a call reached stays
+    // the session's, so both panes stand (run-view-7).
+    renderRun([
+      ...TURN_ONE,
+      ...TURN_TWO_QUESTION,
+      {
+        seq: 99,
+        record: {
+          type: "player_view_changed",
+          turnId: 1,
+          timestamp: Date.now(),
+          visiblePlayerIds: ["dev.coder"],
+        },
+      } as (typeof TURN_ONE)[number],
+    ]);
+    expect(screen.getByTestId("player-pane-dev.coder")).toBeTruthy();
+    expect(screen.getByTestId("player-pane-dev.reviewer")).toBeTruthy();
+  });
+
+  test("a lane appears with its player's first call record, in that order", () => {
+    // The reviewer is called first here: the panes follow the records,
+    // not the roster, and a later call by the coder reorders nothing
+    // (run-view-7, DR-146).
+    renderRun([...TURN_TWO_QUESTION, ...TURN_ONE]);
+    const panes = [...document.querySelectorAll('[data-testid^="player-pane-"]')]
+      .map((pane) => pane.getAttribute("data-testid"));
+    expect(panes).toEqual(["player-pane-dev.reviewer", "player-pane-dev.coder"]);
+    expect(document.body.textContent).not.toContain("Idle until");
+  });
+
+  test("a call that records only its failure keeps its lane with the failure", () => {
+    // The first and only record of the call is its failed finish: the
+    // lane appears and shows it (run-view-7, run-view-127).
+    renderRun([{
+      seq: 1,
+      record: {
+        type: "player_finished",
+        turnId: 1,
+        timestamp: Date.now(),
+        playerId: "dev.reviewer",
+        result: { status: "error", playerId: "dev.reviewer", turnId: 1, error: "adapter refused" },
+      },
+    } as (typeof TURN_ONE)[number]]);
+    expect(screen.getByTestId("player-pane-dev.reviewer").textContent).toContain("adapter refused");
+    expect(screen.queryByTestId("player-pane-dev.coder")).toBeNull();
+  });
+
+  test("a lane that appears with only its failure is brought into view", () => {
+    // The reviewer's lane arrives beyond the grid's right edge and never
+    // runs: its arrival alone moves the grid's own offset (run-view-7).
+    const failed = {
+      seq: 900,
+      record: {
+        type: "player_finished",
+        turnId: 1,
+        timestamp: Date.now(),
+        playerId: "dev.reviewer",
+        result: { status: "error", playerId: "dev.reviewer", turnId: 1, error: "adapter refused" },
+      },
+    } as (typeof TURN_ONE)[number];
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      const [left, right] = this.dataset.testid === "player-pane-dev.reviewer" ? [600, 1000]
+        : this.dataset.testid === "player-pane-dev.coder" ? [0, 400] : [0, 600];
+      return { left, right, top: 0, bottom: 400, width: right - left, height: 400, x: left, y: 0, toJSON: () => ({}) } as DOMRect;
+    };
+    try {
+      const props = {
+        session: SESSION,
+        composer: { queued: [] },
+        connected: true,
+        onSubmit: async () => {},
+        onAbort: () => {},
+        onRemoveQueued: () => {},
+        onDismissError: () => {},
+      };
+      const { rerender } = render(
+        <RunView {...props} view={applyRecords(initialSessionView(PLAYERS), TURN_ONE)} />,
+      );
+      const grid = screen.getByTestId("player-grid");
+      let scrollLeft = 0;
+      Object.defineProperty(grid, "scrollLeft", {
+        configurable: true,
+        get: () => scrollLeft,
+        set: (value: number) => { scrollLeft = value; },
+      });
+      rerender(
+        <RunView {...props} view={applyRecords(initialSessionView(PLAYERS), [...TURN_ONE, failed])} />,
+      );
+      expect(screen.getByTestId("player-pane-dev.reviewer").textContent).toContain("adapter refused");
+      expect(scrollLeft).toBe(400);
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = original;
+    }
+  });
+
+  test("a status line that is only a machine's name reads as its words", () => {
+    renderRun([...TURN_ONE, ...TURN_TWO_QUESTION]);
+    // The classified event and the accepted result read as words, the
+    // arrow kept, the name as written in the words' tooltip
+    // (run-view-1, DR-010 §2).
+    const event = systemLine("start propose");
+    expect(event).toBeTruthy();
+    expect(event!.lastElementChild!.getAttribute("title")).toBe("START_PROPOSE");
+    const result = systemLine("→ needs boss reply");
+    expect(result).toBeTruthy();
+    expect(result!.firstElementChild!.textContent).toBe("→");
+    expect(result!.lastElementChild!.getAttribute("title")).toBe("needsBossReply");
+    expect(systemLine(/START_PROPOSE|needsBossReply/)).toBeNull();
+    // A line that names no machine reads as it came, its words with no
+    // name to keep.
+    const started = systemLine("◇ /code started");
+    expect(started!.lastElementChild!.hasAttribute("title")).toBe(false);
+  });
+});
+
+describe("RUN-21: awaitBossReply as a first-class chat moment", () => {
+  test("the question renders as Captain speech", () => {
+    renderRun([...TURN_ONE, ...TURN_TWO_QUESTION]);
+    const bubble = screen.getByTestId("question-bubble");
+    expect(bubble.textContent).toContain("Captain");
+    expect(bubble.textContent).toContain(
+      "Which auth flow should I prioritize?",
+    );
+    // The runtime's status-line echo of the same question is replaced
+    // by the bubble, not duplicated.
+    expect(
+      screen.queryByText(/asks: Which auth flow/, { exact: false }),
+    ).toBeNull();
+  });
+
+  test("the banner names the player without repeating the question", () => {
+    renderRun([...TURN_ONE, ...TURN_TWO_QUESTION]);
+    const banner = screen.getByTestId("boss-reply-banner");
+    expect(banner.textContent).toContain(
+      "dev.reviewer is waiting. Answer or ask Captain to explain.",
+    );
+  });
+});
+
+const TURN_ONLY_STARTED = [
+  {
+    seq: 1,
+    record: {
+      type: "turn_started",
+      turnId: 9,
+      timestamp: 1,
+      turn: { id: 9, prompt: "go", timestamp: 1 },
+    } as unknown as TmuxPlayRecord,
+  },
+];
+
+describe("RUN-37: the thread stays alive while a turn runs", () => {
+  test("a working indicator shows when the captain is silent", () => {
+    renderRun(TURN_ONLY_STARTED);
+    expect(screen.getByTestId("working-indicator").textContent).toContain(
+      "Captain is thinking…",
+    );
+  });
+
+  test("a running player is named with the span since its call, ticking", () => {
+    // Through the coder's prompt and its first delta: the call is open,
+    // and the core resolved its role (run-view-79).
+    const promptAt = (TURN_ONE[3].record as { timestamp: number }).timestamp;
+    const entries = TURN_ONE.slice(0, 5).map((entry, index) =>
+      index === 3 ? { ...entry, role: "coder" } : entry,
+    );
+    vi.useFakeTimers();
+    vi.setSystemTime(promptAt + 133_000);
+    try {
+      renderRun(entries);
+      const indicator = screen.getByTestId("working-indicator");
+      expect(indicator.textContent).toContain("coder running · 2m 13s");
+      // The running lane's header names the role beside the lane and
+      // says the same span, beside its mark (run-view-7).
+      // The role is the name again, so it reads once (run-view-177).
+      expect(screen.getByTestId("player-name-dev.coder").textContent).toBe(
+        "coder",
+      );
+      expect(screen.getByTestId("player-working").textContent).toBe(
+        "coder running · 2m 13s",
+      );
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+      expect(indicator.textContent).toContain("coder running · 2m 14s");
+      expect(screen.getByTestId("player-working").textContent).toBe(
+        "coder running · 2m 14s",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("run-view-143/144: cumulative active time stays with its agent", () => {
+  const configState = {
+    status: "valid" as const,
+    summary: {
+      path: "/tmp/playbook.config.yaml",
+      captain: { adapter: "claude" as const, model: "captain-default" },
+      players: PLAYERS.map((player) => ({
+        id: player.id,
+        agent: { adapter: player.adapter },
+        display: player.adapter,
+        boundBy: [],
+      })),
+      playbooks: [],
+    },
+    seeded: false,
+  };
+  let previousConfigState: ReturnType<typeof useAppStore.getState>["configState"];
+  let previousCollapsedLanes: ReturnType<typeof useAppStore.getState>["collapsedLanes"];
+
+  beforeEach(() => {
+    previousConfigState = useAppStore.getState().configState;
+    previousCollapsedLanes = useAppStore.getState().collapsedLanes;
+    useAppStore.setState({ configState, collapsedLanes: {} });
+  });
+
+  afterEach(() => {
+    useAppStore.setState({
+      configState: previousConfigState,
+      collapsedLanes: previousCollapsedLanes,
+    });
+  });
+
+  const timedSession = (agentActiveMs: Record<string, number>): SessionInfo => ({
+    ...SESSION,
+    live: false,
+    endedAt: 1_700_000_000_012,
+    agentActiveMs,
+    agentSettings: {
+      captain: { model: "captain-session" },
+      "dev.coder": { effort: "high" },
+      "dev.reviewer": { fastMode: true },
+    },
+  });
+  const activeDescription = (value: string) =>
+    `Completed active time this session: ${value} · parallel calls overlap`;
+
+  test("renders measured values at rest, silence when absent, and keeps a folded lane qualified", () => {
+    renderRun(
+      TURN_ONE,
+      false,
+      timedSession({ captain: 3_840_000, "dev.coder": 0 }),
+    );
+
+    const captain = screen.getByTestId("agent-active-captain");
+    expect(captain.textContent).toBe("active · 1h 4m");
+    expect(captain.title).toBe(activeDescription("1h 4m"));
+    expect(screen.getByTestId("agent-active-description-captain").textContent)
+      .toBe(activeDescription("1h 4m"));
+
+    const coder = screen.getByTestId("agent-active-dev.coder");
+    expect(coder.textContent).toBe("active · <1s");
+    expect(coder.title).toBe(activeDescription("<1s"));
+    expect(screen.queryByTestId("agent-active-dev.reviewer")).toBeNull();
+    expect(screen.queryByTestId("agent-active-description-dev.reviewer")).toBeNull();
+
+    // The execution receipt is beside, never inside, the setting.
+    const settings = screen.getByTestId("agent-chip-dev.coder");
+    expect(settings.textContent).not.toContain("active");
+    expect(settings.getAttribute("aria-label")).not.toContain("active");
+
+    // Per-call tokens remain on the result line exactly once; the
+    // cumulative header adds no second usage metric or money.
+    expect(screen.getAllByText("120→30 token")).toHaveLength(1);
+    const coderHeader = screen.getByTestId("player-pane-dev.coder").querySelector("header")!;
+    expect(coderHeader.textContent).not.toContain("token");
+    expect(document.body.textContent).not.toMatch(/[$≈]/);
+
+    fireEvent.click(within(screen.getByTestId("player-pane-dev.coder"))
+      .getByRole("button", { name: "Collapse coder" }));
+    const rail = screen.getByTestId("player-pane-dev.coder");
+    expect(rail.dataset.collapsed).toBe("true");
+    expect(within(rail).getByTestId("player-name-dev.coder").title)
+      .toContain(activeDescription("<1s"));
+    expect(rail.getAttribute("aria-describedby"))
+      .toBe("agent-active-description-dev.coder");
+    expect(screen.queryByTestId("agent-active-dev.coder")).toBeNull();
+    expect(screen.getByTestId("agent-active-description-dev.coder").textContent)
+      .toBe(activeDescription("<1s"));
+
+    fireEvent.click(within(rail).getByRole("button", { name: "Expand coder" }));
+    expect(screen.getByTestId("agent-active-dev.coder").textContent)
+      .toBe("active · <1s");
+  });
+
+  test("keeps Captain time fixed while the Captain thinks", () => {
+    vi.useFakeTimers();
+    try {
+      renderRun(
+        TURN_ONLY_STARTED,
+        false,
+        timedSession({ captain: 3_840_000 }),
+      );
+      expect(screen.getByTestId("working-indicator").textContent)
+        .toContain("Captain is thinking…");
+      expect(screen.getByTestId("agent-active-captain").textContent)
+        .toBe("active · 1h 4m");
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(screen.getByTestId("agent-active-captain").textContent)
+        .toBe("active · 1h 4m");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("uses summaries only and converges for either summary/finish order", () => {
+    const previous = useAppStore.getState();
+    const liveSession = (agentActiveMs: Record<string, number>): SessionInfo => ({
+      ...timedSession(agentActiveMs),
+      live: true,
+      turnActive: true,
+      endedAt: null,
+    });
+    useAppStore.setState({
+      sessions: [liveSession({ "dev.coder": 1_000 })],
+      activeSessionId: SESSION.id,
+      views: { [SESSION.id]: initialSessionView(PLAYERS) },
+      composers: { [SESSION.id]: { queued: [] } },
+      collapsedLanes: {},
+      machineGraphs: {},
+      specTrees: {},
+      ledger: undefined,
+      stagedIntents: {},
+    });
+
+    function ConnectedRun() {
+      const session = useAppStore((state) =>
+        state.sessions.find(({ id }) => id === SESSION.id),
+      )!;
+      const view = useAppStore((state) => state.views[SESSION.id]);
+      return (
+        <RunView
+          session={session}
+          view={view}
+          composer={{ queued: [] }}
+          connected
+          onSubmit={async () => {}}
+          onAbort={() => {}}
+          onRemoveQueued={() => {}}
+          onDismissError={() => {}}
+        />
+      );
+    }
+
+    let seq = 0;
+    const record = (body: Record<string, unknown>) => {
+      act(() => {
+        deliverServerMessageForTests({
+          type: "record",
+          channel: "session",
+          sessionId: SESSION.id,
+          seq: ++seq,
+          record: body as unknown as TmuxPlayRecord,
+        });
+      });
+    };
+    const summary = (agentActiveMs: Record<string, number>) => {
+      act(() => {
+        deliverServerMessageForTests({
+          type: "session.state",
+          session: liveSession(agentActiveMs),
+        });
+      });
+    };
+    const prompt = (timestamp: number, playerId = "dev.coder") => record({
+      type: "player_prompt",
+      turnId: 2,
+      timestamp,
+      playerId,
+      prompt: "continue coding",
+    });
+    const done = (
+      timestamp: number,
+      input: number,
+      output: number,
+      playerId = "dev.coder",
+    ) => record({
+      type: "player_event",
+      turnId: 2,
+      timestamp,
+      playerId,
+      event: {
+        type: "done",
+        agent: "fake",
+        timestamp,
+        sessionId: "a",
+        payload: {
+          status: "success",
+          result: "done",
+          durationMs: 999_000,
+          usage: {
+            toolUses: 0,
+            tokens: {
+              coverage: "full",
+              totals: {
+                input: { total: input },
+                output: { total: output },
+              },
+            },
+            cost: {
+              amount: 99,
+              currency: "USD",
+              source: "provider-reported",
+            },
+          },
+        },
+      },
+    });
+    const finish = (timestamp: number, playerId = "dev.coder") => record({
+      type: "player_finished",
+      turnId: 2,
+      timestamp,
+      playerId,
+      result: { status: "ok", playerId, turnId: 2, finalText: "done" },
+    });
+
+    const rendered = render(<ConnectedRun />);
+    try {
+      // No call has reached the coder yet, so its summary has no lane
+      // to read in (run-view-7).
+      expect(screen.queryByTestId("player-pane-dev.coder")).toBeNull();
+      record({
+        type: "turn_started",
+        turnId: 2,
+        timestamp: 1_700_000_000_020,
+        turn: {
+          id: 2,
+          prompt: "continue",
+          timestamp: 1_700_000_000_020,
+        },
+      });
+      prompt(1_700_000_000_021);
+      expect(screen.queryByTestId("agent-active-dev.coder")).toBeNull();
+      expect(screen.getByTestId("agent-active-description-dev.coder").textContent)
+        .toBe(activeDescription("1s"));
+
+      done(1_700_000_000_022, 120, 30);
+      expect(screen.queryByTestId("agent-active-dev.coder")).toBeNull();
+      expect(screen.getByTestId("agent-active-description-dev.coder").textContent)
+        .toBe(activeDescription("1s"));
+
+      // Summary first: cache the new resting value behind the live
+      // slot, then reveal it when the finished record arrives.
+      summary({ "dev.coder": 2_000 });
+      expect(screen.getByTestId("agent-active-description-dev.coder").textContent)
+        .toBe(activeDescription("2s"));
+      finish(1_700_000_000_023);
+      expect(screen.getByTestId("agent-active-dev.coder").textContent)
+        .toBe("active · 2s");
+      expect(screen.getAllByText("120→30 token")).toHaveLength(1);
+
+      // Finish first: restore the prior resting value until a later
+      // summary replaces it; no terminal duration is accumulated.
+      prompt(1_700_000_000_024);
+      expect(screen.queryByTestId("agent-active-dev.coder")).toBeNull();
+      done(1_700_000_000_025, 40, 10);
+      finish(1_700_000_000_026);
+      expect(screen.getByTestId("agent-active-dev.coder").textContent)
+        .toBe("active · 2s");
+      expect(screen.getAllByText("40→10 token")).toHaveLength(1);
+      summary({ "dev.coder": 3_000 });
+      expect(screen.getByTestId("agent-active-dev.coder").textContent)
+        .toBe("active · 3s");
+
+      // A terminal event for an agent with no summary entry neither
+      // invents a cumulative figure nor displaces its live reading.
+      prompt(1_700_000_000_027, "dev.reviewer");
+      done(1_700_000_000_028, 5, 1, "dev.reviewer");
+      expect(within(screen.getByTestId("player-pane-dev.reviewer"))
+        .getByTestId("player-working").textContent).toContain("running");
+      expect(screen.queryByTestId("agent-active-dev.reviewer")).toBeNull();
+      expect(screen.queryByTestId("agent-active-description-dev.reviewer")).toBeNull();
+      finish(1_700_000_000_029, "dev.reviewer");
+      expect(screen.queryByTestId("agent-active-dev.reviewer")).toBeNull();
+    } finally {
+      rendered.unmount();
+      useAppStore.setState(previous, true);
+    }
+  });
+});
+
+describe("RUN-38: queued messages read as pending, not sent", () => {
+  test("queue entries render full text with the delivery caption", () => {
+    const view = applyRecords(
+      initialSessionView(PLAYERS),
+      TURN_ONLY_STARTED,
+    );
+    render(
+      <RunView
+        session={SESSION}
+        view={view}
+        composer={{ queued: [{ text: "also update the changelog please" }] }}
+        connected
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    const queue = screen.getByTestId("queue-indicator");
+    expect(queue.textContent).toContain("also update the changelog please");
+    expect(queue.textContent).toContain("sends when this turn ends");
+  });
+
+  // run-view-106: the queue is the composer's one unbounded part, so
+  // it lives in a frame a few entries tall, kept at its end.
+  test("the queue scrolls in its own bounded frame, newest in view", () => {
+    const view = applyRecords(initialSessionView(PLAYERS), TURN_ONLY_STARTED);
+    const queued = (count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        text: `queued message ${index + 1}, long enough to wrap twice over`,
+      }));
+    const run = (count: number) => (
+      <RunView
+        session={SESSION}
+        view={view}
+        composer={{ queued: queued(count) }}
+        connected
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />
+    );
+    const { rerender } = render(run(6));
+    const queue = screen.getByTestId("queue-indicator");
+    expect(queue.className).toContain("overflow-y-auto");
+    expect(queue.className).toContain("max-h-40");
+    // Every scrolling box is a positioned box (run-view-119).
+    expect(queue.className).toContain("relative");
+
+    // A simulated document has no scrolling box of its own; the frame
+    // reports what a painted one would.
+    let top = 0;
+    Object.defineProperty(queue, "scrollTop", {
+      configurable: true,
+      get: () => top,
+      set: (next: number) => {
+        top = next;
+      },
+    });
+    Object.defineProperty(queue, "scrollHeight", {
+      configurable: true,
+      get: () => 480,
+    });
+    rerender(run(7));
+    expect(queue.scrollTop).toBe(480);
+
+    // The composer keeps its intrinsic chrome floor around the frame;
+    // a constrained Captain column contains any excess in its own scroll box.
+    const box = screen.getByTestId("composer-box").parentElement!;
+    expect(box.className).toContain("min-h-min");
+    expect(box.parentElement!.className).toContain("min-h-min");
+  });
+});
+
+describe("RUN-39: drafts come from the store", () => {
+  test("the composer renders the stored draft and reports edits", () => {
+    const view = applyRecords(
+      initialSessionView(PLAYERS),
+      TURN_ONE,
+    );
+    const onDraftChange = vi.fn();
+    render(
+      <RunView
+        session={SESSION}
+        view={view}
+        composer={{ queued: [], draft: "half-typed reply" }}
+        connected
+        onDraftChange={onDraftChange}
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    const composer = screen.getByTestId(
+      "boss-composer",
+    ) as HTMLTextAreaElement;
+    expect(composer.value).toBe("half-typed reply");
+    fireEvent.change(composer, { target: { value: "half-typed reply!" } });
+    expect(onDraftChange).toHaveBeenCalledWith("half-typed reply!");
+  });
+});
+
+describe("RUN-40: abort acknowledges instantly", () => {
+  test("clicking Abort disables it and relabels to Aborting…", () => {
+    renderRun(TURN_ONLY_STARTED);
+    const abort = screen.getByTestId("abort-button") as HTMLButtonElement;
+    fireEvent.click(abort);
+    expect(abort.disabled).toBe(true);
+    expect(abort.textContent).toContain("Aborting…");
+  });
+});
+
+describe("RUN-36: history the core cannot continue renders read-only", () => {
+  test("readOnly hides the composer and shows the history notice", () => {
+    const view = applyRecords(
+      initialSessionView(PLAYERS),
+      TURN_ONE,
+    );
+    render(
+      <RunView
+        session={{ ...SESSION, live: false, endedAt: 5 }}
+        view={view}
+        composer={{ queued: [] }}
+        connected
+        readOnly
+        onStartNew={() => {}}
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("history-notice").textContent).toContain(
+      "can't be continued",
+    );
+    expect(screen.getByTestId("session-last-active").textContent).toContain(
+      "Last active",
+    );
+    expect(screen.queryByTestId("boss-composer")).toBeNull();
+    // The control is within the label budget (DR-041), its sentence
+    // in the tooltip.
+    const fresh = screen.getByRole("button", { name: "New session" });
+    expect(fresh.title).toBe("Start a new session in this project");
+    // The notice wraps its control under its words in a narrow pane.
+    expect(screen.getByTestId("history-notice").className).toContain("flex-wrap");
+  });
+});
+
+// run-view-66: the machine call tree over a fixture replay (DR-031).
+describe("run-view-66: the machine call tree from the trace", () => {
+  test("a running child nests under its caller, which stays drawn as the only root", () => {
+    // Replay to the review's first transition: /code is delegating,
+    // /review is the running leaf.
+    renderRun(MACHINE_RUN.slice(0, 13));
+    const live = screen.getByTestId("live-machines");
+    const cards = within(live).getAllByTestId(/^machine-card-/);
+    expect(cards).toHaveLength(2);
+    expect(cards[0].getAttribute("data-playbook")).toBe("code");
+    expect(cards[1].getAttribute("data-playbook")).toBe("review");
+
+    // State names read at the name step (run-view-60, DR-010 §8).
+    const reviewing = within(cards[1]).getByTestId(
+      "machine-state-t-review-reviewing",
+    );
+    expect(reviewing.querySelector("text")!.getAttribute("font-size")).toBe("13");
+
+    // A drawing wider than its column scrolls, and the column masks
+    // its edge so the cut reads as "more this way" (run-view-81).
+    const scroller = within(live).getAllByTestId(/^machine-scroll-/)[0];
+    expect(scroller.className).toContain("overflow-x-auto");
+    expect(scroller.className).toContain("mask-image");
+
+    // The caller is the only root: it stays drawn while it delegates,
+    // its calling state in the call voice naming the callee, and the
+    // strip's sentence still names both for the accessible name.
+    expect(cards[0].getAttribute("data-expanded")).toBe("true");
+    expect(cards[0].getAttribute("aria-label")).toContain("review new intent phase");
+    expect(cards[0].getAttribute("aria-label")).toContain("/review");
+    const delegating = within(cards[0]).getByTestId(
+      "machine-state-t-code-reviewNewIntentPhase",
+    );
+    expect(delegating.getAttribute("data-delegating")).toBe("true");
+    expect(within(delegating).getByText("call /review")).toBeTruthy();
+    expect(
+      within(live).getByTestId("machine-connector-t-code"),
+    ).toBeTruthy();
+
+    // The running leaf is drawn too, and its header names the state
+    // that called it.
+    expect(cards[1].getAttribute("data-expanded")).toBe("true");
+    expect(cards[1].getAttribute("data-caller-state")).toBe("reviewNewIntentPhase");
+    expect(reviewing.getAttribute("data-active")).toBe("true");
+
+    // The running mark is the app's one pulse, and it says so.
+    const mark = within(cards[1]).getByTestId("machine-running-t-review");
+    expect(mark.getAttribute("data-running")).toBe("true");
+    expect(mark.className).toContain("motion-safe:animate-pulse");
+
+    // The card absorbs the run's progress while ◇ engagement lines
+    // stay — including the bare event ids the runtime narrates with
+    // no glyph, which used to reach the reader as raw jargon.
+    expect(systemLine("◇ /code started")).toBeTruthy();
+    expect(systemLine(/⤷ Coder: implement/)).toBeNull();
+    expect(systemLine(/^(?:START_CODE|start code)$/)).toBeNull();
+    expect(systemLine(/^→ ?(?:directCommit|direct commit)$/)).toBeNull();
+  });
+
+  test("collapsing the caller is arrangement, and the child stays drawn", () => {
+    renderRun(MACHINE_RUN.slice(0, 13));
+    const before = screen
+      .getAllByTestId(/^machine-card-/)
+      .map((card) => card.getAttribute("data-playbook"));
+
+    fireEvent.click(screen.getByTestId("machine-disclose-t-code"));
+
+    const cards = screen.getAllByTestId(/^machine-card-/);
+    // The strip names the calling state and the callee, and the
+    // connector still leaves it — containment survives the fold.
+    expect(cards[0].getAttribute("data-expanded")).toBe("false");
+    expect(cards[0].getAttribute("aria-label")).toContain("review new intent phase");
+    expect(screen.getByTestId("machine-connector-t-code")).toBeTruthy();
+    // The child is untouched: the same tree, differently disclosed.
+    expect(cards.map((card) => card.getAttribute("data-playbook"))).toEqual(
+      before,
+    );
+    expect(cards[1].getAttribute("data-expanded")).toBe("true");
+  });
+
+  test("one card per run: the reports that trail a finish revive none", () => {
+    renderRun(MACHINE_RUN);
+    // Nothing left running, and the root settled into the thread with
+    // its child settled inside it — not two loose cards.
+    expect(screen.queryByTestId("live-machines")).toBeNull();
+    const settled = screen.getAllByTestId(/^machine-card-/);
+    expect(settled).toHaveLength(2);
+    expect(settled[0].getAttribute("data-playbook")).toBe("code");
+    expect(settled[1].getAttribute("data-playbook")).toBe("review");
+    for (const card of settled) {
+      expect(card.getAttribute("data-settled")).toBe("true");
+    }
+    // The status, settlement and disposal that follow a finished run
+    // used to raise a blank second card labelled "stopped".
+    expect(screen.getByTestId("machine-outcome-t-code").textContent).toBe(
+      "done",
+    );
+    expect(screen.getByTestId("machine-outcome-t-review").textContent).toBe(
+      "done",
+    );
+    // The settled child stays anchored to the state that called it.
+    expect(settled[1].getAttribute("data-caller-state")).toBe(
+      "reviewNewIntentPhase",
+    );
+  });
+
+  test("a settled strip expands to its final drawing", () => {
+    renderRun(MACHINE_RUN);
+    const card = screen.getByTestId("machine-card-t-code");
+    expect(card.getAttribute("data-expanded")).toBe("false");
+    fireEvent.click(screen.getByTestId("machine-disclose-t-code"));
+    expect(
+      within(card).getByTestId("machine-state-t-code-done"),
+    ).toBeTruthy();
+  });
+
+  test("a run disposed where it stands settles unfinished", () => {
+    renderRun(MACHINE_STOPPED);
+    expect(screen.getAllByTestId(/^machine-card-/)).toHaveLength(1);
+    expect(screen.getByTestId("machine-outcome-t-halt").textContent).toBe(
+      "aborted",
+    );
+  });
+
+  test("a child whose caller is unknown draws at the top level", () => {
+    renderRun(MACHINE_ORPHAN);
+    const live = screen.getByTestId("live-machines");
+    const cards = within(live).getAllByTestId(/^machine-card-/);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].getAttribute("data-playbook")).toBe("review");
+  });
+});
+
+
+// run-view-60/76/81: the drawing reads from a projector (DR-010 §8).
+describe("run-view-60/76/81: the card's words and its fit to the pane", () => {
+  const graphs: Record<string, MachineGraph> = {
+    code: codeGraph as MachineGraph,
+    review: reviewGraph as MachineGraph,
+  };
+  beforeEach(() => {
+    useAppStore.setState({ machineGraphs: graphs });
+  });
+  afterEach(() => {
+    useAppStore.setState({ machineGraphs: {} });
+  });
+
+  test("boxes take their column's longest label; a long caption falls back to its role", () => {
+    renderRun(MACHINE_RUN.slice(0, 13), true);
+    const code = screen.getByTestId("machine-card-t-code");
+    // "review new intent phase" sets its column's width, so it reads
+    // whole at 13px and the shorter names share the box width.
+    const reported = within(code).getByTestId(
+      "machine-state-t-code-reviewNewIntentPhase",
+    );
+    expect(reported.querySelector("text")!.textContent).toBe(
+      "review new intent phase",
+    );
+    const reportedBox = reported.querySelector("rect")!;
+    const readyBox = within(code)
+      .getByTestId("machine-state-t-code-ready")
+      .querySelector("rect")!;
+    expect(Number(reportedBox.getAttribute("width"))).toBeGreaterThan(132);
+    expect(readyBox.getAttribute("width")).toBe(reportedBox.getAttribute("width"));
+    // Exit labels sit one step under the small step, never lower.
+    const exit = within(code).getAllByTestId(/^machine-exit-/)[0];
+    expect(exit.getAttribute("font-size")).toBe("11");
+  });
+
+  test("a running call names role and player at the caption step, or the role alone", () => {
+    // Through the coder's call: the code machine's first column is as
+    // wide as "review new intent phase", so the pair reads whole.
+    renderRun(MACHINE_RUN.slice(0, 8));
+    const running = screen.getByTestId("machine-state-t-code-firstPhase");
+    const caption = within(running).getByTestId(
+      "machine-caption-t-code-firstPhase",
+    );
+    // The player reads by its name (run-view-177), and a name that is
+    // the role again reads once.
+    expect(caption.textContent).toBe("coder");
+    expect(caption.getAttribute("font-size")).toBe("12");
+    cleanup();
+
+    // A pair no box can hold falls back to the role, the whole pair
+    // kept in the box's title (run-view-61).
+    const longLane = MACHINE_RUN.slice(0, 7).concat([
+      {
+        seq: 406,
+        record: {
+          type: "captain_telemetry",
+          turnId: 9,
+          timestamp: 9_004,
+          topic: "playbook.trace",
+          payload: {
+            schemaVersion: 3,
+            sessionId: "t-code",
+            playbookId: "code",
+            depth: 1,
+            type: "player.call.started",
+            timestamp: 9_004,
+            payload: {
+              stateId: "firstPhase",
+              roleId: "coder",
+              playerId: "security-compliance-reviewer-lane",
+            },
+          },
+        } as unknown as TmuxPlayRecord,
+      },
+    ]);
+    renderRun(longLane);
+    const state = screen.getByTestId("machine-state-t-code-firstPhase");
+    expect(
+      within(state).getByTestId("machine-caption-t-code-firstPhase").textContent,
+    ).toBe("coder");
+    expect(state.querySelector("title")!.textContent).toContain(
+      "coder · security-compliance-reviewer-lane",
+    );
+    expect(Number(state.querySelector("rect")!.getAttribute("width"))).toBeLessThanOrEqual(240);
+  });
+
+  test("unwalked exits into rest states fold to a count until walked or hovered", () => {
+    renderRun(MACHINE_RUN.slice(0, 13), true);
+    const code = screen.getByTestId("machine-card-t-code");
+    // firstPhase's three unwalked exits — two into failed, one
+    // into the Boss-reply wait (playbook 12.2's CODE) — fold to one
+    // "+3" marker whose title lists them, and no label.
+    const first = within(code).getByTestId("machine-state-t-code-firstPhase");
+    const folded = within(first).getByTestId(
+      "machine-exits-folded-t-code-firstPhase",
+    );
+    expect(folded.textContent).toContain("+3");
+    expect(folded.querySelector("title")!.textContent).toContain("→ failed");
+    expect(within(first).queryAllByTestId(/^machine-exit-/)).toHaveLength(0);
+    // Hovering the box reveals them all; leaving folds them again.
+    fireEvent.mouseEnter(first);
+    expect(within(first).queryAllByTestId(/^machine-exit-/)).toHaveLength(3);
+    expect(
+      within(first).queryByTestId("machine-exits-folded-t-code-firstPhase"),
+    ).toBeNull();
+    fireEvent.mouseLeave(first);
+    expect(within(first).queryAllByTestId(/^machine-exit-/)).toHaveLength(0);
+    // An exit into working state stays a label; the one into failed
+    // beside it folds to "+1".
+    const review = within(code).getByTestId(
+      "machine-state-t-code-reviewNewIntentPhase",
+    );
+    const labels = within(review).getAllByTestId(/^machine-exit-/);
+    expect(labels).toHaveLength(1);
+    expect(labels[0].textContent).toContain("→ ir task phase");
+    expect(
+      within(review).getByTestId("machine-exits-folded-t-code-reviewNewIntentPhase")
+        .textContent,
+    ).toContain("+1");
+  });
+
+  test("the split's row form is a query on its wrapper, never on itself", () => {
+    // An element cannot answer its own container query (run-view-107):
+    // the wrapper is the container, the flex box asks it.
+    renderRun(MACHINE_RUN.slice(0, 13));
+    const split = screen.getByTestId("captain-column").parentElement!;
+    expect(split.className).toContain("@2xl:flex-row");
+    expect(split.className).not.toContain("@container");
+    expect(split.parentElement!.className).toContain("@container");
+  });
+
+  test("the drawing scales into a pane it exceeds by under a quarter, else scrolls", () => {
+    renderRun(MACHINE_RUN.slice(0, 13));
+    const scroller = screen.getByTestId("machine-scroll-t-code");
+    const svg = scroller.querySelector("svg")!;
+    const natural = Number(svg.getAttribute("data-natural-width"));
+    const floor = Number(svg.getAttribute("data-scale-floor"));
+    expect(natural).toBeGreaterThan(0);
+    expect(floor).toBeCloseTo(natural / 1.25, 0);
+    // The rule rides the card as a container query: the pane's width
+    // decides between the drawing's natural width and the pane's.
+    expect(scroller.style.getPropertyValue("--fit")).toContain("100cqw");
+    expect(scroller.style.getPropertyValue("--fit")).toContain(`${floor}px`);
+    expect(scroller.className).toContain("var(--beyond");
+    expect(screen.getByTestId("machine-card-t-code").className).toContain(
+      "@container",
+    );
+    // A drawing holds nothing focusable, so the box that scrolls it
+    // takes the stop and says what it holds (run-view-50).
+    expect(scroller.getAttribute("tabindex")).toBe("0");
+    expect(scroller.getAttribute("aria-label")).toBe("code machine drawing");
+  });
+
+  // run-view-81: the fade is a fact about the box as much as about the
+  // scroll position, so a pane that narrows behind more drawing brings
+  // it back with no scroll of the reader's own.
+  test("a drawing read to its end regains its fade when the pane narrows", () => {
+    const observers = observeResizes();
+    renderRun(MACHINE_RUN.slice(0, 13));
+    const scroller = screen.getByTestId("machine-scroll-t-code");
+    const geometry = { clientWidth: 600, scrollWidth: 1400, scrollLeft: 0 };
+    for (const key of Object.keys(geometry) as (keyof typeof geometry)[]) {
+      Object.defineProperty(scroller, key, {
+        configurable: true,
+        get: () => geometry[key],
+      });
+    }
+    // Scrolled to the end, the fade retires: nothing lies beyond.
+    geometry.scrollLeft = 800;
+    fireEvent.scroll(scroller);
+    expect(scroller.style.maskImage).toBe("none");
+    // The pane narrows — no scroll event — and 220px of drawing are
+    // hidden again, so the fade returns.
+    geometry.clientWidth = 380;
+    act(() => observers.fire(scroller));
+    expect(scroller.style.maskImage).toBe("");
+  });
+
+  // run-view-142: the grid is the run's own sideways-scrolling canvas,
+  // and it scrolls itself to the lane whose call opens, so either edge
+  // can hide a pane and each says so on its own.
+  test("the player grid fades whichever edge hides a pane", () => {
+    const observers = observeResizes();
+    renderRun([...MACHINE_RUN.slice(0, 13), ...CALLED_LANES]);
+    const grid = screen.getByTestId("player-grid");
+    const geometry = { clientWidth: 544, scrollWidth: 572, scrollLeft: 0 };
+    for (const key of Object.keys(geometry) as (keyof typeof geometry)[]) {
+      Object.defineProperty(grid, key, {
+        configurable: true,
+        get: () => geometry[key],
+      });
+    }
+    const fade = () => [
+      grid.style.getPropertyValue("--fade-start"),
+      grid.style.getPropertyValue("--fade-end"),
+    ];
+    // The mask rides the box as the drawing's does, each edge's fade
+    // its own length (run-view-7).
+    expect(grid.className).toContain("var(--fade-start");
+    expect(grid.className).toContain("var(--fade-end");
+    // At the start only the far edge hides a pane.
+    fireEvent.scroll(grid);
+    expect(fade()).toEqual(["0px", "24px"]);
+    // Standing between them, both edges hide one.
+    geometry.scrollLeft = 14;
+    fireEvent.scroll(grid);
+    expect(fade()).toEqual(["24px", "24px"]);
+    // Scrolled to that end, its fade retires: nothing lies beyond it.
+    geometry.scrollLeft = 28;
+    fireEvent.scroll(grid);
+    expect(fade()).toEqual(["24px", "0px"]);
+    // The box narrows with no scroll of the reader's own, so a pane
+    // lies beyond again and that edge's fade returns.
+    geometry.clientWidth = 400;
+    act(() => observers.fire(grid));
+    expect(fade()).toEqual(["24px", "24px"]);
+  });
+});
+
+describe("run-view-81: the divider lands under the pointer", () => {
+  test("the split is read against the box the share resolves against", () => {
+    renderRun([...MACHINE_RUN.slice(0, 13), ...CALLED_LANES]);
+    const divider = screen.getByTestId("captain-divider");
+    const container = screen.getByTestId("captain-column").parentElement!;
+    // The container's padding and its gap are the offsets the share
+    // is carried by; a simulated document reports only what is set.
+    container.style.paddingLeft = "12px";
+    container.style.paddingRight = "12px";
+    container.style.columnGap = "12px";
+    container.getBoundingClientRect = () =>
+      ({
+        left: 0,
+        right: 1200,
+        width: 1200,
+        top: 0,
+        bottom: 800,
+        height: 800,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    divider.setPointerCapture = () => {};
+    divider.releasePointerCapture = () => {};
+
+    fireEvent.pointerDown(divider, { pointerId: 1, clientX: 600 });
+    fireEvent.pointerMove(divider, { pointerId: 1, clientX: 600 });
+    fireEvent.pointerUp(divider, { pointerId: 1, clientX: 600 });
+
+    const percent = parseFloat(
+      screen
+        .getByTestId("captain-column")
+        .style.getPropertyValue("--captain-split"),
+    );
+    // The rule sits at the column's trailing edge plus the gap; that
+    // place is where the pointer was, not 24px past it. The stored
+    // share is rounded, so the rule lands within a pixel of the hand.
+    const content = 1200 - 12 - 12;
+    const rule = 12 + (percent / 100) * content + 12;
+    expect(Math.abs(rule - 600)).toBeLessThanOrEqual(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Intent ledger coverage (run-view-92..96, DR-035): the composer's
+// queue-instead capture, the staged chip, the delivery card with
+// confirm-pulls-next, and attention activation landing at the
+// intent's place.
+// ---------------------------------------------------------------------------
+
+function makeIntent(over: Partial<IntentInfo> & { id: string }): IntentInfo {
+  return {
+    projectId: "p1",
+    text: "Address #7: fix the login bug\nfull context for the run",
+    createdAt: 0,
+    ...over,
+  };
+}
+
+const EMPTY_LEDGER: LedgerState = { intents: [], attention: [], badge: 0 };
+
+/** The turn-1 intent, finished and awaiting its verdict. */
+const FINISHED: DerivedIntent = {
+  intent: makeIntent({
+    id: "i1",
+    source: {
+      kind: "issue",
+      ref: "7",
+      url: "https://github.com/acme/demo/issues/7",
+    },
+    dispatched: { sessionId: "s1", turnId: 1, at: 1000 },
+  }),
+  state: "finished",
+  stats: { reviewRounds: 2, turns: 1, elapsedMs: 12 * 60_000 },
+};
+
+const QUEUED_NEXT: DerivedIntent = {
+  intent: makeIntent({ id: "i2", text: "Review PR 45: tighten the docs" }),
+  state: "queued",
+  next: { standing: "manual-ready", manualStart: true },
+};
+
+function seedLedger(ledger: LedgerState): void {
+  useAppStore.setState({ ledger });
+}
+
+function renderRunWith(
+  entries: typeof FULL_RUN,
+  over: Partial<Parameters<typeof RunView>[0]> = {},
+) {
+  const view = applyRecords(initialSessionView(PLAYERS), entries);
+  return render(
+    <RunView
+      session={SESSION}
+      view={view}
+      composer={{ queued: [] }}
+      connected
+      onSubmit={async () => {}}
+      onAbort={() => {}}
+      onRemoveQueued={() => {}}
+      onDismissError={() => {}}
+      {...over}
+    />,
+  );
+}
+
+describe("run-view-92: queue instead of send captures a chat intent", () => {
+  const command = vi.fn();
+
+  beforeEach(() => {
+    command.mockReset();
+    command.mockImplementation(async (type: string) => {
+      if (type === "intent.queue") return makeIntent({ id: "chat-1" });
+      if (type === "ledger.get") return EMPTY_LEDGER;
+      return {};
+    });
+    setClientForTests({ command } as never);
+  });
+
+  afterEach(() => {
+    useAppStore.setState({ ledger: undefined, stagedIntents: {} });
+    setClientForTests(undefined);
+  });
+
+  test("the typed text queues with chat provenance, nothing sends", async () => {
+    const onSubmit = vi.fn(async () => {});
+    renderRunWith(TURN_ONE, { onSubmit });
+    // The control's sentence rides its tooltip (run-view-85).
+    expect(screen.getByTestId("queue-intent-button").title).toBe(
+      "Add this to the project's Up next without sending it",
+    );
+
+    fireEvent.change(screen.getByTestId("boss-composer"), {
+      target: { value: "also fix the logout flow later" },
+    });
+    fireEvent.click(screen.getByTestId("queue-intent-button"));
+
+    await vi.waitFor(() =>
+      expect(command).toHaveBeenCalledWith("intent.queue", {
+        projectId: "p1",
+        text: "also fix the logout flow later",
+        source: { kind: "chat", ref: "s1" },
+      }),
+    );
+    // Shelved, not sent (run-view-85): no dispatch, no queued bubble.
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(command).not.toHaveBeenCalledWith(
+      "turn.submit",
+      expect.anything(),
+    );
+    expect(screen.queryByTestId("queue-indicator")).toBeNull();
+    // The inline acknowledgment names where the row landed.
+    await vi.waitFor(() =>
+      expect(
+        screen.getByTestId("queued-intent-note").textContent,
+      ).toContain("Up next"),
+    );
+    // The draft cleared: the text lives in the queue now.
+    expect(
+      (screen.getByTestId("boss-composer") as HTMLTextAreaElement).value,
+    ).toBe("");
+  });
+});
+
+describe("run-view-93: the staged chip governs what a send stamps", () => {
+  afterEach(() => {
+    useAppStore.setState({ ledger: undefined, stagedIntents: {} });
+    setClientForTests(undefined);
+  });
+
+  test("the composer wears the staged chip; emptying detaches it", () => {
+    useAppStore.setState({
+      stagedIntents: {
+        s1: { intentId: "i1", title: "Address #7: fix the login bug" },
+      },
+    });
+    renderRunWith(TURN_ONE);
+    const chip = screen.getByTestId("staged-intent-chip");
+    expect(chip.textContent).toContain("Address #7: fix the login bug");
+
+    const composer = screen.getByTestId("boss-composer");
+    fireEvent.change(composer, { target: { value: "extra context" } });
+    expect(screen.getByTestId("staged-intent-chip")).toBeTruthy();
+    fireEvent.change(composer, { target: { value: "" } });
+    // Emptying the composer detaches the intent (run-view-86): the
+    // chip leaves and the store drops the staging.
+    expect(useAppStore.getState().stagedIntents.s1).toBeUndefined();
+    expect(screen.queryByTestId("staged-intent-chip")).toBeNull();
+  });
+
+  test("a queued submission carries the chip on its pending bubble", () => {
+    const view = applyRecords(initialSessionView(PLAYERS), [
+      {
+        seq: 1,
+        record: {
+          type: "turn_started",
+          turnId: 9,
+          timestamp: 1,
+          turn: { id: 9, prompt: "go", timestamp: 1 },
+        },
+      } as (typeof TURN_ONE)[number],
+    ]);
+    render(
+      <RunView
+        session={SESSION}
+        view={view}
+        composer={{ queued: [{ text: "start the next one", intentId: "i1" }] }}
+        connected
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    const queue = screen.getByTestId("queue-indicator");
+    expect(within(queue).getByTestId("queued-intent-chip")).toBeTruthy();
+    expect(queue.textContent).toContain("sends when this turn ends");
+  });
+});
+
+describe("run-view-90/89: the working line and the bound turn's chip", () => {
+  afterEach(() => {
+    useAppStore.setState({ ledger: undefined, stagedIntents: {} });
+  });
+
+  test("an open dispatched intent names itself above the composer", () => {
+    seedLedger({
+      intents: [
+        {
+          intent: makeIntent({
+            id: "i1",
+            dispatched: { sessionId: "s1", turnId: 9, at: 1 },
+          }),
+          state: "working",
+        },
+      ],
+      attention: [],
+      badge: 0,
+    });
+    renderRunWith(TURN_ONLY_STARTED as typeof FULL_RUN);
+    const line = screen.getByTestId("working-line");
+    expect(line.textContent).toContain("Working:");
+    expect(line.textContent).toContain("Address #7: fix the login bug");
+    // Hover is never the only channel, but the raw text rides along.
+    expect(line.title).toContain("full context for the run");
+  });
+
+  test("the newest open intent owns the line; the bubble wears the chip", () => {
+    seedLedger({
+      intents: [
+        {
+          intent: makeIntent({
+            id: "i-old",
+            text: "the older intent",
+            dispatched: { sessionId: "s1", turnId: 1, at: 1 },
+          }),
+          state: "interrupted",
+          reason: "question",
+        },
+        {
+          intent: makeIntent({
+            id: "i-new",
+            text: "the newest intent",
+            source: { kind: "chat", ref: "s1" },
+            dispatched: { sessionId: "s1", turnId: 2, at: 2 },
+          }),
+          state: "working",
+        },
+      ],
+      attention: [],
+      badge: 0,
+    });
+    renderRunWith([...TURN_ONE, ...TURN_TWO_QUESTION]);
+    expect(screen.getByTestId("working-line").textContent).toContain(
+      "the newest intent",
+    );
+    // The bound turn's Boss bubble wears the source chip (run-view-89);
+    // an unsourced intent's bubble wears none.
+    const bubbles = screen.getAllByTestId("boss-bubble");
+    expect(within(bubbles[1]).getByTestId("intent-source-chip").textContent)
+      .toBe("chat");
+    expect(within(bubbles[0]).queryByTestId("intent-source-chip")).toBeNull();
+  });
+
+  test("Drop asks the inline confirm, closes the intent dropped, and hands focus on (run-view-113)", async () => {
+    const command = vi.fn(async (type: string) => {
+      // The fold re-derives without the dropped intent.
+      if (type === "ledger.get") return { intents: [], attention: [], badge: 0 };
+      return {};
+    });
+    setClientForTests({ command, subscribe: vi.fn(async () => {}) } as never);
+    seedLedger({
+      intents: [
+        {
+          intent: makeIntent({
+            id: "i1",
+            dispatched: { sessionId: "s1", turnId: 9, at: 1 },
+          }),
+          state: "working",
+        },
+      ],
+      attention: [],
+      badge: 0,
+    });
+    renderRunWith(TURN_ONLY_STARTED as typeof FULL_RUN);
+    const drop = screen.getByTestId("working-drop");
+    expect(drop.textContent).toBe("Drop");
+    // Work is underway: the confirm names the act, its safe default
+    // focused; Keep backs out to the control (DR-010 §4, §6).
+    fireEvent.click(drop);
+    const keep = screen.getByRole("button", { name: "Keep" });
+    expect(document.activeElement).toBe(keep);
+    expect(command).not.toHaveBeenCalledWith("intent.close", expect.anything());
+    fireEvent.click(keep);
+    expect(screen.getByTestId("working-line")).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByTestId("working-drop"));
+
+    fireEvent.click(screen.getByTestId("working-drop"));
+    fireEvent.click(screen.getByRole("button", { name: "Drop" }));
+    await vi.waitFor(() =>
+      expect(command).toHaveBeenCalledWith("intent.close", {
+        intentId: "i1",
+        as: "dropped",
+      }),
+    );
+    // The line leaves with its control. While the composer is disabled,
+    // the outcome receives focus after React runs its handoff effect.
+    await vi.waitFor(() =>
+      expect(screen.queryByTestId("working-line")).toBeNull(),
+    );
+    const note = screen.getByTestId("working-note");
+    expect(note.getAttribute("role")).toBe("status");
+    expect(note.textContent).toContain("Dropped “Address #7: fix the login bug”");
+    await vi.waitFor(() => expect(document.activeElement).toBe(note));
+    setClientForTests(undefined);
+  });
+
+  test("a refused drop keeps the line, names the refusal, and returns to the control", async () => {
+    const command = vi.fn(async (type: string) => {
+      if (type === "intent.close") throw new Error("the intent is already closed");
+      return {};
+    });
+    setClientForTests({ command, subscribe: vi.fn(async () => {}) } as never);
+    seedLedger({
+      intents: [
+        {
+          intent: makeIntent({
+            id: "i1",
+            dispatched: { sessionId: "s1", turnId: 9, at: 1 },
+          }),
+          state: "working",
+        },
+      ],
+      attention: [],
+      badge: 0,
+    });
+    renderRunWith(TURN_ONLY_STARTED as typeof FULL_RUN);
+    fireEvent.click(screen.getByTestId("working-drop"));
+    fireEvent.click(screen.getByRole("button", { name: "Drop" }));
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("working-note").textContent).toContain(
+        "Couldn't drop “Address #7: fix the login bug”: the intent is already closed",
+      ),
+    );
+    expect(screen.getByTestId("working-line")).toBeTruthy();
+    await vi.waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByTestId("working-drop")),
+    );
+    setClientForTests(undefined);
+  });
+});
+
+describe("run-view-94/87: the delivery card and confirm-pulls-next", () => {
+  const command = vi.fn();
+  let servedLedger: LedgerState;
+
+  beforeEach(() => {
+    servedLedger = { intents: [FINISHED, QUEUED_NEXT], attention: [], badge: 1 };
+    command.mockReset();
+    command.mockImplementation(async (type: string) => {
+      if (type === "ledger.get") return servedLedger;
+      if (type === "intent.queue") return makeIntent({ id: "i3" });
+      return {};
+    });
+    setClientForTests({ command, subscribe: vi.fn(async () => {}) } as never);
+    useAppStore.setState({
+      ledger: { intents: [FINISHED, QUEUED_NEXT], attention: [], badge: 1 },
+      projects: [],
+      sessions: [],
+      stagedIntents: {},
+    });
+  });
+
+  afterEach(() => {
+    useAppStore.setState({
+      ledger: undefined,
+      projects: [],
+      stagedIntents: {},
+      sessions: [],
+      homeDraft: "",
+    });
+    setClientForTests(undefined);
+  });
+
+  test("a trailing line repeating the source URL leaves the bubble", () => {
+    const url = "https://github.com/acme/demo/issues/7";
+    const withUrl = TURN_ONE.map((entry, index) =>
+      index === 0
+        ? {
+            ...entry,
+            record: {
+              ...(entry.record as unknown as Record<string, unknown>),
+              turn: { id: 1, prompt: `Address #7: fix login\n${url}` },
+            } as unknown as TmuxPlayRecord,
+          }
+        : entry,
+    );
+    renderRunWith(withUrl);
+    const bubble = screen.getByTestId("boss-bubble");
+    expect(bubble.textContent).toContain("Address #7: fix login");
+    expect(bubble.textContent).not.toContain(url);
+    expect(within(bubble).getByTestId("intent-source-chip").getAttribute("href")).toBe(url);
+  });
+
+  test("the bound bubble wears the source chip as a canonical link", () => {
+    renderRunWith(TURN_ONE);
+    const bubble = screen.getByTestId("boss-bubble");
+    const chip = within(bubble).getByTestId("intent-source-chip");
+    expect(chip.textContent).toBe("#7");
+    expect(chip.tagName).toBe("A");
+    expect(chip.getAttribute("href")).toBe(
+      "https://github.com/acme/demo/issues/7",
+    );
+    // Raw provenance lives in the tooltip (DR-010 §2).
+    expect(chip.getAttribute("title")).toContain("issue 7");
+  });
+
+  test("the card carries title, chip, stats, verdicts, and the note", () => {
+    renderRunWith(TURN_ONE);
+    const card = screen.getByTestId("delivery-card-i1");
+    expect(card.getAttribute("data-settled")).toBe("0");
+    expect(card.textContent).toContain("Address #7: fix the login bug");
+    expect(within(card).getByTestId("intent-source-chip").textContent).toBe(
+      "#7",
+    );
+    // Review rounds foremost, then turns, then elapsed (run-view-87).
+    expect(within(card).getByTestId("delivery-stats").textContent).toBe(
+      "2 review rounds · 1 turn · 12m",
+    );
+    expect(within(card).getByTestId("delivery-confirm").textContent).toBe(
+      "Confirm",
+    );
+    expect(within(card).getByTestId("delivery-drop").textContent).toBe(
+      "Drop",
+    );
+    expect(card.textContent).toContain(
+      "A follow-up message continues this intent.",
+    );
+  });
+
+  test("a later dispatch keeps the earlier Confirm without claiming its follow-ups", async () => {
+    const working: DerivedIntent = {
+      ...QUEUED_NEXT,
+      intent: {
+        ...QUEUED_NEXT.intent,
+        dispatched: { sessionId: "s1", turnId: 2, at: 2000 },
+      },
+      state: "working",
+      next: undefined,
+    };
+    seedLedger({ intents: [FINISHED, working], attention: [], badge: 1 });
+    renderRunWith([...TURN_ONE, ...TURN_TWO_QUESTION.slice(0, 2)]);
+
+    const card = screen.getByTestId("delivery-card-i1");
+    expect(card.getAttribute("data-settled")).toBe("0");
+    expect(card.textContent).not.toContain("A follow-up message continues this intent.");
+    expect(screen.getByTestId("working-line").textContent).toContain(working.intent.text);
+    const confirm = within(card).getByTestId("delivery-confirm") as HTMLButtonElement;
+    expect(confirm.disabled).toBe(false);
+
+    servedLedger = { intents: [working], attention: [], badge: 0 };
+    fireEvent.click(confirm);
+    await vi.waitFor(() => {
+      expect(command).toHaveBeenCalledWith("intent.close", { intentId: "i1", as: "done" });
+      expect(screen.getByTestId("delivery-card-i1").getAttribute("data-settled")).toBe("1");
+    });
+    expect(screen.getByTestId("working-line").textContent).toContain(working.intent.text);
+    expect(command.mock.calls.some(([type]) => type === "turn.submit")).toBe(false);
+  });
+
+  test("a verdict closes over the protocol and resolves into Up next", async () => {
+    renderRunWith(TURN_ONE);
+    // The verdict re-derives the fold without the closed intent.
+    servedLedger = { intents: [QUEUED_NEXT], attention: [], badge: 0 };
+
+    const confirm = screen.getByTestId(
+      "delivery-confirm",
+    ) as HTMLButtonElement;
+    fireEvent.click(confirm);
+    // The action acknowledges in place (DR-010): busy until it lands.
+    expect(confirm.disabled).toBe(true);
+    expect(confirm.textContent).toContain("Confirming…");
+
+    await vi.waitFor(() =>
+      expect(command).toHaveBeenCalledWith("intent.close", {
+        intentId: "i1",
+        as: "done",
+      }),
+    );
+    // The card resolves in place into the core-published next intent
+    // with the shared lifecycle mark and manual Start (run-view-87).
+    await vi.waitFor(() => {
+      const card = screen.getByTestId("delivery-card-i1");
+      expect(card.getAttribute("data-settled")).toBe("1");
+      expect(card.textContent).toContain("Review PR 45: tighten the docs");
+      expect(within(card).getByTestId("resolved-next-queued").textContent).toBe(
+        "Queued",
+      );
+      expect(within(card).queryByTestId("resolved-next-standing")).toBeNull();
+    });
+    expect(screen.getByTestId("upnext-start").getAttribute("aria-label")).toBe(
+      "Start Review PR 45: tighten the docs",
+    );
+
+    // Start stages the dispatch — no live session here, so it stages
+    // the Captain home (run-view-86).
+    fireEvent.click(screen.getByTestId("upnext-start"));
+    await vi.waitFor(() => {
+      expect(useAppStore.getState().stagedIntents.home?.intentId).toBe("i2");
+      expect(useAppStore.getState().homeDraft).toBe(
+        "Review PR 45: tighten the docs",
+      );
+    });
+  });
+
+  test("the resolved card trusts the published waiting row, not an earlier queued row", async () => {
+    const earlier: DerivedIntent = {
+      intent: makeIntent({ id: "i-earlier", text: "Unpublished earlier row" }),
+      state: "queued",
+    };
+    const waiting: DerivedIntent = {
+      ...QUEUED_NEXT,
+      intent: makeIntent({ id: "i-waiting", text: "Published waiting row" }),
+      next: {
+        standing: "failure-park",
+        manualStart: false,
+        cause: { code: "commit-missing" },
+      },
+    };
+    seedLedger({
+      intents: [FINISHED, earlier, waiting],
+      attention: [],
+      badge: 1,
+    });
+    servedLedger = { intents: [earlier, waiting], attention: [], badge: 0 };
+    renderRunWith(TURN_ONE);
+
+    fireEvent.click(screen.getByTestId("delivery-confirm"));
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("delivery-card-i1").getAttribute("data-settled")).toBe(
+        "1",
+      ),
+    );
+    const card = screen.getByTestId("delivery-card-i1");
+    expect(card.textContent).toContain("Published waiting row");
+    expect(card.textContent).not.toContain("Unpublished earlier row");
+    expect(within(card).getByTestId("resolved-next-standing").textContent).toBe(
+      "waiting — current work failed — Committed nothing",
+    );
+    expect(within(card).queryByTestId("upnext-start")).toBeNull();
+  });
+
+  test("an empty queue resolves into the inline add affordance", async () => {
+    useAppStore.setState({
+      ledger: { intents: [FINISHED], attention: [], badge: 1 },
+    });
+    servedLedger = EMPTY_LEDGER;
+    renderRunWith(TURN_ONE);
+
+    fireEvent.click(screen.getByTestId("delivery-drop"));
+    await vi.waitFor(() =>
+      expect(command).toHaveBeenCalledWith("intent.close", {
+        intentId: "i1",
+        as: "dropped",
+      }),
+    );
+    const input = await vi.waitFor(() =>
+      screen.getByTestId("upnext-add-input"),
+    );
+    expect((input as HTMLInputElement).placeholder).toBe(
+      "Nothing queued — name the next intent…",
+    );
+    fireEvent.change(input, { target: { value: "polish the changelog" } });
+    fireEvent.click(screen.getByTestId("upnext-add"));
+    await vi.waitFor(() =>
+      expect(command).toHaveBeenCalledWith("intent.queue", {
+        projectId: "p1",
+        text: "polish the changelog",
+      }),
+    );
+  });
+
+  test("a history replay keeps its verdict live and its resolved actions inert", async () => {
+    renderRunWith(TURN_ONE, {
+      session: { ...SESSION, live: false, endedAt: 5 },
+      readOnly: true,
+      onStartNew: () => {},
+    });
+    const card = screen.getByTestId("delivery-card-i1");
+    expect(card.textContent).toContain("Address #7: fix the login bug");
+    // The verdict rules on the intent, not the session (run-view-87,
+    // DR-066): the Dashboard row takes the very same act, so claiming
+    // it inert here would be the only false statement on screen.
+    expect(
+      (within(card).getByTestId("delivery-confirm") as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    expect(
+      (within(card).getByTestId("delivery-drop") as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    // And a read-only lane shows no working line.
+    expect(screen.queryByTestId("working-line")).toBeNull();
+
+    servedLedger = { intents: [QUEUED_NEXT], attention: [], badge: 0 };
+    fireEvent.click(within(card).getByTestId("delivery-confirm"));
+    await vi.waitFor(() =>
+      expect(card.getAttribute("data-settled")).toBe("1"),
+    );
+    expect(within(card).getByTestId("resolved-next-queued").textContent).toBe(
+      "Queued",
+    );
+    const start = within(card).getByTestId("upnext-start") as HTMLButtonElement;
+    expect(start.disabled).toBe(true);
+    fireEvent.click(start);
+    expect(useAppStore.getState().stagedIntents.home).toBeUndefined();
+
+    act(() => useAppStore.setState({ ledger: EMPTY_LEDGER }));
+    const input = await within(card).findByTestId("upnext-add-input");
+    const add = within(card).getByTestId("upnext-add") as HTMLButtonElement;
+    expect((input as HTMLInputElement).disabled).toBe(true);
+    expect(add.disabled).toBe(true);
+    fireEvent.click(add);
+    expect(command.mock.calls.some(([type]) => type === "intent.queue")).toBe(
+      false,
+    );
+  });
+});
+
+describe("run-view-96/91: attention activation lands at the place", () => {
+  afterEach(() => {
+    useAppStore.setState({ ledger: undefined, stagedIntents: {} });
+  });
+
+  test("a pending question focuses the question bubble", () => {
+    const onFocusHandled = vi.fn();
+    renderRunWith([...TURN_ONE, ...TURN_TWO_QUESTION], {
+      focusTurn: 2,
+      onFocusHandled,
+    });
+    const wrapper = screen
+      .getByTestId("question-bubble")
+      .closest("[data-focus-key]");
+    expect(wrapper?.getAttribute("data-focused")).toBe("1");
+    expect(onFocusHandled).toHaveBeenCalled();
+  });
+
+  test("an unacknowledged failure focuses the failure line", () => {
+    const TURN_FAILED = [
+      {
+        seq: 1,
+        record: {
+          type: "turn_started",
+          turnId: 5,
+          timestamp: 1,
+          turn: { id: 5, prompt: "go", timestamp: 1 },
+        },
+      },
+      {
+        seq: 2,
+        record: {
+          type: "runtime_error",
+          turnId: 5,
+          timestamp: 2,
+          message: "the coder crashed",
+        },
+      },
+      {
+        seq: 3,
+        record: { type: "turn_finished", turnId: 5, timestamp: 3 },
+      },
+    ] as typeof FULL_RUN;
+    renderRunWith(TURN_FAILED, { focusTurn: 5 });
+    const wrapper = screen
+      .getByText("the coder crashed")
+      .closest("[data-focus-key]");
+    expect(wrapper?.getAttribute("data-focused")).toBe("1");
+  });
+
+  test("a failure recorded naming no turn while its turn was open focuses its line", () => {
+    // Earlier cores recorded every failure of their own naming no turn;
+    // the ledger counts one recorded while a turn was open in that turn
+    // (core-service-49), and so does its line.
+    const TURN_SETTLED_FAILED = [
+      {
+        seq: 1,
+        record: {
+          type: "turn_started",
+          turnId: 6,
+          timestamp: 1,
+          turn: { id: 6, prompt: "go", timestamp: 1 },
+        },
+      },
+      {
+        seq: 2,
+        record: {
+          type: "runtime_error",
+          turnId: null,
+          timestamp: 2,
+          message: "the release failed",
+        },
+      },
+      {
+        seq: 3,
+        record: { type: "turn_finished", turnId: 6, timestamp: 3 },
+      },
+    ] as unknown as typeof FULL_RUN;
+    renderRunWith(TURN_SETTLED_FAILED, { focusTurn: 6 });
+    const wrapper = screen
+      .getByText("the release failed")
+      .closest("[data-focus-key]");
+    expect(wrapper?.getAttribute("data-focused")).toBe("1");
+  });
+
+  test("a finish awaiting its verdict focuses the delivery card", async () => {
+    useAppStore.setState({
+      ledger: { intents: [FINISHED], attention: [], badge: 1 },
+    });
+    const onFocusHandled = vi.fn();
+    const { container } = renderRunWith(TURN_ONE, {
+      focusTurn: 1,
+      onFocusHandled,
+    });
+    await vi.waitFor(() => {
+      const wrapper = container.querySelector('[data-focus-key="card-i1"]');
+      expect(wrapper?.getAttribute("data-focused")).toBe("1");
+    });
+    expect(onFocusHandled).toHaveBeenCalled();
+  });
+});
+
+describe("run-view-25, DR-038: the player label wears the fast-mode mark", () => {
+  test("a fast-mode player shows the lightning; the other lane does not", () => {
+    const view = applyRecords(initialSessionView(PLAYERS), TURN_ONE_REVIEWED);
+    render(
+      <RunView
+        session={{
+          ...SESSION,
+          players: [{ ...PLAYERS[0], fastMode: true }, PLAYERS[1]],
+        }}
+        view={view}
+        composer={{ queued: [] }}
+        connected
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    const coder = screen.getByTestId("player-pane-dev.coder");
+    expect(within(coder).getByTestId("player-fast-mode").title).toBe(
+      "fast mode",
+    );
+    expect(
+      within(screen.getByTestId("player-pane-dev.reviewer")).queryByTestId(
+        "player-fast-mode",
+      ),
+    ).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session view craft (run-view-2/8/38/50/83/85/87): labels that say
+// what happens, every state in more than color, links that leave the
+// page instead of replacing it, and focus that is never stranded.
+// ---------------------------------------------------------------------------
+
+describe("run-view-8/38: the composer says what a send does mid-turn", () => {
+  test("the primary control, the placeholder, and the caption agree", () => {
+    const view = applyRecords(initialSessionView(PLAYERS), TURN_ONLY_STARTED);
+    render(
+      <RunView
+        session={SESSION}
+        view={view}
+        composer={{ queued: [{ text: "and the changelog" }] }}
+        connected
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    // The busy form stays within the label budget (DR-041); the
+    // sentence rides the tooltip ahead of the keys.
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(send.title).toBe(
+      "Captain is working…",
+    );
+    expect(
+      screen.getByTestId("boss-composer").getAttribute("placeholder"),
+    ).toBe("Captain is working…");
+    expect(screen.getByTestId("queue-indicator").textContent).toContain(
+      "sends when this turn ends",
+    );
+    // Abort stands beside the primary in the action row.
+    const row = screen.getByTestId("abort-button").parentElement!;
+    expect(row.textContent).toBe("AbortSend");
+    // The remove control is a real hit target (run-view-50).
+    const remove = screen.getByRole("button", {
+      name: "Remove this queued message",
+    });
+    expect(remove.className).toContain("h-6 w-6");
+    expect(remove.title).toBe("Remove this message");
+  });
+
+  test("idle, the control reads Send", () => {
+    renderRun(TURN_ONE);
+    expect(screen.getByRole("button", { name: "Send" }).title).toBe(
+      "Enter to send · Shift+Enter for a new line",
+    );
+  });
+
+  // run-view-106 (DR-041): the composer's shape — a one-row field
+  // with no native grip, the caption line under it, placeholders
+  // within 24 characters.
+  test("the field is one growing row and the caption carries the hint", () => {
+    renderRun(TURN_ONE);
+    const box = screen.getByTestId("boss-composer") as HTMLTextAreaElement;
+    expect(box.rows).toBe(1);
+    expect(box.className).toContain("resize-none");
+    expect(box.placeholder.length).toBeLessThanOrEqual(24);
+    expect(screen.getByTestId("composer-caption").textContent).toBe(
+      "/ for playbooks · Enter sends",
+    );
+  });
+
+  test("a waiting question names the player in the placeholder", () => {
+    const view = applyRecords(initialSessionView(PLAYERS), TURN_ONLY_STARTED);
+    render(
+      <RunView
+        session={SESSION}
+        view={{ ...view, turnActive: false, pendingQuestion: "Migrate?", pendingQuestionPlayer: "coder" }}
+        composer={{ queued: [] }}
+        connected
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    const box = screen.getByTestId("boss-composer") as HTMLTextAreaElement;
+    expect(box.placeholder).toBe("Reply to coder…");
+  });
+
+  test("the staged chip names the task and its control speaks plainly", () => {
+    useAppStore.setState({
+      stagedIntents: { s1: { intentId: "i1", title: "Address #7" } },
+    });
+    renderRunWith(TURN_ONE);
+    expect(screen.getByTestId("staged-intent-chip").textContent).toContain(
+      "Starting: Address #7",
+    );
+    const detach = screen.getByRole("button", {
+      name: "Take the task out of the message",
+    });
+    expect(detach.className).toContain("h-6 w-6");
+    useAppStore.setState({ stagedIntents: {} });
+  });
+});
+
+const TURN_FAILING = [
+  {
+    seq: 1,
+    record: {
+      type: "turn_started",
+      turnId: 5,
+      timestamp: 1,
+      turn: { id: 5, prompt: "go", timestamp: 1 },
+    },
+  },
+  {
+    seq: 2,
+    record: {
+      type: "runtime_error",
+      turnId: 5,
+      timestamp: 2,
+      message: "the coder crashed",
+    },
+  },
+  {
+    seq: 3,
+    record: {
+      type: "runtime_error",
+      turnId: 5,
+      timestamp: 3,
+      message: "the coder crashed",
+    },
+  },
+  {
+    seq: 4,
+    record: {
+      type: "runtime_error",
+      turnId: 5,
+      timestamp: 4,
+      message: "disk full",
+    },
+  },
+  { seq: 5, record: { type: "turn_finished", turnId: 5, timestamp: 5 } },
+] as typeof FULL_RUN;
+
+describe("run-view-2: failure lines fold, and point at the remedy", () => {
+  test("a failure line speaks plain with the runtime's words in its tooltip", () => {
+    renderRunWith([
+      ...TURN_ONLY_STARTED,
+      {
+        seq: 2,
+        record: {
+          type: "runtime_error",
+          turnId: 9,
+          timestamp: 2,
+          message: "Error: Claude Code process exited with code 1",
+        } as unknown as TmuxPlayRecord,
+      },
+    ]);
+    const text = screen.getByTestId("failure-text");
+    expect(text.textContent).toBe("The agent process exited unexpectedly (1)");
+    expect(text.title).toBe("Error: Claude Code process exited with code 1");
+  });
+
+  test("a repeat counts, and the not-ready hint links to Settings", () => {
+    const onOpenSettings = vi.fn();
+    renderRunWith(TURN_FAILING, {
+      readinessHint: {
+        requirement: "ANTHROPIC_API_KEY is not set",
+        onOpenSettings,
+      },
+    });
+    const lines = screen.getAllByTestId("failure-line");
+    expect(lines).toHaveLength(2);
+    expect(within(lines[0]).getByTestId("failure-count").textContent).toContain(
+      "×2",
+    );
+    expect(within(lines[1]).queryByTestId("failure-count")).toBeNull();
+    const link = within(lines[0]).getByRole("button", {
+      name: "Check agent readiness",
+    });
+    expect(link.title).toBe("ANTHROPIC_API_KEY is not set");
+    fireEvent.click(link);
+    expect(onOpenSettings).toHaveBeenCalled();
+  });
+
+  test("no hint without the not-ready report, and none in a replay", () => {
+    const { unmount } = renderRunWith(TURN_FAILING);
+    expect(screen.queryByTestId("failure-readiness-link")).toBeNull();
+    unmount();
+    renderRunWith(TURN_FAILING, {
+      readinessHint: { onOpenSettings: vi.fn() },
+      session: { ...SESSION, live: false, endedAt: 5 },
+      readOnly: true,
+      onStartNew: () => {},
+    });
+    expect(screen.queryByTestId("failure-readiness-link")).toBeNull();
+  });
+});
+
+const TOOL_FATES = [
+  ...TURN_ONE.slice(0, 4),
+  {
+    seq: 5,
+    record: {
+      type: "player_event",
+      turnId: 1,
+      timestamp: 5,
+      playerId: "dev.coder",
+      event: {
+        type: "tool_use",
+        payload: { toolName: "Bash", toolUseId: "tu9", input: "rm -rf build" },
+      },
+    },
+  },
+  {
+    seq: 6,
+    record: {
+      type: "player_event",
+      turnId: 1,
+      timestamp: 6,
+      playerId: "dev.coder",
+      event: {
+        type: "tool_result",
+        payload: { toolUseId: "tu9", status: "error", output: "exit 1" },
+      },
+    },
+  },
+  {
+    seq: 7,
+    record: {
+      type: "player_event",
+      turnId: 1,
+      timestamp: 7,
+      playerId: "dev.coder",
+      event: {
+        type: "tool_use",
+        payload: { toolName: "Write", toolUseId: "tu10", input: { path: "x" } },
+      },
+    },
+  },
+  {
+    seq: 8,
+    record: {
+      type: "player_event",
+      turnId: 1,
+      timestamp: 8,
+      playerId: "dev.coder",
+      event: {
+        type: "tool_result",
+        payload: { toolUseId: "tu10", status: "denied" },
+      },
+    },
+  },
+] as typeof FULL_RUN;
+
+describe("run-view-127: a player's failure shows once per call", () => {
+  const MESSAGE = "The model requires a newer version of the CLI. Please upgrade and try again.";
+  const FAILED_CALL = [
+    { seq: 1, record: { type: "turn_started", turnId: 2, timestamp: 1, turn: { id: 2, prompt: "go" } } },
+    { seq: 2, record: { type: "player_prompt", turnId: 2, timestamp: 2, playerId: "dev.coder", prompt: "go" } },
+    { seq: 3, record: { type: "player_event", turnId: 2, timestamp: 3, playerId: "dev.coder", event: { type: "text", payload: { content: MESSAGE } } } },
+    { seq: 4, record: { type: "player_event", turnId: 2, timestamp: 4, playerId: "dev.coder", event: { type: "error", payload: { code: "error", message: MESSAGE } } } },
+    { seq: 5, record: { type: "player_event", turnId: 2, timestamp: 5, playerId: "dev.coder", event: { type: "error", payload: { message: MESSAGE } } } },
+    { seq: 6, record: { type: "player_finished", turnId: 2, timestamp: 6, playerId: "dev.coder", result: { status: "error", playerId: "dev.coder", turnId: 2, error: MESSAGE } } },
+  ] as unknown as typeof FULL_RUN;
+
+  test("one failure line with its count, and a result line that does not repeat it", () => {
+    renderRun(FAILED_CALL);
+    const pane = screen.getByTestId("player-pane-dev.coder");
+    const failures = within(pane).getAllByTestId("player-failure");
+    expect(failures).toHaveLength(1);
+    expect(failures[0].textContent).toContain(MESSAGE);
+    const count = within(failures[0]).getByTestId("player-failure-count");
+    expect(count.textContent).toContain("×2");
+    expect(count.textContent).toContain("2 times");
+    // The prose that only repeated the failure is gone with it.
+    expect(within(pane).queryAllByText(MESSAGE, { selector: "p" })).toHaveLength(0);
+    const result = within(pane).getByTestId("player-result");
+    expect(result.textContent).toBe("✗ failed");
+    expect(result.title).toBe(MESSAGE);
+  });
+});
+
+describe("run-view-50: color is never the only channel in a player pane", () => {
+  test("tool cards say how they ended, and the running mark says running", () => {
+    renderRun(TOOL_FATES);
+    // The prompt landed and no result yet: the lane runs, in words.
+    const running = screen.getByTestId("player-running");
+    expect(running.getAttribute("data-running")).toBe("true");
+    expect(running.textContent).toBe("running");
+
+    const status = (tool: string) =>
+      within(screen.getByText(tool).closest("summary")!).getByTestId(
+        /^tool-status-/,
+      );
+    expect(status("Bash").textContent).toBe("✗failed");
+    expect(status("Write").textContent).toBe("✗denied");
+  });
+
+  test("a call that succeeded wears the ok mark", () => {
+    renderRun(TURN_ONE);
+    const edit = screen.getByText("Edit").closest("summary")!;
+    expect(within(edit).getByTestId(/^tool-status-/).textContent).toBe("✓ok");
+  });
+});
+
+describe("run-view-194: a lane at work says so without opening a card", () => {
+  test("a tool card awaiting its result runs, and the lane's foot names it", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(5 + 12_000);
+    try {
+      renderRun(TOOL_FATES.slice(0, 5));
+      const card = screen.getAllByText("Bash").map((el) => el.closest("details")).find(Boolean)!;
+      expect(card.open).toBe(false);
+      expect(card.dataset.running).toBe("true");
+      expect(within(card).getByTestId("tool-running-5").textContent).toMatch(/running · 12s$/);
+      expect(within(card).queryByTestId(/^tool-status-/)).toBeNull();
+      const foot = screen.getByTestId("player-working-line");
+      expect(foot.textContent).toBe("running: Bash · 12s, rm -rf build");
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+      expect(within(card).getByTestId("tool-running-5").textContent).toMatch(/running · 13s$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an ended card stops running, and the foot reads the player thinking", () => {
+    renderRun(TOOL_FATES.slice(0, 6));
+    const card = screen.getAllByText("Bash").map((el) => el.closest("details")).find(Boolean)!;
+    expect(card.dataset.running).toBeUndefined();
+    expect(within(card).queryByTestId("tool-running-5")).toBeNull();
+    expect(within(card).getByTestId(/^tool-status-/).textContent).toBe("✗failed");
+    expect(screen.getByTestId("player-working-line").textContent).toBe("running: Thinking…");
+  });
+
+  test("a long tool name gives way in the foot, keeping its span and subject", () => {
+    const name = "mcp__playwright__browser_take_screenshot_of_the_whole_page";
+    renderRun([
+      ...TOOL_FATES.slice(0, 4),
+      {
+        seq: 5,
+        record: {
+          type: "player_event",
+          turnId: 1,
+          timestamp: 5,
+          playerId: "dev.coder",
+          event: {
+            type: "tool_use",
+            payload: { toolName: name, toolUseId: "tu9", input: "rm -rf build" },
+          },
+        },
+      },
+    ] as unknown as typeof FULL_RUN);
+    const foot = screen.getByTestId("player-working-line");
+    const tool = within(foot).getByTitle(name);
+    expect(tool.className).toMatch(/\btruncate\b/);
+    expect(tool.className).toContain("max-w-[50%]");
+    expect(within(foot).getByText(/^· \S/).className).toContain("shrink-0");
+    expect(within(foot).getByTitle("rm -rf build").className).toContain("flex-1");
+  });
+
+  test("a finished call leaves no running card and no foot", () => {
+    renderRun(TURN_ONE);
+    expect(screen.queryByTestId("player-working-line")).toBeNull();
+    expect(screen.queryByTestId(/^tool-running-/)).toBeNull();
+    expect(screen.getAllByText("120→30 token")).toHaveLength(1);
+  });
+});
+
+describe("run-view-83/87: links leave the page, never replace it", () => {
+  afterEach(() => {
+    useAppStore.setState({ ledger: undefined });
+  });
+
+  test("a transcript's web link and the source chip open a new tab without a referrer", () => {
+    useAppStore.setState({
+      ledger: { intents: [FINISHED], attention: [], badge: 1 },
+    });
+    renderRunWith(TURN_ONE);
+    const link = screen.getByText("the SDK docs");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noreferrer");
+    const chip = within(screen.getByTestId("boss-bubble")).getByTestId(
+      "intent-source-chip",
+    );
+    expect(chip.getAttribute("target")).toBe("_blank");
+    expect(chip.getAttribute("rel")).toBe("noreferrer");
+  });
+});
+
+describe("run-view-50: focus is never stranded", () => {
+  test("abort keeps focus in the Captain pane", () => {
+    renderRun(TURN_ONLY_STARTED);
+    const abort = screen.getByTestId("abort-button");
+    abort.focus();
+    fireEvent.click(abort);
+    expect(document.activeElement).toBe(screen.getByTestId("captain-pane"));
+  });
+
+});
+
+describe("run-view-7: a roster with no players", () => {
+  test("renders the Captain column alone, with no divider and no player grid", () => {
+    renderRunWith(FULL_RUN, {
+      session: { ...SESSION, players: [] },
+      readOnly: true,
+    });
+    expect(screen.getByTestId("captain-pane")).toBeTruthy();
+    expect(screen.queryByTestId("player-grid")).toBeNull();
+    expect(screen.queryByRole("separator")).toBeNull();
+    expect(screen.getByTestId("captain-column").className).toContain("max-w-2xl");
+  });
+
+  test("keeps the divider and the grid while any lane is bound", () => {
+    renderRunWith(FULL_RUN, { readOnly: true });
+    expect(screen.getByTestId("player-grid")).toBeTruthy();
+    expect(screen.getByRole("separator")).toBeTruthy();
+  });
+});
+
+describe("run-view-4: a runner's shell wrapper", () => {
+  test("the inner command is the subject and the wire name reads shell", () => {
+    expect(unwrapShell(`/bin/zsh -lc "rg --files -g '!specs/**' | sort"`)).toBe(
+      "rg --files -g '!specs/**' | sort",
+    );
+    expect(unwrapShell("/bin/zsh -lc 'cat guidelines.md | head -120'")).toBe(
+      "cat guidelines.md | head -120",
+    );
+    expect(unwrapShell("bash -c ls")).toBe("ls");
+    expect(unwrapShell("ls -la")).toBe("ls -la");
+    expect(toolLabel("command_execution")).toBe("shell");
+    expect(toolLabel("Bash")).toBe("Bash");
+  });
+});
+
+describe("run-view-116/117: a lane folds to a rail and returns for its call", () => {
+  beforeEach(() => {
+    useAppStore.setState({ collapsedLanes: {} });
+  });
+
+  test("the header's control folds the pane to a rail, focus handed on", () => {
+    renderRun(TURN_ONE_REVIEWED);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse reviewer" }));
+    const rail = screen.getByTestId("player-pane-dev.reviewer");
+    expect(rail.dataset.collapsed).toBe("true");
+    // The rail names the lane and offers the way back (run-view-116).
+    const name = within(rail).getByTestId("player-name-dev.reviewer");
+    expect(name.textContent).toBe("reviewer");
+    expect(within(rail).getByTestId("player-mark").textContent).toBe("R");
+    expect(within(rail).queryByTestId("player-running")).toBeNull();
+    const expand = within(rail).getByRole("button", { name: "Expand reviewer" });
+    expect(document.activeElement).toBe(expand);
+    expect(useAppStore.getState().collapsedLanes.s1).toEqual(["dev.reviewer"]);
+
+    fireEvent.click(expand);
+    const pane = screen.getByTestId("player-pane-dev.reviewer");
+    expect(pane.dataset.collapsed).toBeUndefined();
+    expect(document.activeElement).toBe(
+      within(pane).getByRole("button", { name: "Collapse reviewer" }),
+    );
+    expect(useAppStore.getState().collapsedLanes.s1).toEqual([]);
+  });
+
+  test("the rail wears the running mark while the lane's call is open", () => {
+    render(
+      <PlayerPane
+        view={{ id: "dev.reviewer", running: true, segments: [] }}
+        collapsed
+      />,
+    );
+    const rail = screen.getByTestId("player-pane-dev.reviewer");
+    expect(within(rail).getByTestId("player-running").dataset.running).toBe("true");
+  });
+
+  /** The reviewer's call opens (run-view-117): the record that turns
+   * its lane running, delivered as the client would, then the view
+   * the fold produced. */
+  function openReviewerCall(idle: ReturnType<typeof applyRecords>) {
+    act(() => {
+      deliverServerMessageForTests({
+        type: "record",
+        channel: "session",
+        sessionId: "s1",
+        seq: 90,
+        record: {
+          type: "player_prompt",
+          turnId: 2,
+          timestamp: Date.now(),
+          playerId: "dev.reviewer",
+          prompt: "Review the change",
+        },
+      });
+    });
+    return {
+      ...idle,
+      players: {
+        ...idle.players,
+        "dev.reviewer": { ...idle.players["dev.reviewer"], running: true },
+      },
+    };
+  }
+
+  test("a collapsed lane opens itself when its call opens, per session", () => {
+    useAppStore.setState({
+      collapsedLanes: { s1: ["dev.reviewer"], s2: ["dev.reviewer"] },
+    });
+    const idle = applyRecords(initialSessionView(PLAYERS), TURN_ONE_REVIEWED);
+    const props = {
+      session: SESSION,
+      composer: { queued: [] },
+      connected: true,
+      onSubmit: async () => {},
+      onAbort: () => {},
+      onRemoveQueued: () => {},
+      onDismissError: () => {},
+    };
+    const { rerender } = render(<RunView {...props} view={idle} />);
+    expect(screen.getByTestId("player-pane-dev.reviewer").dataset.collapsed).toBe(
+      "true",
+    );
+    rerender(<RunView {...props} view={openReviewerCall(idle)} />);
+    const pane = screen.getByTestId("player-pane-dev.reviewer");
+    expect(pane.dataset.collapsed).toBeUndefined();
+    const collapse = within(pane).getByRole("button", { name: "Collapse reviewer" });
+    // The other session's set stands; the reader's focus — in the
+    // composer, where the view put it — was not taken (run-view-117).
+    expect(useAppStore.getState().collapsedLanes).toEqual({
+      s1: [],
+      s2: ["dev.reviewer"],
+    });
+    expect(document.activeElement).not.toBe(collapse);
+    // Folding a lane whose call is already open stands: only the
+    // call's opening unfolds it.
+    fireEvent.click(collapse);
+    expect(screen.getByTestId("player-pane-dev.reviewer").dataset.collapsed).toBe(
+      "true",
+    );
+    expect(useAppStore.getState().collapsedLanes.s1).toEqual(["dev.reviewer"]);
+  });
+
+  test("a self-opening lane carries focus from the rail's control it removes", () => {
+    useAppStore.setState({ collapsedLanes: { s1: ["dev.reviewer"] } });
+    const idle = applyRecords(initialSessionView(PLAYERS), TURN_ONE_REVIEWED);
+    const props = {
+      session: SESSION,
+      composer: { queued: [] },
+      connected: true,
+      onSubmit: async () => {},
+      onAbort: () => {},
+      onRemoveQueued: () => {},
+      onDismissError: () => {},
+    };
+    const { rerender } = render(<RunView {...props} view={idle} />);
+    act(() => {
+      screen.getByRole("button", { name: "Expand reviewer" }).focus();
+    });
+    rerender(<RunView {...props} view={openReviewerCall(idle)} />);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Collapse reviewer" }),
+    );
+  });
+});
+
+describe("run-view-110: explicit uncertain-turn recovery", () => {
+  test("external ownership keeps delivery history with its verdict still owed", () => {
+    const previous = useAppStore.getState();
+    useAppStore.setState({ledger: {...EMPTY_LEDGER, intents: [FINISHED, QUEUED_NEXT]}});
+    try {
+      renderRunWith(TURN_ONE, {session: {...SESSION, externalWriter: "active"}});
+      expect(screen.getByTestId("delivery-card-i1")).toBeTruthy();
+      // A session another writer owns runs no turn here, and the
+      // verdict needs none: the ruling is the ledger's (run-view-87).
+      expect((screen.getByTestId("delivery-confirm") as HTMLButtonElement).disabled).toBe(false);
+      expect((screen.getByTestId("delivery-drop") as HTMLButtonElement).disabled).toBe(false);
+      expect(screen.queryByTestId("boss-composer")).toBeNull();
+    } finally {useAppStore.setState(previous, true);}
+  });
+
+  test.each(["active", "unknown"] as const)("external %s ownership hides session controls and keeps streaming history", (externalWriter) => {
+    const session = { ...SESSION, externalWriter, live: externalWriter === "active", turnActive: false,
+      recovery: { state: "uncertain" as const, input: "Saved request", discardable: true } };
+    const view = applyRecords(initialSessionView(PLAYERS), TURN_ONE);
+    const composer = { draft: "Keep draft", queued: [{text: "Keep queue"}] };
+    const props = {session, view, composer, connected: true, readOnly: false,
+      onSubmit: vi.fn(async () => {}), onRecover: vi.fn(async () => {}),
+      onStartNew: vi.fn(), onAbort: vi.fn(), onRemoveQueued: vi.fn(), onDismissError: vi.fn()};
+    const rendered = render(<RunView {...props} />);
+    expect(screen.getByTestId("session-external-owner").textContent).toContain(externalWriter === "active" ? "in use elsewhere" : "ownership is unknown");
+    expect(screen.queryByTestId("session-last-active")).toBeNull();
+    expect(screen.queryByTestId("history-notice")).toBeNull();
+    expect(screen.queryByText("Interrupted turn")).toBeNull();
+    expect(screen.queryByTestId("boss-composer")).toBeNull();
+    for (const name of ["Restore", "Discard", "New session"]) {
+      expect(screen.queryByRole("button", {name})).toBeNull();
+    }
+    applyRecords(view, [{seq: view.lastSeq + 1, record: {type: "captain_reply", timestamp: 100, turnId: 1, text: "New external output"} as TmuxPlayRecord}]);
+    rendered.rerender(<RunView {...props} view={{...view}} />);
+    expect(screen.getByText("New external output")).toBeTruthy();
+    expect(composer).toEqual({draft: "Keep draft", queued: [{text: "Keep queue"}]});
+  });
+
+  test.each(["active", "unknown"] as const)("external %s ownership blocks queued and direct mutations without losing input", async (externalWriter) => {
+    const previous = useAppStore.getState();
+    const command = vi.fn(async () => ({}));
+    setClientForTests({command} as never);
+    const session = {...SESSION, externalWriter, live: externalWriter === "active", turnActive: false};
+    const composer = {draft: "Keep draft", queued: [{text: "Keep queue"}]};
+    useAppStore.setState({sessions: [session], views: {s1: initialSessionView(PLAYERS)}, composers: {s1: composer}, specTrees: {}, activeSessionId: undefined});
+    try {
+      deliverServerMessageForTests({type: "record", channel: "session", sessionId: "s1", seq: 1,
+        record: {type: "turn_finished", turnId: 1, timestamp: 1} as TmuxPlayRecord});
+      deliverServerMessageForTests({type: "session.state", session});
+      await expect(useAppStore.getState().submitBossText("s1", "New request")).rejects.toThrow("ownership");
+      await expect(useAppStore.getState().recoverSession("s1", "restore")).rejects.toThrow("ownership");
+      await expect(useAppStore.getState().recoverSession("s1", "discard")).rejects.toThrow("ownership");
+      await expect(useAppStore.getState().deleteSession("s1")).rejects.toThrow("ownership");
+      expect(command).not.toHaveBeenCalled();
+      expect(useAppStore.getState().composers.s1).toEqual(composer);
+      expect(useAppStore.getState().views.s1.lastSeq).toBe(1);
+      deliverServerMessageForTests({type: "session.state", session: {...SESSION, live: false}});
+      expect(command).not.toHaveBeenCalled();
+      expect(useAppStore.getState().composers.s1).toEqual(composer);
+    } finally {setClientForTests(undefined); useAppStore.setState(previous, true);}
+  });
+
+  function renderInterrupted(onRecover: (action: "restore" | "discard") => Promise<void> = vi.fn(async () => {}), connected = true, discardable = true) {
+    const session = { ...SESSION, live: false, continuable: false, recovery: { state: "uncertain" as const, input: "Original interrupted request", discardable } };
+    const props = {
+      session, view: initialSessionView(PLAYERS),
+      composer: { draft: "Keep my draft", queued: [{ text: "Later" }] },
+      connected, readOnly: true, onRecover,
+      onDraftChange: vi.fn(), onSubmit: vi.fn(async () => {}),
+      onAbort: vi.fn(), onRemoveQueued: vi.fn(), onDismissError: vi.fn(),
+    };
+    return { ...render(<RunView {...props} />), props, onRecover };
+  }
+
+  test("confirms the saved input, prevents duplicate recovery, and retains a refused draft", async () => {
+    let refuse!: (error: Error) => void;
+    const onRecover = vi.fn(() => new Promise<void>((_resolve, reject) => { refuse = reject; }));
+    const { props } = renderInterrupted(onRecover);
+    expect(screen.getByText("Original interrupted request")).toBeTruthy();
+    expect(screen.getByDisplayValue("Keep my draft")).toBeTruthy();
+    // The draft stays typable while only sending is blocked (run-view-110).
+    expect((screen.getByTestId("boss-composer") as HTMLTextAreaElement).disabled).toBe(false);
+    const send = screen.getAllByRole("button").find((b) => b.textContent === "Send");
+    expect((send as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Cancel" }), { key: "Escape" });
+    expect(onRecover).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Discard" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    expect(onRecover).toHaveBeenCalledExactlyOnceWith("discard");
+    expect((screen.getByRole("button", { name: "Restore" }) as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => refuse(new Error("Recorded work or changed repository evidence must be restored and reported; the turn cannot be discarded")));
+    expect(screen.getByRole("alert").textContent).toContain("must be restored and reported");
+    expect(screen.getByDisplayValue("Keep my draft")).toBeTruthy();
+    expect(props.onSubmit).not.toHaveBeenCalled();
+  });
+
+  test("Restore sends only the selected session ID at once, saying nothing is repeated, and never twice", async () => {
+    const previous = useAppStore.getState();
+    let accept!: () => void;
+    const command = vi.fn(() => new Promise((resolve) => { accept = () => resolve({ accepted: true }); }));
+    setClientForTests({ command } as never);
+    renderInterrupted(async (action) => {
+      await useAppStore.getState().recoverSession(SESSION.id, action);
+    });
+    try {
+      const restore = screen.getByRole("button", { name: "Restore" }) as HTMLButtonElement;
+      // It repeats and discards nothing, so it asks nothing (run-view-110).
+      expect(restore.getAttribute("title")).toBe("Nothing is repeated");
+      // With no confirm between the click and the command, a repeated
+      // click is what could send it twice (run-view-111).
+      fireEvent.click(restore);
+      fireEvent.click(restore);
+      await act(async () => {});
+      expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+      expect(restore.disabled).toBe(true);
+      fireEvent.click(restore);
+      expect(command).toHaveBeenCalledExactlyOnceWith("session.restore", { sessionId: SESSION.id });
+      await act(async () => accept());
+      expect(command).toHaveBeenCalledTimes(1);
+    } finally {
+      setClientForTests(undefined);
+      useAppStore.setState(previous, true);
+    }
+  });
+
+  test("an attempt that recorded work offers Restore alone, and nothing explains the absence", () => {
+    renderInterrupted(undefined, true, false);
+    const region = screen.getByRole("region", { name: "Interrupted turn" });
+    expect(within(region).getAllByRole("button").map((button) => button.textContent)).toEqual(["Restore"]);
+    expect(region.textContent).not.toMatch(/discard/i);
+  });
+
+  test("does not dispatch disconnected recovery", () => {
+    renderInterrupted(undefined, false);
+    expect((screen.getByRole("button", { name: "Restore" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Discard" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  test("holds queued messages through turn_finished until checkpoint settlement", () => {
+    const previous = useAppStore.getState();
+    const command = vi.fn(async () => ({}));
+    setClientForTests({ command } as never);
+    useAppStore.setState({
+      sessions: [{ ...SESSION, turnActive: true }],
+      views: { s1: initialSessionView(PLAYERS) },
+      composers: { s1: { draft: "Draft", queued: [{ text: "After settlement" }] } },
+      specTrees: {}, activeSessionId: undefined,
+    });
+    render(<StoredSessionRun />);
+    try {
+      act(() => deliverServerMessageForTests({ type: "record", channel: "session", sessionId: "s1", seq: 1,
+        record: { type: "turn_finished", turnId: 1, timestamp: 1 } as TmuxPlayRecord }));
+      expect(command).not.toHaveBeenCalled();
+      expect(useAppStore.getState().views.s1.turnActive).toBe(true);
+      expect(screen.getByTestId("working-indicator")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
+      act(() => deliverServerMessageForTests({ type: "session.state", session: { ...SESSION, live: false, recovery: { state: "uncertain", input: "saved", discardable: true } } }));
+      expect(command).not.toHaveBeenCalled();
+      expect(useAppStore.getState().composers.s1.queued).toHaveLength(1);
+      act(() => deliverServerMessageForTests({ type: "session.state", session: { ...SESSION, turnActive: false } }));
+      expect(command).toHaveBeenCalledExactlyOnceWith("turn.submit", { sessionId: "s1", text: "After settlement" });
+      expect(useAppStore.getState().views.s1.turnActive).toBe(false);
+    } finally {
+      setClientForTests(undefined);
+      useAppStore.setState(previous, true);
+    }
+  });
+});
+
+/** Real store actions and server messages drive the rendered session. */
+function StoredSessionRun() {
+  const state = useAppStore();
+  const session = state.sessions.find((entry) => entry.id === "s1");
+  const view = state.views.s1;
+  if (!session || !view || view.loading) return <span>Loading transcript…</span>;
+  return <RunView session={session} view={view}
+    composer={state.composers.s1 ?? { queued: [] }} connected
+    readOnly={!!session.externalWriter || (!session.live && !session.continuable)}
+    error={state.runErrors.s1}
+    onRetryLoad={() => { void state.loadPastSession("s1", true).catch(() => {}); }}
+    onRecover={(action) => state.recoverSession("s1", action)}
+    onDraftChange={(draft) => state.setDraft("s1", draft)}
+    onSubmit={(text) => state.submitBossText("s1", text)}
+    onAbort={() => state.abortTurn("s1")}
+    onRemoveQueued={() => {}} onDismissError={() => state.clearRunError("s1")} />;
+}
+
+test("stored mid-turn history stays idle and Discard permits a direct submission", async () => {
+  const previous = useAppStore.getState();
+  const stopped = { ...SESSION, live: false, turnActive: false, continuable: false,
+    recovery: { state: "uncertain" as const, input: "Interrupted request", discardable: true } };
+  const records = [
+    { seq: 1, record: { type: "turn_started", timestamp: 1, turnId: 1, turn: { id: 1, prompt: "Interrupted request" } } },
+    { seq: 2, record: { type: "player_prompt", timestamp: 2, turnId: 1, playerId: "dev.coder", prompt: "Work in progress" } },
+    { seq: 3, record: { type: "player_event", timestamp: 3, turnId: 1, playerId: "dev.coder",
+      event: { type: "text_delta", payload: { delta: "Preserve partial output" } } } },
+  ] as { seq: number; record: TmuxPlayRecord }[];
+  const command = vi.fn(async (type: string) => {
+    if (type === "history.get") return { records };
+    if (type === "session.discard") {
+      deliverServerMessageForTests({ type: "session.state", session: { ...SESSION, live: false, turnActive: false, continuable: true } });
+      return { removed: false };
+    }
+    return {};
+  });
+  setClientForTests({ command, subscribe: async () => {} } as never);
+  useAppStore.setState({ sessions: [stopped], views: {}, runErrors: {}, stagedIntents: {},
+    composers: { s1: { draft: "Next request", queued: [{ text: "Keep queued request" }] } },
+    activeSessionId: undefined, specTrees: {} });
+  render(<StoredSessionRun />);
+  try {
+    await act(async () => useAppStore.getState().loadPastSession("s1"));
+    expect(screen.getByText("Preserve partial output")).toBeTruthy();
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(screen.queryByTestId("player-running")).toBeNull();
+    expect(screen.queryByTestId("abort-button")).toBeNull();
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByTestId("player-pane-dev.coder").querySelector(".animate-pulse")).toBeNull();
+    // The display is idle without rewriting the conversation's open
+    // segment, so subsequent replay/deltas still combine correctly.
+    expect(useAppStore.getState().views.s1.players["dev.coder"].segments.at(-1)).toMatchObject({ text: "Preserve partial output", streaming: true });
+    await act(async () => useAppStore.getState().recoverSession("s1", "discard"));
+    expect(screen.queryByRole("region", { name: "Interrupted turn" })).toBeNull();
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(screen.queryByTestId("abort-button")).toBeNull();
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(false);
+    await act(async () => useAppStore.getState().submitBossText("s1", "Next request"));
+    expect(command).toHaveBeenCalledWith("turn.submit", { sessionId: "s1", text: "Next request" });
+    expect(useAppStore.getState().composers.s1.queued).toEqual([{ text: "Keep queued request" }]);
+  } finally { setClientForTests(undefined); useAppStore.setState(previous, true); }
+});
+
+test.each(["active", "unknown", "continuable", "uncertain"] as const)(
+  "%s session history reports load failure and retries without losing input", async (kind) => {
+    const previous = useAppStore.getState();
+    const externalWriter = kind === "active" || kind === "unknown" ? kind : undefined;
+    const session = { ...SESSION, live: kind === "active", turnActive: false, externalWriter,
+      continuable: kind === "continuable",
+      ...(kind === "uncertain" ? { recovery: { state: "uncertain" as const, input: "Saved input", discardable: true } } : {}),
+    };
+    const history = vi.fn().mockRejectedValueOnce(new Error("Cannot read selected transcript"))
+      .mockResolvedValueOnce({ records: [{ seq: 1, record: { type: "captain_reply", timestamp: 1, turnId: 1, text: "Recovered history" } }] });
+    const command = vi.fn(async (type: string) => type === "history.get" ? history() : {});
+    setClientForTests({ command, subscribe: async () => {} } as never);
+    const composer = { draft: "Keep draft", queued: [{ text: "Keep queue" }] };
+    useAppStore.setState({ sessions: [session], views: {}, composers: { s1: composer },
+      runErrors: {}, activeSessionId: undefined, specTrees: {} });
+    render(<StoredSessionRun />);
+    try {
+      await act(async () => {
+        await expect(useAppStore.getState().loadPastSession("s1")).rejects.toThrow("Cannot read selected transcript");
+      });
+      const error = screen.getByTestId("past-load-error");
+      expect(error.textContent).toContain("Cannot read selected transcript");
+      if (externalWriter) expect(screen.getByTestId("session-external-owner")).toBeTruthy();
+      await act(async () => fireEvent.click(within(error).getByRole("button", { name: "Retry" })));
+      expect(await screen.findByText("Recovered history")).toBeTruthy();
+      expect(screen.queryByTestId("past-load-error")).toBeNull();
+      expect(command.mock.calls.every(([type]) => type === "history.get")).toBe(true);
+      expect(history).toHaveBeenCalledTimes(2);
+      expect(useAppStore.getState().composers.s1).toEqual(composer);
+    } finally { setClientForTests(undefined); useAppStore.setState(previous, true); }
+  },
+);
+
+test("run-view-110: a rejected queued send preserves its text and draft", async () => {
+  const previous = useAppStore.getState();
+  const command = vi.fn(async () => { throw new Error("Resolve uncertainty first"); });
+  setClientForTests({command} as never);
+  useAppStore.setState({sessions:[{...SESSION,turnActive:false}],views:{s1:initialSessionView(PLAYERS)},composers:{s1:{draft:"My draft",queued:[{text:"Next request"}]}},specTrees:{},activeSessionId:undefined});
+  try {
+    await Promise.resolve();
+    deliverServerMessageForTests({type:"session.state",session:{...SESSION,turnActive:false}});
+    await waitFor(() => expect(useAppStore.getState().runErrors.s1).toContain("Resolve uncertainty first"));
+    expect(command).toHaveBeenCalledTimes(1);
+    expect(useAppStore.getState().composers.s1).toEqual({draft:"My draft",queued:[{text:"Next request"}]});
+  } finally {setClientForTests(undefined);useAppStore.setState(previous,true);}
+});
+
+describe("run-view-64: immutable graph context", () => {
+  test("stored runs keep their own graph after newer context and current-module changes", () => {
+    const context = (seq: number, graph: MachineGraph) => ({seq, record:{
+      type:"session_context", timestamp:seq, contextVersion:1,
+      graphs:[{playbookId:"code", graph}],
+    } as unknown as TmuxPlayRecord});
+    const entries = MACHINE_RUN.map((entry,index) => ({...entry, seq:index+2,
+      record:{...entry.record, contextSeq:1} as TmuxPlayRecord}));
+    const view = applyRecords(initialSessionView(PLAYERS), [context(1, codeGraph as MachineGraph), ...entries]);
+    const frame = view.captain.find((line) => line.frame?.playbookId === "code")?.frame;
+    expect(frame?.historicalGraph).toEqual(codeGraph);
+    const replacement: MachineGraph = {initial:"replacement",nodes:[{id:"replacement",kind:"final",tags:[]}],edges:[]};
+    applyRecords(view, [context(entries.length+2,replacement)]);
+    expect(frame?.historicalGraph).toEqual(codeGraph);
+    expect(Object.values(view.contexts).at(-1)?.code).toEqual(replacement);
+  });
+
+  test("legacy traces and unknown context use observed states without borrowing a current graph", () => {
+    const view = applyRecords(initialSessionView(PLAYERS), MACHINE_RUN);
+    const frame = view.captain.find((line) => line.frame?.playbookId === "code")?.frame;
+    expect(frame?.historicalGraph).toBeNull();
+  });
+});
+
+test("run-view-123: reconnect and replacement reload history while preserving drafts", async () => {
+  const previous = useAppStore.getState();
+  const session = {...SESSION,live:false};
+  const old = applyRecords(initialSessionView(PLAYERS), [{seq:30,record:{type:"captain_reply",timestamp:1,turnId:1,text:"Unselected history"} as TmuxPlayRecord}]);
+  const records = [{seq:1,record:{type:"captain_reply",timestamp:2,turnId:1,text:"Selected history"} as TmuxPlayRecord}];
+  const command = vi.fn(async (type: string) => {
+    if (type === "session.list") return [session];
+    if (type === "history.get") return {records};
+    if (type === "config.get") return {status:"missing",path:"/config"};
+    if (type === "project.list" || type === "readiness.get") return [];
+    return {};
+  });
+  setClientForTests({command,subscribe:async () => {}} as never);
+  useAppStore.setState({sessions:[session],views:{s1:old},composers:{s1:{draft:"Keep draft",queued:[{text:"Keep queue"}]}},specTrees:{},activeSessionId:undefined,projects:[],history:{}});
+  try {
+    await useAppStore.getState().refresh();
+    expect(command).toHaveBeenCalledWith("history.get", {sessionId:"s1",afterSeq:0});
+    expect(useAppStore.getState().views.s1.lastSeq).toBe(1);
+    useAppStore.setState({views:{s1:old}});
+    deliverServerMessageForTests({type:"session.history-replaced",sessionId:"s1"});
+    await waitFor(() => expect(useAppStore.getState().views.s1.lastSeq).toBe(1));
+    expect(useAppStore.getState().composers.s1).toEqual({draft:"Keep draft",queued:[{text:"Keep queue"}]});
+    expect(JSON.stringify(useAppStore.getState().views.s1)).not.toContain("Unselected history");
+  } finally {setClientForTests(undefined);useAppStore.setState(previous,true);}
+});
+
+describe("run-view-131: the failed-workflow notice and its recovery request", () => {
+  const CODE: PlaybookSummary = {
+    id: "code",
+    from: "@sublang/playbook/code/registry",
+    command: "code",
+    intent: "Implement a change",
+    roles: {},
+  };
+
+  function failedView(...more: FixtureEntry[][]) {
+    return applyRecords(
+      initialSessionView(PLAYERS),
+      [MACHINE_FAILED, ...more].flat(),
+    );
+  }
+
+  // core-service-32, DR-074/DR-075: the runtime is held only for a
+  // turn, so what the parked run advertises was read at settlement and
+  // travels with the summary. The notice draws one control per action
+  // and names the one it activates; the core re-validates that name
+  // against the opened shell.
+  const PARKED: SessionInfo = { ...SESSION, parked: PARKED_FAILURE };
+  const RECONCILE = PARKED_FAILURE.actions[0];
+  const ABANDON = PARKED_FAILURE.actions[1];
+
+  /** One advertised control, by the id the summary published. */
+  function action(id: string): HTMLButtonElement {
+    const found = screen
+      .getAllByTestId("failed-workflow-action")
+      .find((button) => button.getAttribute("data-action-id") === id);
+    if (!found) throw new Error(`no control for "${id}"`);
+    return found as HTMLButtonElement;
+  }
+
+  function renderFailed(over: Partial<Parameters<typeof RunView>[0]> = {}) {
+    return render(
+      <RunView
+        session={PARKED}
+        view={failedView()}
+        composer={{ queued: [] }}
+        connected
+        playbooks={[CODE]}
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+        {...over}
+      />,
+    );
+  }
+
+  test("stands between the pane and the composer, naming the workflow and its control's promise", () => {
+    renderFailed();
+    const notice = screen.getByTestId("failed-workflow");
+    const pane = screen.getByTestId("captain-pane");
+    const box = screen.getByTestId("boss-composer");
+    expect(
+      pane.compareDocumentPosition(notice) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      notice.compareDocumentPosition(box) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // Plain words name the workflow by its command; the raw state id
+    // rides the tooltip and never the copy (run-view-128, DR-010 §2).
+    expect(screen.getByTestId("failed-workflow-what").textContent).toBe(
+      "The /code workflow failed and is waiting for you.",
+    );
+    expect(notice.getAttribute("title")).toBe("state: failed");
+    // Why, from the catalogue's phrase for the cause the runtime
+    // attached, and what to do about it outside Spex (run-view-128,
+    // DR-075) — no model composed either.
+    expect(screen.getByTestId("failed-workflow-why").textContent).toBe(
+      "Committed, but left changes uncommitted: stray-1.txt",
+    );
+    // One control per advertised action, in the run's own labels, and
+    // the no-op's reason where the what-now line names it.
+    const controls = screen.getAllByTestId("failed-workflow-action");
+    expect(controls.map((button) => button.getAttribute("data-action-id"))).toEqual([
+      RECONCILE.id,
+      ABANDON.id,
+    ]);
+    expect(controls.map((button) => button.textContent)).toEqual([
+      RECONCILE.label,
+      ABANDON.label,
+    ]);
+    expect(screen.getByTestId("failed-workflow-next").textContent).toBe(
+      "Commit or discard what is left · Retry unresolved effect reconciliation: nothing has changed since it failed",
+    );
+    // A no-op stays visible and disabled, its reason in its tooltip:
+    // nothing is chosen for the Boss and nothing is hidden from him.
+    expect(action(RECONCILE.id).disabled).toBe(true);
+    expect(action(RECONCILE.id).getAttribute("title")).toBe(
+      "Retry unresolved effect reconciliation: nothing has changed since it failed",
+    );
+    expect(action(ABANDON.id).disabled).toBe(false);
+    expect(
+      screen.getByTestId("failed-workflow-drop").getAttribute("title"),
+    ).toBe("Stop /code");
+  });
+
+  test("a runtime's long label stays whole in the control and its tooltip", () => {
+    // The runtime labels an action with its own state description
+    // (run-view-128, DR-041): the control that carried this one grew
+    // to 844px inside a 349px notice and pushed Drop out of the box.
+    // It now yields with the group and ellipses the label at its
+    // width — the recover journey measures that at 320px — and keeps
+    // the whole of it in the tooltip: the label is still what the
+    // turn will carry, so the reader can read all of it.
+    const LABEL =
+      "Retry: Coder runs the first coding phase: a direct implementation, a new IR, or the next task of an existing IR.";
+    renderFailed({
+      session: {
+        ...SESSION,
+        parked: {
+          ...PARKED_FAILURE,
+          actions: [{ id: "retry:START_CODE", label: LABEL, standing: "ready" }],
+        },
+      },
+    });
+    const control = action("retry:START_CODE");
+    const label = control.querySelector("span")!;
+    expect(label.textContent).toBe(LABEL);
+    expect(control.getAttribute("title")).toBe(LABEL);
+  });
+
+  test("the resumes fold behind one control that opens their whole labels in place", async () => {
+    // DR-117: a run interrupted under a running /shape drew one Retry,
+    // six near-identical "Resume from" rows and Drop. The row keeps the
+    // failure's own act and Drop; the resumes stand behind one control
+    // and read whole once it opens — each still its own control.
+    const RETRY = {
+      id: "retry:START_SHAPE",
+      label: "Retry: Shaper drafts the intent from the request and the specs it cites.",
+      standing: "ready" as const,
+    };
+    const RESUMES = [1, 2, 3, 4, 5, 6].map((n) => ({
+      id: `jump:step${n}`,
+      label: `Resume from: Shaper runs step ${n} of the shaping pass, drafting the intent, checking every spec it cites, and recording what it changed.`,
+      standing: "ready" as const,
+    }));
+    const FOLDED: SessionInfo = {
+      ...SESSION,
+      parked: {
+        reason: "failure",
+        actions: [RETRY, ...RESUMES],
+        ending: { id: "give-up", label: "Stop /shape" },
+      },
+    };
+    const previous = useAppStore.getState();
+    const command = vi.fn(async () => ({}));
+    setClientForTests({ command } as never);
+    useAppStore.setState({
+      sessions: [FOLDED],
+      views: { s1: failedView() },
+      composers: { s1: { queued: [] } },
+      stagedIntents: {},
+      specTrees: {},
+      activeSessionId: undefined,
+    });
+    try {
+      renderFailed({ session: FOLDED });
+      // Folded: the retry in its own label, the one door to the resumes,
+      // Drop with the ending's label — and no resume drawn.
+      expect(
+        screen.getAllByTestId("failed-workflow-action").map((button) => button.getAttribute("data-action-id")),
+      ).toEqual([RETRY.id]);
+      expect(action(RETRY.id).textContent).toBe(RETRY.label);
+      const toggle = screen.getByTestId("failed-workflow-resumes");
+      expect(toggle.textContent).toBe("Resume from an earlier step…");
+      expect(toggle.getAttribute("aria-expanded")).toBe("false");
+      expect(screen.queryByTestId("failed-workflow-resume-list")).toBeNull();
+      expect(screen.getByTestId("failed-workflow-drop").getAttribute("title")).toBe("Stop /shape");
+      // Retry stands before the door, and Drop after it.
+      const row = [RETRY.id, "failed-workflow-resumes", "failed-workflow-drop"].map((id) =>
+        id === RETRY.id ? action(id) : screen.getByTestId(id),
+      );
+      for (let i = 1; i < row.length; i += 1) {
+        expect(row[i - 1].compareDocumentPosition(row[i]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      }
+
+      // Opened in place: the six in the summary's order, each label
+      // whole and set to wrap rather than ellipse, the list bounded to
+      // scroll (run-view-128).
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      const list = screen.getByTestId("failed-workflow-resume-list");
+      expect(screen.getByTestId("failed-workflow").contains(list)).toBe(true);
+      expect(toggle.getAttribute("aria-controls")).toBe(list.id);
+      expect(list.className).toMatch(/\bmax-h-48\b/);
+      expect(list.className).toMatch(/\boverflow-y-auto\b/);
+      const folded = within(list).getAllByTestId("failed-workflow-action");
+      expect(folded.map((button) => button.getAttribute("data-action-id"))).toEqual(RESUMES.map((resume) => resume.id));
+      for (const [i, button] of folded.entries()) {
+        const label = button.querySelector("span")!;
+        expect(label.textContent).toBe(RESUMES[i].label);
+        expect(label.className).not.toMatch(/\btruncate\b/);
+        expect(label.className).toMatch(/\bwhitespace-normal\b/);
+        expect((button as HTMLButtonElement).disabled).toBe(false);
+      }
+      // The retry in the row keeps its ellipsis rule.
+      expect(action(RETRY.id).querySelector("span")!.className).toMatch(/\btruncate\b/);
+
+      // A folded resume is a control of its own: exactly one control
+      // naming its id (run-view-129).
+      await act(async () => fireEvent.click(folded[3]));
+      expect(command).toHaveBeenCalledExactlyOnceWith("session.control", {
+        sessionId: "s1",
+        kind: "recovery",
+        actionId: RESUMES[3].id,
+      });
+    } finally {
+      setClientForTests(undefined);
+      useAppStore.setState(previous, true);
+    }
+  });
+
+  test("where the summary published no controls, Drop stands alone and the composer is the other door", () => {
+    // A session parked before this rule, or one whose controls were
+    // never captured (run-view-128): the notice offers no recovery it
+    // cannot name, and says what does work.
+    renderFailed({ session: SESSION });
+    expect(screen.queryAllByTestId("failed-workflow-action")).toEqual([]);
+    expect(screen.getByTestId("failed-workflow-drop")).toBeTruthy();
+    expect(screen.getByTestId("failed-workflow-next").textContent).toContain(
+      "Send a message to pick it up, or drop the run",
+    );
+    expect(screen.getByTestId("boss-composer")).toBeTruthy();
+  });
+
+  test("the thread draws the failure as a card: what failed, why, and what now", () => {
+    renderFailed();
+    const card = screen.getByTestId("failure-card");
+    // What failed: the run's command and the step it left, humanized
+    // (run-view-59); the raw id and the runtime's own message ride the
+    // tooltip.
+    expect(screen.getByTestId("failure-card-what").textContent).toBe(
+      "/code failed at first phase",
+    );
+    expect(screen.getByTestId("failure-card-why").textContent).toBe(
+      "Committed, but left changes uncommitted: stray-1.txt",
+    );
+    expect(screen.getByTestId("failure-card-next").textContent).toBe(
+      "Commit or discard what is left · Retry unresolved effect reconciliation: nothing has changed since it failed",
+    );
+    expect(card.getAttribute("title")).toBe(
+      "CODE governed outcome remains unresolved: repository-disposition-mismatch · step: firstPhase",
+    );
+    // The bare status line it replaces is gone from the thread.
+    expect(
+      screen
+        .queryAllByTestId("system-line")
+        .some((line) => line.textContent?.includes("workflow failed")),
+    ).toBe(false);
+  });
+
+  function laterTrace(seq: number, sessionId: string, playbookId: string,
+    type: string, payload: Record<string, unknown>): FixtureEntry {
+    return {
+      seq,
+      record: {
+        type: "captain_telemetry", turnId: 30, timestamp: 30_000 + seq,
+        topic: "playbook.trace",
+        payload: { schemaVersion: 3, sessionId, playbookId, depth: 1,
+          sequence: seq, timestamp: 30_000 + seq, type, payload },
+      } as unknown as TmuxPlayRecord,
+    };
+  }
+
+  const DECIDE: PlaybookSummary = { ...CODE, id: "decide", command: "decide" };
+  const laterFailure = (seq: number): FixtureEntry => ({
+    seq,
+    record: { type: "runtime_error", turnId: 30, timestamp: 30_000 + seq,
+      message: "A later workflow failure", data: { cause: { code: "runtime-defect" } },
+    } as unknown as TmuxPlayRecord,
+  });
+  const disposed = laterTrace(801, "t-fail", "code", "session.disposed", {
+    state: { value: "failed", status: "stopped" },
+  });
+
+  test("a historical failure keeps its command and step after a different run succeeds", () => {
+    const view = failedView(MACHINE_RECOVERED, [disposed,
+      laterTrace(802, "t-next", "decide", "session.started", {}),
+      laterTrace(803, "t-next", "decide", "fsm.transition", {
+        from: "designing", to: "done", event: "APPROVED",
+        state: { value: "done", status: "done" },
+      }),
+    ]);
+    renderFailed({ view, session: SESSION, playbooks: [CODE, DECIDE] });
+    expect(screen.getByTestId("failure-card-what").textContent).toBe("/code failed at first phase");
+    expect(screen.getByTestId("failure-card-next").textContent).toBe("Commit or discard what is left");
+    expect(screen.queryByTestId("failed-workflow")).toBeNull();
+  });
+
+  test.each(["same", "different"])("only the current failure in a %s run carries current control standings", (which) => {
+    const same = which === "same";
+    const view = failedView(MACHINE_RECOVERED, [
+      ...(same ? [] : [disposed, laterTrace(802, "t-next", "decide", "session.started", {})]),
+      laterTrace(803, same ? "t-fail" : "t-next", same ? "code" : "decide", "fsm.transition", {
+        from: same ? "firstPhase" : "designing", to: "failed", event: "FAIL",
+        state: { value: "failed", status: "active", tags: ["playbook.parked"] },
+      }),
+      laterFailure(804),
+    ]);
+    renderFailed({ view, playbooks: [CODE, DECIDE] });
+    const cards = screen.getAllByTestId("failure-card");
+    expect(cards).toHaveLength(2);
+    expect(within(cards[0]).getByTestId("failure-card-what").textContent).toBe("/code failed at first phase");
+    expect(within(cards[0]).getByTestId("failure-card-next").textContent).toBe("Commit or discard what is left");
+    expect(within(cards[1]).getByTestId("failure-card-what").textContent).toBe(
+      same ? "/code failed at first phase" : "/decide failed at designing",
+    );
+    expect(within(cards[1]).getByTestId("failure-card-next").textContent).toContain(RECONCILE.label);
+  });
+
+  test("an unassigned failure never borrows a later run's identity or controls", () => {
+    const view = applyRecords(initialSessionView(PLAYERS), [
+      { seq: 1, record: { type: "runtime_error", turnId: 1, timestamp: 1000,
+        message: "No run opened", data: { cause: { code: "runtime-defect" } },
+      } as unknown as TmuxPlayRecord },
+      ...MACHINE_FAILED,
+    ]);
+    renderFailed({ view });
+    const cards = screen.getAllByTestId("failure-card");
+    expect(within(cards[0]).getByTestId("failure-card-what").textContent).toBe("The workflow failed");
+    expect(within(cards[0]).getByTestId("failure-card-next").textContent).not.toContain(RECONCILE.label);
+    expect(within(cards[1]).getByTestId("failure-card-what").textContent).toBe("/code failed at first phase");
+  });
+
+  test("a question summary cannot lend its controls to a traced failure card", () => {
+    renderFailed({ session: { ...PARKED, parked: { ...PARKED_FAILURE, reason: "question" } } });
+    expect(screen.getByTestId("failure-card-what").textContent).toBe("/code failed at first phase");
+    expect(screen.getByTestId("failure-card-next").textContent).toBe("Commit or discard what is left");
+  });
+
+
+
+  test("names no command where none is configured, keeping the run's id in the tooltip", () => {
+    // An identifier is never dressed as a command the reader could
+    // type (run-view-128, DR-010 §2): the words fall back to the plain
+    // sentence and the trace's own id rides the tooltip.
+    renderFailed({ playbooks: [] });
+    expect(screen.getByTestId("failed-workflow-what").textContent).toBe(
+      "The workflow failed and is waiting for you.",
+    );
+    expect(screen.getByTestId("failed-workflow").getAttribute("title")).toBe(
+      "playbook: code · state: failed",
+    );
+  });
+
+  test("activating a control runs it as the next turn, stamping no intent", async () => {
+    const previous = useAppStore.getState();
+    const command = vi.fn(async () => ({}));
+    setClientForTests({ command } as never);
+    useAppStore.setState({
+      sessions: [PARKED],
+      views: { s1: failedView() },
+      composers: { s1: { queued: [] } },
+      stagedIntents: { s1: { intentId: "i1", title: "Address #7" } },
+      specTrees: {},
+      activeSessionId: undefined,
+    });
+    try {
+      const { rerender } = renderFailed();
+      await act(async () => fireEvent.click(action(ABANDON.id)));
+      // run-view-129: the action the Boss chose, named by the id the
+      // summary published — never the first the run advertised, and no
+      // prose for the Captain to interpret.
+      expect(command).toHaveBeenCalledExactlyOnceWith("session.control", {
+        sessionId: "s1",
+        kind: "recovery",
+        actionId: ABANDON.id,
+      });
+      // Nothing else rides the control turn (run-view-129).
+      expect(useAppStore.getState().stagedIntents.s1).toBeUndefined();
+
+      // The turn lands in the thread as the Boss's own message, in the
+      // action's own label.
+      const spoken = failedView([
+        {
+          seq: 800,
+          record: {
+            type: "turn_started",
+            turnId: 17,
+            timestamp: 17_000,
+            turn: { id: 17, prompt: "Retry the failing step" },
+          } as unknown as TmuxPlayRecord,
+        },
+      ]);
+      rerender(
+        <RunView
+          session={PARKED}
+          view={spoken}
+          composer={{ queued: [] }}
+          connected
+          playbooks={[CODE]}
+          onSubmit={async () => {}}
+          onAbort={() => {}}
+          onRemoveQueued={() => {}}
+          onDismissError={() => {}}
+        />,
+      );
+      expect(
+        screen
+          .getAllByTestId("boss-bubble")
+          .some((bubble) => bubble.textContent?.includes("Retry the failing step")),
+      ).toBe(true);
+    } finally {
+      setClientForTests(undefined);
+      useAppStore.setState(previous, true);
+    }
+  });
+
+  test("Drop asks its confirm, and Keep backs out having sent nothing", async () => {
+    const previous = useAppStore.getState();
+    const command = vi.fn(async () => ({}));
+    setClientForTests({ command } as never);
+    useAppStore.setState({
+      sessions: [PARKED],
+      views: { s1: failedView() },
+      composers: { s1: { queued: [] } },
+      stagedIntents: {},
+      specTrees: {},
+      activeSessionId: undefined,
+    });
+    try {
+      renderFailed();
+      // DR-010 §4: ending a run asks in place before it acts.
+      fireEvent.click(screen.getByTestId("failed-workflow-drop"));
+      expect(screen.getByTestId("failed-workflow-confirm-ask")).toBeTruthy();
+      expect(command).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId("failed-workflow-drop-keep"));
+      expect(screen.queryByTestId("failed-workflow-confirm-ask")).toBeNull();
+      expect(command).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByTestId("failed-workflow-drop"));
+      await act(async () =>
+        fireEvent.click(screen.getByTestId("failed-workflow-drop-confirm")),
+      );
+      // run-view-112: the shell's own ending, selected by the id the
+      // summary published.
+      expect(command).toHaveBeenCalledExactlyOnceWith("session.control", {
+        sessionId: "s1",
+        kind: "ending",
+        actionId: "give-up",
+      });
+    } finally {
+      setClientForTests(undefined);
+      useAppStore.setState(previous, true);
+    }
+  });
+
+  test("the busy form keeps the control's box, refuses a second activation, and a refusal shows its cause", async () => {
+    const previous = useAppStore.getState();
+    let refuse!: (error: Error) => void;
+    const command = vi.fn(
+      () => new Promise<unknown>((_resolve, reject) => { refuse = reject; }),
+    );
+    setClientForTests({ command } as never);
+    useAppStore.setState({
+      sessions: [PARKED],
+      views: { s1: failedView() },
+      composers: { s1: { draft: "Keep my draft", queued: [] } },
+      stagedIntents: {},
+      specTrees: {},
+      activeSessionId: undefined,
+    });
+    try {
+      renderFailed({
+        composer: { draft: "Keep my draft", queued: [] },
+        onDraftChange: () => {},
+      });
+      const abandon = action(ABANDON.id);
+      fireEvent.click(abandon);
+      fireEvent.click(abandon);
+      expect(command).toHaveBeenCalledOnce();
+      // The label stays in the box, invisible, holding the width the
+      // busy form is laid over (run-view-130).
+      expect(abandon.textContent).toBe(`${ABANDON.label}Working…`);
+      expect(abandon.getAttribute("aria-busy")).toBe("true");
+      expect(abandon.disabled).toBe(true);
+      // run-view-130: no control may be activated while the turn this
+      // one started is in flight.
+      expect((screen.getByTestId("failed-workflow-drop") as HTMLButtonElement).disabled).toBe(true);
+      expect(screen.getByRole("status").textContent).toContain(
+        "Running the workflow's control",
+      );
+      await act(async () => {
+        refuse(new Error("A turn is already running."));
+        await Promise.resolve();
+      });
+      expect(screen.getByTestId("failed-workflow-error").textContent).toContain(
+        "A turn is already running.",
+      );
+      // The refusal costs neither the transcript nor the draft.
+      expect(systemLine("◇ /code started")).toBeTruthy();
+      expect(screen.getByDisplayValue("Keep my draft")).toBeTruthy();
+      expect(screen.getByTestId("failed-workflow")).toBeTruthy();
+    } finally {
+      setClientForTests(undefined);
+      useAppStore.setState(previous, true);
+    }
+  });
+
+  test("the control is disabled while disconnected and while a turn is active", () => {
+    const { rerender } = renderFailed({ connected: false });
+    const disconnected = action(ABANDON.id);
+    expect(disconnected.disabled).toBe(true);
+    expect(disconnected.getAttribute("title")).toBe("Reconnecting…");
+    const working = failedView([
+      {
+        seq: 801,
+        record: {
+          type: "turn_started",
+          turnId: 18,
+          timestamp: 18_000,
+          turn: { id: 18, prompt: "still going" },
+        } as unknown as TmuxPlayRecord,
+      },
+    ]);
+    rerender(
+      <RunView
+        session={PARKED}
+        view={working}
+        composer={{ queued: [] }}
+        connected
+        playbooks={[CODE]}
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    const busy = action(ABANDON.id);
+    expect(busy.disabled).toBe(true);
+    expect(busy.getAttribute("title")).toBe("Wait for the running turn");
+  });
+
+  test("a restore's recorded position stands the run where it was restored, its call no longer running", () => {
+    // Playbook's report moves no traced state (DR-088): without the
+    // core's record the card would go on running the coder's call the
+    // process died in, and no notice would stand.
+    const interrupted = applyRecords(initialSessionView(PLAYERS), MACHINE_INTERRUPTED);
+    expect(interrupted.frames.map((frame) => [frame.active, frame.activePlayers?.[0]?.running])).toEqual([["firstPhase", true]]);
+    expect(interrupted.players["dev.coder"]?.running).toBe(true);
+    const view = applyRecords(initialSessionView(PLAYERS), [...MACHINE_INTERRUPTED, ...machineRestored()]);
+    expect(view.frames.map((frame) => [frame.traceSessionId, frame.active, frame.activePlayers])).toEqual([["t-stop", "failed", undefined]]);
+    // The call the process died in no longer runs on its lane either
+    // (run-view-74): no running mark, no working reading.
+    expect(Object.values(view.players).filter((lane) => lane.running)).toEqual([]);
+    // The report starts the lost turn again under its own id and
+    // message: the message was sent once, and reads once.
+    expect(view.captain.filter((line) => line.kind === "boss").map((line) => [line.turnId, line.text])).toEqual([
+      [21, "/code fix the refresh path"],
+    ]);
+    renderFailed({ view });
+    expect(screen.queryByTestId("player-running")).toBeNull();
+    expect(screen.queryByTestId("player-working")).toBeNull();
+    expect(screen.getAllByTestId("boss-bubble")).toHaveLength(1);
+    expect(screen.getByText(/The process stopped during the first phase/)).toBeTruthy();
+    expect(screen.getByTestId("failed-workflow-what").textContent).toBe(
+      "The /code workflow failed and is waiting for you.",
+    );
+    expect(screen.getByTestId("failed-workflow").getAttribute("title")).toBe("state: failed");
+    // Why and what now, from the cause the recorded position carries
+    // (run-view-147): the card at the position's place and the notice
+    // phrase it alike.
+    const why = "A Playbook defect: The process stopped during this step. Review the recorded work before choosing how to continue.";
+    expect(screen.getByTestId("failed-workflow-why").textContent).toBe(why);
+    expect(screen.getByTestId("failure-card-what").textContent).toBe("/code failed at first phase");
+    expect(screen.getByTestId("failure-card-why").textContent).toBe(why);
+    expect(screen.getByTestId("failure-card-next").textContent).toContain("Report it");
+    // The controls are the ones the restore's settlement published.
+    expect(
+      screen.getAllByTestId("failed-workflow-action").map((button) => button.getAttribute("data-action-id")),
+    ).toEqual([RECONCILE.id, ABANDON.id]);
+  });
+
+  test("a restored position leaves a run already parked in its failure state with the account it had", () => {
+    // The Boss stopped the run himself; a later message was lost and
+    // restored. The position moves no run into failure, so it draws no
+    // second card, and the notice keeps the cause the stop reported.
+    const view = applyRecords(initialSessionView(PLAYERS), [
+      ...MACHINE_FAILED,
+      ...machineRestored([{
+        sessionId: "t-fail",
+        playbookId: "code",
+        depth: 1,
+        state: { value: "failed", activeStateIds: ["failed"], tags: ["playbook.parked"], status: "active", quiescent: true, stateId: "failed" },
+        pendingBossQuestions: [],
+        cause: { code: "runtime-defect", evidence: { reason: "not this one" } },
+      }]),
+    ]);
+    const before = applyRecords(initialSessionView(PLAYERS), MACHINE_FAILED);
+    expect(view.captain.filter((line) => line.kind === "status" || line.kind === "error").length)
+      .toBe(before.captain.filter((line) => line.kind === "status" || line.kind === "error").length);
+    renderFailed({ view });
+    expect(screen.getByTestId("failed-workflow")).toBeTruthy();
+    expect(screen.getByTestId("failed-workflow-why").textContent).not.toContain("not this one");
+  });
+
+  test("a restored position holding no run settles the stopped one unfinished and stands no notice", () => {
+    const view = applyRecords(initialSessionView(PLAYERS), [...MACHINE_INTERRUPTED, ...machineRestored([])]);
+    expect(view.frames).toEqual([]);
+    expect(view.captain.filter((line) => line.kind === "machine").map((line) => line.frame?.outcome)).toEqual(["stopped"]);
+    renderFailed({ view, session: SESSION });
+    expect(screen.queryByTestId("failed-workflow")).toBeNull();
+  });
+
+  test("a restored position raises the question it holds, and one holding none clears the wait", () => {
+    const question = { questionId: "firstPhase", asker: { kind: "role", roleId: "dev.coder" }, question: "Should I also migrate the legacy sessions?" };
+    const asking = {
+      sessionId: "t-ask",
+      playbookId: "code",
+      depth: 1,
+      state: { value: "awaitBossReply", activeStateIds: ["awaitBossReply"], tags: ["playbook.parked"], status: "active", quiescent: true, stateId: "awaitBossReply" },
+      pendingBossQuestions: [question],
+    };
+    const raised = applyRecords(initialSessionView(PLAYERS), [...MACHINE_INTERRUPTED, ...machineRestored([asking])]);
+    expect(raised.pendingQuestion).toBe(question.question);
+    expect(raised.pendingQuestionPlayer).toBe("dev.coder");
+    expect(raised.frames.map((frame) => [frame.traceSessionId, frame.active])).toEqual([["t-ask", "awaitBossReply"]]);
+    const cleared = applyRecords(initialSessionView(PLAYERS), [...MACHINE_ASKED, ...machineRestored([])]);
+    expect(applyRecords(initialSessionView(PLAYERS), MACHINE_ASKED).pendingQuestion).toBeDefined();
+    expect(cleared.pendingQuestion).toBeUndefined();
+  });
+
+  test("the notice leaves when the run leaves its failure state and stands when a turn only answers", () => {
+    const props = {
+      session: SESSION,
+      composer: { queued: [] },
+      connected: true,
+      playbooks: [CODE],
+      onSubmit: async () => {},
+      onAbort: () => {},
+      onRemoveQueued: () => {},
+      onDismissError: () => {},
+    };
+    const { rerender } = render(
+      <RunView {...props} view={failedView(MACHINE_ANSWERED)} />,
+    );
+    // A Captain reply answers without recovering: the way back stands.
+    expect(screen.getByText("The coder could not apply the patch.")).toBeTruthy();
+    expect(screen.getByTestId("failed-workflow")).toBeTruthy();
+    rerender(
+      <RunView {...props} view={failedView(MACHINE_ANSWERED, MACHINE_RECOVERED)} />,
+    );
+    expect(screen.queryByTestId("failed-workflow")).toBeNull();
+  });
+
+  test("an uncertain session shows the interrupted turn instead, and external ownership shows neither", () => {
+    const uncertain = {
+      ...SESSION,
+      live: false,
+      continuable: false,
+      recovery: { state: "uncertain" as const, input: "Saved request", discardable: true },
+    };
+    const { rerender } = renderFailed({ session: uncertain, readOnly: true });
+    expect(screen.getByRole("region", { name: "Interrupted turn" })).toBeTruthy();
+    expect(screen.queryByTestId("failed-workflow")).toBeNull();
+    rerender(
+      <RunView
+        session={{ ...SESSION, externalWriter: "active" }}
+        view={failedView()}
+        composer={{ queued: [] }}
+        connected
+        playbooks={[CODE]}
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    expect(screen.queryByTestId("failed-workflow")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Interrupted turn" })).toBeNull();
+  });
+
+  test("a run parked on a question carries Drop alone, and its Drop takes the verdict", async () => {
+    const previous = useAppStore.getState();
+    const command = vi.fn(async (type: string) =>
+      type === "ledger.get" ? { intents: [], attention: [], badge: 0 } : {},
+    );
+    setClientForTests({ command, subscribe: vi.fn(async () => {}) } as never);
+    const asked = applyRecords(initialSessionView(PLAYERS), MACHINE_ASKED);
+    useAppStore.setState({
+      sessions: [PARKED],
+      views: { s1: asked },
+      composers: { s1: { queued: [] } },
+      stagedIntents: {},
+      specTrees: {},
+      activeSessionId: undefined,
+      ledger: {
+        intents: [
+          {
+            intent: makeIntent({
+              id: "i1",
+              dispatched: { sessionId: "s1", turnId: 20, at: 1 },
+            }),
+            state: "interrupted",
+            reason: "question",
+          },
+        ],
+        attention: [],
+        badge: 0,
+      },
+    });
+    try {
+      renderFailed({ view: asked });
+      const notice = screen.getByTestId("failed-workflow");
+      // The park the run stands in is what the words name (DR-069):
+      // no recovery answers a question, so Retry is absent rather than
+      // offered and refused (run-view-128).
+      expect(screen.getByTestId("failed-workflow-what").textContent).toBe(
+        "The /code workflow is waiting for your answer.",
+      );
+      expect(notice.textContent).toContain("Answer below, or drop the run");
+      expect(notice.getAttribute("title")).toBe("state: awaitBossReply");
+      // No recovery answers a question, so none is drawn (run-view-128).
+      expect(screen.queryAllByTestId("failed-workflow-action")).toEqual([]);
+      // The composer is the question's other door (run-view-8).
+      expect(screen.getByTestId("boss-composer")).toBeTruthy();
+
+      // DR-010 §4: ending a run asks in place before it acts.
+      fireEvent.click(screen.getByTestId("failed-workflow-drop"));
+      expect(screen.getByTestId("failed-workflow-confirm-ask")).toBeTruthy();
+      expect(command).not.toHaveBeenCalled();
+      await act(async () =>
+        fireEvent.click(screen.getByTestId("failed-workflow-drop-confirm")),
+      );
+      // One ruling, one command (run-view-112): the close is the whole
+      // act, the core ending the run on its way to the verdict — the
+      // notice sends no control of its own.
+      expect(
+        command.mock.calls.filter(([type]) => type === "intent.close"),
+      ).toEqual([["intent.close", { intentId: "i1", as: "dropped" }]]);
+      expect(
+        command.mock.calls.filter(([type]) => type === "session.control"),
+      ).toEqual([]);
+    } finally {
+      setClientForTests(undefined);
+      useAppStore.setState(previous, true);
+    }
+  });
+
+  test("a refused close leaves its cause beside the notice, which stands", async () => {
+    const previous = useAppStore.getState();
+    const command = vi.fn(async (type: string) => {
+      if (type === "intent.close") {
+        throw new Error("the run is still parked, so the intent stays open");
+      }
+      return { intents: [], attention: [], badge: 0 };
+    });
+    setClientForTests({ command, subscribe: vi.fn(async () => {}) } as never);
+    const asked = applyRecords(initialSessionView(PLAYERS), MACHINE_ASKED);
+    useAppStore.setState({
+      sessions: [PARKED],
+      views: { s1: asked },
+      composers: { s1: { queued: [] } },
+      stagedIntents: {},
+      specTrees: {},
+      activeSessionId: undefined,
+      ledger: {
+        intents: [
+          {
+            intent: makeIntent({
+              id: "i1",
+              dispatched: { sessionId: "s1", turnId: 20, at: 1 },
+            }),
+            state: "interrupted",
+            reason: "question",
+          },
+        ],
+        attention: [],
+        badge: 0,
+      },
+    });
+    try {
+      renderFailed({ view: asked });
+      fireEvent.click(screen.getByTestId("failed-workflow-drop"));
+      await act(async () =>
+        fireEvent.click(screen.getByTestId("failed-workflow-drop-confirm")),
+      );
+      // The busy form stood until the one command resolved, and its
+      // refusal reads where the act was taken (run-view-130).
+      expect(screen.getByTestId("failed-workflow-error").textContent).toContain(
+        "the run is still parked",
+      );
+      expect(screen.getByTestId("failed-workflow")).toBeTruthy();
+      expect(
+        (screen.getByTestId("failed-workflow-drop") as HTMLButtonElement)
+          .disabled,
+      ).toBe(false);
+    } finally {
+      setClientForTests(undefined);
+      useAppStore.setState(previous, true);
+    }
+  });
+
+  test("a parked run the session serves no intent for closes nothing", async () => {
+    const previous = useAppStore.getState();
+    const command = vi.fn(async () => ({}));
+    setClientForTests({ command, subscribe: vi.fn(async () => {}) } as never);
+    useAppStore.setState({
+      sessions: [PARKED],
+      views: { s1: failedView() },
+      composers: { s1: { queued: [] } },
+      stagedIntents: {},
+      specTrees: {},
+      activeSessionId: undefined,
+      ledger: { intents: [], attention: [], badge: 0 },
+    });
+    try {
+      renderFailed();
+      fireEvent.click(screen.getByTestId("failed-workflow-drop"));
+      await act(async () =>
+        fireEvent.click(screen.getByTestId("failed-workflow-drop-confirm")),
+      );
+      // Ending the run is the whole of the act, so it is the whole of
+      // what is sent (run-view-112), by the ending's published id.
+      expect(command).toHaveBeenCalledExactlyOnceWith("session.control", {
+        sessionId: "s1",
+        kind: "ending",
+        actionId: "give-up",
+      });
+    } finally {
+      setClientForTests(undefined);
+      useAppStore.setState(previous, true);
+    }
+  });
+});
+
+describe("run-view-133: at rest the chip reads the leaf, not the last reporter", () => {
+  const CODE: PlaybookSummary = {
+    id: "code",
+    from: "@sublang/playbook/code/registry",
+    command: "code",
+    intent: "Implement a change",
+    roles: {},
+  };
+
+  function props(view: SessionView) {
+    return {
+      session: SESSION,
+      view,
+      composer: { queued: [] },
+      connected: true,
+      playbooks: [CODE],
+      onSubmit: async () => {},
+      onAbort: () => {},
+      onRemoveQueued: () => {},
+      onDismissError: () => {},
+    };
+  }
+
+  function viewOf(...more: FixtureEntry[][]) {
+    return applyRecords(
+      initialSessionView(PLAYERS),
+      [MACHINE_FAILED, ...more].flat(),
+    );
+  }
+
+  test("the parked run holds the chip red, a turn that only answers keeps it, and leaving the failure gives the reported state back", () => {
+    const view = viewOf();
+    // The stream really did leave the shell's rest state behind: the
+    // Captain's own controller reported last, on the leaf's topic.
+    expect(view.fsmState).toBe("hub");
+    const { rerender } = render(<RunView {...props(view)} />);
+    const parked = screen.getByTestId("state-chip");
+    expect(parked.textContent).toBe("failed");
+    expect(parked.className).toContain("red");
+    expect(parked.getAttribute("title")).toBe("state: failed");
+    rerender(<RunView {...props(viewOf(MACHINE_ANSWERED))} />);
+    expect(screen.getByTestId("state-chip").textContent).toBe("failed");
+    rerender(<RunView {...props(viewOf(MACHINE_ANSWERED, MACHINE_RECOVERED))} />);
+    const chip = screen.getByTestId("state-chip");
+    expect(chip.textContent).toBe("first phase");
+    expect(chip.className).not.toContain("red");
+    expect(chip.getAttribute("title")).toBe("state: firstPhase");
+  });
+});
+
+describe("run-view-138/139/140: an agent's settings for one conversation", () => {
+  const SUMMARY = {
+    path: "/tmp/playbook.config.yaml",
+    captain: { adapter: "claude" as const, model: "claude-captain", effort: "high" },
+    players: [
+      { id: "dev.coder", agent: { adapter: "claude" as const, model: "claude-test" }, display: "claude-test", boundBy: ["code.coder"] },
+      { id: "dev.reviewer", agent: { adapter: "codex" as const }, display: "codex", boundBy: ["review.reviewer"] },
+    ],
+    playbooks: [
+      { id: "code", from: "@sublang/playbook/code/registry", command: "/code", intent: "write code",
+        roles: { coder: { playerId: "dev.coder", effort: "low" as const, display: "claude-test @ low" } } },
+    ],
+  };
+
+  /** `defaultModel` is the model the runtime reports running when none
+   * is configured, where the catalog reports one. */
+  function mount(agentSettings?: SessionInfo["agentSettings"], defaultModel?: string) {
+    const previous = useAppStore.getState();
+    const command = vi.fn(async (name: string, payload?: { adapter?: string }) =>
+      name === "agent.options"
+        ? { adapter: "claude", effortValues: ["low", "high", "max"], fastModeSupported: true,
+            // Cligent serves a subagent model on Claude alone (DR-093).
+            subagentModelSupported: payload?.adapter === "claude",
+            subagentEffortValues: payload?.adapter === "claude" ? ["low", "medium", "high", "max"] : [],
+            discovery: { status: "available", ...(defaultModel ? { defaultModel } : {}), models: [
+              { id: "claude-opus", name: "Opus" },
+              { id: "claude-test", name: "Test", resolvedModel: "claude-test-5-5" },
+            ] } }
+        : { ...SESSION, ...(agentSettings ? { agentSettings } : {}) });
+    setClientForTests({ command } as never);
+    useAppStore.setState({
+      sessions: [{ ...SESSION, ...(agentSettings ? { agentSettings } : {}) }],
+      activeSessionId: SESSION.id,
+      views: { s1: applyRecords(initialSessionView(PLAYERS), CALLED_LANES) },
+      composers: { s1: { queued: [] } },
+      collapsedLanes: {},
+      configState: { status: "valid", summary: SUMMARY, seeded: false },
+      specTrees: {},
+      ledger: undefined,
+      stagedIntents: {},
+    } as never);
+    const session = { ...SESSION, ...(agentSettings ? { agentSettings } : {}) };
+    const result = render(
+      <RunView
+        session={session}
+        view={applyRecords(initialSessionView(PLAYERS), TURN_ONE_REVIEWED)}
+        composer={{ queued: [] }}
+        connected
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    return { command, restore: () => { useAppStore.setState(previous, true); setClientForTests(undefined); }, ...result };
+  }
+
+  test("one agent's chip opens that agent's settings and no one else's", async () => {
+    const { command, restore } = mount();
+    // Each agent reads its own configured value on its own pane.
+    expect(screen.getByTestId("agent-chip-captain").textContent).toMatch("claude-captain @ high");
+    expect(screen.getByTestId("agent-chip-dev.coder").textContent).toMatch("claude-test");
+    expect(screen.getByTestId("agent-chip-captain").getAttribute("data-changed")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("agent-chip-dev.coder"));
+    const editor = await screen.findByTestId("agent-settings-dev.coder");
+    // The editor is this one agent's: its name, its three fields, and
+    // nothing belonging to any other agent (DR-068).
+    expect(editor.textContent).toMatch("dev.coder");
+    expect(editor.textContent).not.toMatch("dev.reviewer");
+    expect(editor.textContent).not.toMatch("Captain");
+    expect(screen.queryByTestId("agent-settings-captain")).toBeNull();
+    expect(within(editor).getByTestId("agent-dev.coder-model-mode")).toBeTruthy();
+    expect(within(editor).getByTestId("agent-dev.coder-effort-mode")).toBeTruthy();
+    // Where the change lands, and the binding it will run alike.
+    expect(within(editor).getByTestId("agent-scope-dev.coder").textContent)
+      .toMatch(/This conversation only/);
+    expect(within(editor).getByTestId("agent-roles-dev.coder").textContent).toMatch(/code\.coder/);
+    expect(command).not.toHaveBeenCalledWith("config.edit", expect.anything());
+    restore();
+  });
+
+  test("nothing offers a roster, a count, or a name for the act", async () => {
+    const { restore } = mount({ "dev.coder": { model: "claude-opus" }, captain: { fastMode: true } });
+    // The view carries no session-wide control and no aggregate count.
+    expect(screen.queryByTestId("session-tuning-control")).toBeNull();
+    expect(screen.queryByTestId("session-tuning")).toBeNull();
+    fireEvent.click(screen.getByTestId("agent-chip-dev.coder"));
+    const editor = await screen.findByTestId("agent-settings-dev.coder");
+    // Nor any word for it beyond the settings the product already has.
+    expect(document.body.textContent).not.toMatch(/\bTun(e|ing)\b/);
+    expect(editor.textContent).not.toMatch(/\bTun(e|ing)\b/);
+    restore();
+  });
+
+  test("saving sends one agent command, and the chip reads the choice at once", async () => {
+    const { command, restore } = mount();
+    fireEvent.click(screen.getByTestId("agent-chip-captain"));
+    await screen.findByTestId("agent-settings-captain");
+    fireEvent.click(screen.getByTestId("agent-save-captain"));
+    await waitFor(() => expect(command).toHaveBeenCalled());
+    const calls = command.mock.calls as unknown as [string, Record<string, unknown>][];
+    expect(calls.map(([name]) => name)).toContain("session.agent.set");
+    expect(calls.every(([name]) => name !== "config.edit")).toBe(true);
+    const [, payload] = calls.find(([name]) => name === "session.agent.set")!;
+    expect(payload).toMatchObject({ sessionId: "s1", agentId: "captain" });
+    restore();
+  });
+
+  test("a changed agent says so on its own chip", () => {
+    const { restore } = mount({ "dev.coder": { model: "claude-opus", effort: "max" }, captain: { fastMode: true } });
+    const chip = screen.getByTestId("agent-chip-dev.coder");
+    expect(chip.textContent).toMatch("claude-opus @ max");
+    expect(chip.getAttribute("data-changed")).toBe("true");
+    // The mark is in the accessible name too, never color alone.
+    expect(chip.getAttribute("aria-label")).toMatch(/changed for this conversation/);
+    expect(screen.getByTestId("agent-fast-mode-captain")).toBeTruthy();
+    // An untouched agent says nothing of the kind.
+    expect(screen.getByTestId("agent-chip-dev.reviewer").getAttribute("data-changed")).toBeNull();
+    restore();
+  });
+
+  test("the inherit choice names the configured model as the runtime reports it", async () => {
+    const { restore } = mount();
+    fireEvent.click(screen.getByTestId("agent-chip-dev.coder"));
+    const editor = await screen.findByTestId("agent-settings-dev.coder");
+    const mode = within(editor).getByTestId("agent-dev.coder-model-mode") as HTMLSelectElement;
+    // Once the runtime's catalog is in, the configured alias reads as
+    // its name and the model it resolves to (run-view-138, DR-091).
+    await waitFor(() => expect(mode.options[0]?.textContent).toBe("from Settings (Test · claude-test-5-5)"));
+    restore();
+  });
+
+  test.each([
+    { defaultModel: "claude-test", reads: "from Settings (Provider default · Test · claude-test-5-5)" },
+    { defaultModel: "opus[1m]", reads: "from Settings (Provider default · opus[1m])" },
+    { defaultModel: undefined, reads: "from Settings (Provider default)" },
+  ])("an unset configured model is inherited as the provider's default ($defaultModel)", async ({ defaultModel, reads }) => {
+    // The reviewer's block sets no model: it runs the provider's default.
+    const { restore } = mount(undefined, defaultModel);
+    fireEvent.click(screen.getByTestId("agent-chip-dev.reviewer"));
+    const editor = await screen.findByTestId("agent-settings-dev.reviewer");
+    await waitFor(() => expect(within(editor).queryByText("Loading model options…")).toBeNull());
+    const mode = within(editor).getByTestId("agent-dev.reviewer-model-mode") as HTMLSelectElement;
+    // Named as the model field names its empty value, never bare: the
+    // words, then the model the runtime runs by default where the
+    // catalog reports one, by the same rule (run-view-138, settings-38).
+    expect(mode.options[0]?.textContent).toBe(reads);
+    restore();
+  });
+
+  test("an unset configured effort is inherited as the provider's default", async () => {
+    const { restore } = mount();
+    // The Captain's effort is configured, and named as it is.
+    fireEvent.click(screen.getByTestId("agent-chip-captain"));
+    const captain = await screen.findByTestId("agent-settings-captain");
+    expect((within(captain).getByTestId("agent-captain-effort-mode") as HTMLSelectElement).options[0]?.textContent)
+      .toBe("from Settings (high)");
+    fireEvent.click(within(captain).getByRole("button", { name: "Cancel" }));
+    // The reviewer's block sets none: it reads the words the model
+    // field gives the provider's default, never bare (run-view-138).
+    fireEvent.click(screen.getByTestId("agent-chip-dev.reviewer"));
+    const reviewer = await screen.findByTestId("agent-settings-dev.reviewer");
+    expect((within(reviewer).getByTestId("agent-dev.reviewer-effort-mode") as HTMLSelectElement).options[0]?.textContent)
+      .toBe("from Settings (Provider default)");
+    restore();
+  });
+
+  test("the inherited provider's default reads in the reader's language", async () => {
+    // A requirement on a phrase holds in each offered language
+    // (localization-1): the words and their brackets are the catalog's,
+    // the model the runtime's own.
+    activateLanguage("zh");
+    const { restore } = mount(undefined, "claude-test");
+    try {
+      fireEvent.click(screen.getByTestId("agent-chip-dev.reviewer"));
+      const editor = await screen.findByTestId("agent-settings-dev.reviewer");
+      const mode = within(editor).getByTestId("agent-dev.reviewer-model-mode") as HTMLSelectElement;
+      await waitFor(() => expect(mode.options[0]?.textContent).toBe("取自设置（服务商默认 · Test · claude-test-5-5）"));
+    } finally {
+      restore();
+      activateLanguage("en");
+    }
+  });
+
+  test("Use default returns the whole agent, and read-only reads only", async () => {
+    const { command, restore } = mount({ "dev.coder": { model: "claude-opus" } });
+    fireEvent.click(screen.getByTestId("agent-chip-dev.coder"));
+    await screen.findByTestId("agent-settings-dev.coder");
+    fireEvent.click(screen.getByTestId("agent-default-dev.coder"));
+    fireEvent.click(screen.getByTestId("agent-save-dev.coder"));
+    await waitFor(() => expect(command).toHaveBeenCalled());
+    const [, payload] = (command.mock.calls as unknown as [string, Record<string, unknown>][])
+      .find(([name]) => name === "session.agent.set")!;
+    expect(payload).toMatchObject({ agentId: "dev.coder", model: null, subagentModel: null, effort: null, fastMode: null });
+    restore();
+  });
+
+  test("the subagent model is chosen in the editor and saved with the rest, where the adapter serves one (DR-093)", async () => {
+    const { command, restore } = mount();
+    // The codex reviewer is offered none.
+    fireEvent.click(screen.getByTestId("agent-chip-dev.reviewer"));
+    const reviewer = await screen.findByTestId("agent-settings-dev.reviewer");
+    await waitFor(() => expect(within(reviewer).queryByText("Loading model options…")).toBeNull());
+    expect(within(reviewer).queryByTestId("agent-dev.reviewer-subagent-model-mode")).toBeNull();
+    fireEvent.click(within(reviewer).getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(screen.getByTestId("agent-chip-dev.coder"));
+    const editor = await screen.findByTestId("agent-settings-dev.coder");
+    const mode = await within(editor).findByTestId("agent-dev.coder-subagent-model-mode") as HTMLSelectElement;
+    // [run-view-138] the configured value named — unset, "Same as agent"
+    // — and "Off" offered only while it stands (DR-095).
+    expect([...mode.options].map((option) => option.textContent)).toEqual(["from Settings (Same as agent)", "pin a value…"]);
+    fireEvent.change(mode, { target: { value: "pin" } });
+    fireEvent.change(within(editor).getByTestId("agent-dev.coder-subagent-model-value"), { target: { value: "claude-opus" } });
+    fireEvent.click(screen.getByTestId("agent-save-dev.coder"));
+    await waitFor(() => expect((command.mock.calls as unknown as [string][]).some(([name]) => name === "session.agent.set")).toBe(true));
+    const [, payload] = (command.mock.calls as unknown as [string, Record<string, unknown>][])
+      .find(([name]) => name === "session.agent.set")!;
+    expect(payload).toMatchObject({ agentId: "dev.coder", subagentModel: "claude-opus", model: null, effort: null, fastMode: null });
+    restore();
+  });
+
+  test("the subagent effort stands beside the subagent model, Agent chooses by default, and saves with the rest (DR-095)", async () => {
+    const { command, restore } = mount();
+    // The codex reviewer is offered neither subagent field.
+    fireEvent.click(screen.getByTestId("agent-chip-dev.reviewer"));
+    const reviewer = await screen.findByTestId("agent-settings-dev.reviewer");
+    await waitFor(() => expect(within(reviewer).queryByText("Loading model options…")).toBeNull());
+    expect(within(reviewer).queryByTestId("agent-dev.reviewer-subagent-effort-mode")).toBeNull();
+    fireEvent.click(within(reviewer).getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(screen.getByTestId("agent-chip-dev.coder"));
+    const editor = await screen.findByTestId("agent-settings-dev.coder");
+    const mode = await within(editor).findByTestId("agent-dev.coder-subagent-effort-mode") as HTMLSelectElement;
+    // [run-view-138] each model beside its effort, in one paired grid.
+    const rows = within(editor).getByTestId("agent-dev.coder-tuning-rows");
+    expect(rows.className).toContain("@xs:grid-cols-2");
+    expect([...rows.querySelectorAll("select[data-testid$='-mode']")].map((select) => select.getAttribute("data-testid"))).toEqual([
+      "agent-dev.coder-model-mode", "agent-dev.coder-effort-mode", "agent-dev.coder-subagent-model-mode", "agent-dev.coder-subagent-effort-mode",
+    ]);
+    // [run-view-138] an unset configured effort is the agent's choice,
+    // which is also the provider-default choice.
+    expect([...mode.options].map((option) => option.textContent)).toEqual([
+      "from Settings (Agent chooses)", "Agent chooses", "pin a value…",
+    ]);
+    fireEvent.change(mode, { target: { value: "pin" } });
+    const pinned = within(editor).getByTestId("agent-dev.coder-subagent-effort-value") as HTMLSelectElement;
+    // [run-view-140] the adapter's subagent efforts, no orchestration value.
+    expect([...pinned.options].map((option) => option.value)).toEqual(["", "low", "medium", "high", "max"]);
+    fireEvent.change(pinned, { target: { value: "medium" } });
+    fireEvent.click(screen.getByTestId("agent-save-dev.coder"));
+    await waitFor(() => expect((command.mock.calls as unknown as [string][]).some(([name]) => name === "session.agent.set")).toBe(true));
+    const [, payload] = (command.mock.calls as unknown as [string, Record<string, unknown>][])
+      .find(([name]) => name === "session.agent.set")!;
+    expect(payload).toMatchObject({ agentId: "dev.coder", subagentEffort: "medium", subagentModel: null, model: null, effort: null, fastMode: null });
+    restore();
+  });
+
+  test("a changed subagent effort marks the chip changed and leaves its reading alone (DR-095)", () => {
+    const { restore } = mount({ "dev.coder": { subagentEffort: "max" } });
+    const chip = screen.getByTestId("agent-chip-dev.coder");
+    // [run-view-139] the chip never reads the subagent effort.
+    expect(chip.textContent).toBe("claude-test");
+    expect(chip.getAttribute("aria-label")).not.toMatch(/max/);
+    expect(chip.getAttribute("data-changed")).toBe("true");
+    expect(chip.getAttribute("aria-label")).toMatch(/changed for this conversation/);
+    restore();
+  });
+
+  test("a changed subagent model marks the chip changed and leaves its reading alone (DR-093)", () => {
+    const { restore } = mount({ "dev.coder": { subagentModel: "claude-opus" } });
+    const chip = screen.getByTestId("agent-chip-dev.coder");
+    // [run-view-139] the chip reads adapter, model and effort, never the subagent model.
+    expect(chip.textContent).toBe("claude-test");
+    expect(chip.getAttribute("aria-label")).not.toMatch(/claude-opus/);
+    // [run-view-139] a changed field still counts the chip changed.
+    expect(chip.getAttribute("data-changed")).toBe("true");
+    expect(chip.getAttribute("aria-label")).toMatch(/changed for this conversation/);
+    restore();
+  });
+
+  test("a conversation in use elsewhere reads its agents without writing them", async () => {
+    const previous = useAppStore.getState();
+    setClientForTests({ command: vi.fn(async (name: string) =>
+      name === "agent.options"
+        ? { adapter: "claude", effortValues: ["low"], fastModeSupported: false, discovery: { status: "unavailable", reason: "no runtime" } }
+        : ({} as never)) } as never);
+    useAppStore.setState({
+      sessions: [SESSION], activeSessionId: SESSION.id,
+      views: { s1: applyRecords(initialSessionView(PLAYERS), CALLED_LANES) }, composers: { s1: { queued: [] } },
+      collapsedLanes: {}, configState: { status: "valid", summary: SUMMARY, seeded: false },
+      specTrees: {}, ledger: undefined, stagedIntents: {},
+    } as never);
+    render(
+      <RunView
+        session={{ ...SESSION, live: false, externalWriter: "active" }}
+        view={applyRecords(initialSessionView(PLAYERS), TURN_ONE_REVIEWED)}
+        composer={{ queued: [] }}
+        connected
+        readOnly
+        onSubmit={async () => {}}
+        onAbort={() => {}}
+        onRemoveQueued={() => {}}
+        onDismissError={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("agent-chip-dev.coder"));
+    const editor = await screen.findByTestId("agent-settings-dev.coder");
+    expect(editor.textContent).toMatch(/read only/);
+    expect(within(editor).queryByTestId("agent-save-dev.coder")).toBeNull();
+    useAppStore.setState(previous, true);
+    setClientForTests(undefined);
+  });
+});
+
+
+describe("run-view-152: a chip names the model its runtime reported", () => {
+  const SUMMARY = {
+    path: "/tmp/playbook.config.yaml",
+    captain: { adapter: "claude" as const, model: "claude-captain", effort: "high" },
+    players: [
+      { id: "dev.coder", agent: { adapter: "claude" as const, model: "opus" }, display: "opus", boundBy: ["code.coder"] },
+      { id: "dev.reviewer", agent: { adapter: "codex" as const }, display: "codex", boundBy: ["review.reviewer"] },
+    ],
+    playbooks: [],
+  };
+  const REPORTED: SessionInfo["agentReportedModels"] = {
+    captain: { model: "claude-opus-5-5", settings: { adapter: "claude", model: "claude-captain" } },
+    "dev.reviewer": { model: "gpt-5.6-sol", settings: { adapter: "codex", model: false } },
+  };
+  let previous: ReturnType<typeof useAppStore.getState>;
+  beforeEach(() => {
+    previous = useAppStore.getState();
+    setClientForTests({ command: vi.fn(async () => ({})) } as never);
+    useAppStore.setState({
+      configState: { status: "valid", summary: SUMMARY, seeded: false },
+      collapsedLanes: {},
+    } as never);
+  });
+  afterEach(() => {
+    useAppStore.setState(previous, true);
+    setClientForTests(undefined);
+  });
+
+  const view = () => applyRecords(initialSessionView(PLAYERS), TURN_ONE_REVIEWED);
+  const runView = (session: SessionInfo) => (
+    <RunView
+      session={session}
+      view={view()}
+      composer={{ queued: [] }}
+      connected
+      onSubmit={async () => {}}
+      onAbort={() => {}}
+      onRemoveQueued={() => {}}
+      onDismissError={() => {}}
+    />
+  );
+  const chip = (id: string) => screen.getByTestId(`agent-chip-${id}`);
+
+  test("reads what ran while its call's adapter and model setting stand, and what is set once either changes", () => {
+    const reported = { ...SESSION, live: false, agentReportedModels: REPORTED };
+    const { rerender } = render(runView(reported));
+
+    // The Captain's report stands: its model reads as the runtime named
+    // it, and what is set stays in its title and accessible name.
+    expect(chip("captain").textContent).toBe("claude-opus-5-5 @ high");
+    expect(chip("captain").getAttribute("title")).toBe("set to claude-captain @ high, runtime reports claude-opus-5-5");
+    expect(chip("captain").getAttribute("aria-label")).toBe(
+      "Captain settings: claude-opus-5-5 @ high, set to claude-captain @ high, runtime reports claude-opus-5-5",
+    );
+    // An agent set to the provider's default names that, not its adapter.
+    expect(chip("dev.reviewer").textContent).toBe("gpt-5.6-sol");
+    expect(chip("dev.reviewer").getAttribute("title")).toBe("set to provider default, runtime reports gpt-5.6-sol");
+    // No report: the set value, as ever.
+    expect(chip("dev.coder").textContent).toBe("opus");
+    expect(chip("dev.coder").getAttribute("title")).toBe("opus");
+    expect(chip("dev.coder").getAttribute("data-reported")).toBeNull();
+
+    // This conversation's own model for the Captain, after its call:
+    // the chip reads the choice at once.
+    rerender(runView({ ...reported, agentSettings: { captain: { model: "claude-sonnet-5" } } }));
+    expect(chip("captain").textContent).toBe("claude-sonnet-5 @ high");
+    expect(chip("captain").getAttribute("aria-label")).not.toContain("runtime reports");
+    expect(chip("captain").getAttribute("data-changed")).toBe("true");
+
+    // The configured effort for the reviewer changes in Settings: effort
+    // leaves which model runs unchanged, so the report stands.
+    act(() => {
+      useAppStore.setState({
+        configState: { status: "valid", seeded: false, summary: { ...SUMMARY, players: [
+          SUMMARY.players[0],
+          { ...SUMMARY.players[1], agent: { adapter: "codex" as const, effort: "high" } },
+        ] } },
+      } as never);
+    });
+    expect(chip("dev.reviewer").textContent).toBe("gpt-5.6-sol @ high");
+    expect(chip("dev.reviewer").getAttribute("title")).toBe("set to provider default @ high, runtime reports gpt-5.6-sol");
+
+    // The reviewer moves to another adapter, still on its provider's
+    // default: the report named another runtime's model, so the chip
+    // reads what is set.
+    act(() => {
+      useAppStore.setState({
+        configState: { status: "valid", seeded: false, summary: { ...SUMMARY, players: [
+          SUMMARY.players[0],
+          { ...SUMMARY.players[1], agent: { adapter: "claude" as const, effort: "high" } },
+        ] } },
+      } as never);
+    });
+    expect(chip("dev.reviewer").textContent).toBe("claude @ high");
+    expect(chip("dev.reviewer").getAttribute("title")).toBe("claude @ high");
+    expect(chip("dev.reviewer").getAttribute("data-reported")).toBeNull();
+
+    // A call under the new settings reports again, and that report reads.
+    rerender(runView({
+      ...reported,
+      agentSettings: { captain: { model: "claude-sonnet-5" } },
+      agentReportedModels: {
+        ...REPORTED,
+        captain: { model: "claude-sonnet-5-20260901", settings: { adapter: "claude", model: "claude-sonnet-5" } },
+      },
+    }));
+    expect(chip("captain").textContent).toBe("claude-sonnet-5-20260901 @ high");
+    expect(chip("captain").getAttribute("title")).toBe(
+      "set to claude-sonnet-5 @ high, runtime reports claude-sonnet-5-20260901 — changed for this conversation",
+    );
+  });
+
+  test("a folded lane's rail carries the reported reading", () => {
+    render(runView({ ...SESSION, live: false, agentReportedModels: REPORTED }));
+    fireEvent.click(within(screen.getByTestId("player-pane-dev.reviewer"))
+      .getByRole("button", { name: "Collapse reviewer" }));
+    const rail = screen.getByTestId("player-pane-dev.reviewer");
+    expect(within(rail).getByTestId("player-name-dev.reviewer").title)
+      .toBe("dev.reviewer · gpt-5.6-sol — set to provider default, runtime reports gpt-5.6-sol");
+  });
+});
+
+describe("Captain conversation between turns", () => {
+  test("busy input stays unavailable until settlement, including an early question", () => {
+    const onSubmit = vi.fn(async () => {});
+    const active = { ...initialSessionView(PLAYERS), turnActive: true,
+      pendingQuestion: "Which option?", pendingQuestionPlayer: "coder" };
+    const props = { session: SESSION, view: active, composer: { queued: [], draft: "Please explain" },
+      connected: true, onDraftChange: vi.fn(), onSubmit, onAbort: vi.fn(),
+      onRemoveQueued: vi.fn(), onDismissError: vi.fn() };
+    const rendered = render(<RunView {...props} />);
+    const field = screen.getByTestId("boss-composer") as HTMLTextAreaElement;
+    expect(field.disabled).toBe(true);
+    expect(field.value).toBe("Please explain");
+    expect((screen.getByTestId("send-button") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.keyDown(field, { key: "Enter" });
+    fireEvent.click(screen.getByTestId("send-button"));
+    expect(onSubmit).not.toHaveBeenCalled();
+    rendered.rerender(<RunView {...props} view={{ ...active, turnActive: false }} />);
+    expect(field.disabled).toBe(false);
+    expect(field.value).toBe("Please explain");
+    expect(screen.getByTestId("boss-reply-banner").textContent).toContain("ask Captain to explain");
+    fireEvent.click(screen.getByTestId("send-button"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith("Please explain");
+    expect(screen.getByTestId("boss-reply-banner")).toBeTruthy();
+  });
+
+  test.each(["known", "late"])("a %s busy refusal preserves the draft without queueing it", async (kind) => {
+    const command = vi.fn(async () => { throw { code: "busy", message: "Captain is working." }; });
+    setClientForTests({ command } as never);
+    useAppStore.setState({ sessions: [{ ...SESSION, live: true, turnActive: kind === "known" }],
+      views: { s1: initialSessionView(PLAYERS) },
+      composers: { s1: { queued: [], draft: "Do not lose this" } }, stagedIntents: {} });
+    try {
+      await expect(useAppStore.getState().submitBossText("s1", "Do not lose this")).rejects.toBeDefined();
+      expect(useAppStore.getState().composers.s1).toEqual({ queued: [], draft: "Do not lose this" });
+      expect(command).toHaveBeenCalledTimes(kind === "known" ? 0 : 1);
+    } finally { setClientForTests(undefined); }
+  });
+});
+
+const SESSION_RACE = { id: "synthetic", projectId: "synthetic-project", projectPath: "/synthetic", createdAt: 1, live: true, turnActive: true, endedAt: null, players: [], initialVisible: [], turns: 1, failed: false, continuable: true };
+const SETTLED_RACE = { ...SESSION_RACE, live: false, turnActive: false, endedAt: 3 };
+const HISTORY_RACE = { records: [
+  { seq: 1, record: { type: "turn_started", timestamp: 1, turnId: 1, turn: { id: 1, prompt: "synthetic work", timestamp: 1 } } },
+  { seq: 2, record: { type: "captain_reply", timestamp: 2, turnId: 1, text: "Synthetic finished reply" } },
+  { seq: 3, record: { type: "turn_finished", timestamp: 3, turnId: 1 } },
+] };
+function deferredRace<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return {promise, resolve}; }
+function seedRace(command: (type: string) => Promise<unknown>) {
+  setClientForTests({ command, subscribe: async () => null } as never);
+  useAppStore.setState({ sessions: [SESSION_RACE], views: { synthetic: initialSessionView([]) }, projects: [], specTrees: {}, history: {}, drafts: {}, draftViews: {}, currentProjectId: undefined, activeSessionId: undefined });
+}
+function otherRace(type: string): Promise<unknown> {
+  if (type === "history.get") return Promise.resolve(HISTORY_RACE);
+  if (type === "ledger.get") return Promise.resolve({intents: [], lanes: {}});
+  if (type === "readiness.get" || type === "project.list" || type === "draft.list") return Promise.resolve([]);
+  if (type === "config.get") return Promise.resolve({status: "missing", path: "/synthetic/config"});
+  return Promise.resolve({});
+}
+
+test.each(["refresh", "rereadProse"] as const)("%s preserves a settlement heard after the list reply while config is pending", async (method) => {
+  const before = useAppStore.getState(); const config = deferredRace<unknown>(); let submitted = false;
+  seedRace(type => type === "config.get" ? config.promise : type === "session.list" ? Promise.resolve([SESSION_RACE]) : type === "turn.submit" ? (submitted = true, Promise.resolve({})) : otherRace(type));
+  try {
+    const pending = useAppStore.getState()[method]();
+    await Promise.resolve();
+    deliverServerMessageForTests({type: "session.state", session: SETTLED_RACE} as never);
+    config.resolve({status: "missing", path: "/synthetic/config"});
+    await pending;
+    expect(useAppStore.getState().sessions[0]).toMatchObject({live: false, turnActive: false});
+    expect(useAppStore.getState().views.synthetic.turnActive).toBe(false);
+    await useAppStore.getState().submitBossText("synthetic", "Follow up");
+    expect(submitted).toBe(true);
+  } finally {setClientForTests(undefined); useAppStore.setState(before, true);}
+});
+
+test("an in-flight list preserves per-session removals and creations without discarding unrelated rows", async () => {
+  const before = useAppStore.getState(); const list = deferredRace<unknown>();
+  const created = {...SETTLED_RACE, id: "created", createdAt: 2}; const unrelated = {...SETTLED_RACE, id: "unrelated", createdAt: 3};
+  seedRace(type => type === "session.list" ? list.promise : otherRace(type));
+  try {
+    const pending = useAppStore.getState().refresh();
+    deliverServerMessageForTests({type: "session.removed", sessionId: "synthetic", projectId: "synthetic-project"});
+    deliverServerMessageForTests({type: "session.state", session: created} as never);
+    list.resolve([SESSION_RACE, unrelated]);
+    await pending;
+    expect(useAppStore.getState().sessions.map(s => s.id)).toEqual(["created", "unrelated"]);
+  } finally {setClientForTests(undefined); useAppStore.setState(before, true);}
+});
+
+test("an older list response cannot replace a newer reading, and a later read can refresh an announced ID", async () => {
+  const before = useAppStore.getState(); const first = deferredRace<unknown>(); let lists = 0;
+  seedRace(type => type === "session.list" ? (++lists === 1 ? first.promise : Promise.resolve([SETTLED_RACE])) : otherRace(type));
+  try {
+    const stale = useAppStore.getState().refresh();
+    await useAppStore.getState().refresh();
+    first.resolve([SESSION_RACE]); await stale;
+    expect(useAppStore.getState().sessions[0].live).toBe(false);
+    deliverServerMessageForTests({type: "session.state", session: SESSION_RACE} as never);
+    await useAppStore.getState().refresh();
+    expect(useAppStore.getState().sessions[0].live).toBe(false);
+  } finally {setClientForTests(undefined); useAppStore.setState(before, true);}
+});
+
+test("a newer session read cannot cancel an independent project-key migration", async () => {
+  const before = useAppStore.getState();
+  const movedProjects = deferredRace<unknown>(); const oldList = deferredRace<unknown>();
+  const oldProject = {id: "old-project", name: "Synthetic", path: "/synthetic", registeredAt: 1, repository: {key: "old-project", name: "Synthetic", group: "synthetic", own: false}};
+  const newProject = {...oldProject, id: "new-project", repository: {...oldProject.repository, key: "new-project"}};
+  let projectReads = 0; let sessionReads = 0;
+  seedRace(type => type === "project.list" ? (++projectReads === 1 ? movedProjects.promise : Promise.resolve([oldProject]))
+    : type === "session.list" ? (++sessionReads === 1 ? oldList.promise : Promise.resolve([SETTLED_RACE])) : otherRace(type));
+  useAppStore.setState({projects: [oldProject], currentProjectId: oldProject.id,
+    openTabs: {[oldProject.id]: ["synthetic"]}, workspaceTabs: {[oldProject.id]: "synthetic"},
+    expandedProjects: {[oldProject.id]: true}});
+  try {
+    deliverServerMessageForTests({type: "space.state", state: {own: {name: "synthetic", repositories: []}, instances: [{groups: [{repositories: [
+      {key: newProject.id, folder: oldProject.path, state: "reachable"},
+    ]}]}]} } as never);
+    await useAppStore.getState().rereadProse(); // a newer session.list supersedes followProjects' list only
+    oldList.resolve([SESSION_RACE]); movedProjects.resolve([newProject]);
+    await Promise.all([oldList.promise, movedProjects.promise]);
+    await Promise.resolve(); await Promise.resolve();
+    const state = useAppStore.getState();
+    expect(state.currentProjectId).toBe(newProject.id);
+    expect(state.openTabs[newProject.id]).toEqual(["synthetic"]);
+    expect(state.workspaceTabs[newProject.id]).toBe("synthetic");
+    expect(state.expandedProjects[newProject.id]).toBe(true);
+    expect(state.openTabs[oldProject.id]).toBeUndefined();
+    expect(state.sessions[0].live).toBe(false);
+  } finally {setClientForTests(undefined); useAppStore.setState(before, true);}
+});

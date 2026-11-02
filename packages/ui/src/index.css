@@ -1,0 +1,150 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai> */
+
+@import "tailwindcss";
+
+/* SubLang brand tokens (DR-013). Interaction rides the brand ramp
+   anchored at the design system's accent #890FBC (600) and deep
+   #27063D (950); the wordmark's bright #A416EF is artwork-only and
+   deliberately absent. Light neutrals shift to the system's warm
+   paper values; dark surfaces stay stock, with muted ink lifted for contrast. */
+@theme {
+  /* Each stack names the platforms' Simplified Chinese faces after its
+     Latin faces (DR-078, localization-3): the brand faces still set
+     every Latin glyph, and a Chinese glyph the Latin faces do not hold
+     falls to the reader's own system face rather than a generic. */
+  --font-sans:
+    "Euclid Circular A", ui-sans-serif, system-ui, "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC",
+    "Noto Sans SC", sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Noto Sans Mono CJK SC", "PingFang SC", "Microsoft YaHei", monospace;
+
+  --color-brand-50: #faf4fe;
+  --color-brand-100: #f3e4fc;
+  --color-brand-200: #e7c9fa;
+  --color-brand-300: #d4a4f4;
+  --color-brand-400: #bb6ee9;
+  --color-brand-500: #a337da;
+  --color-brand-600: #890fbc;
+  --color-brand-700: #6e0c98;
+  --color-brand-800: #550975;
+  --color-brand-900: #3e0754;
+  --color-brand-950: #27063d;
+
+  --color-neutral-50: #f7f4ef;
+  --color-neutral-100: #efeae2;
+  --color-neutral-200: #e3ded5;
+  --color-neutral-300: #d8d2c6;
+
+  /* Warm paper is darker than stock neutral-50, so light-theme
+     muted text drops one step to hold WCAG AA (DR-010 §7). */
+  --color-neutral-500: #696969;
+}
+
+:root {
+  color-scheme: light dark;
+  accent-color: var(--color-brand-600);
+}
+
+/* Muted body text still meets AA on the dark cards and controls. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-neutral-500: #949494;
+  }
+}
+
+/* A control a reader can activate says so under the pointer; the
+   utility layer still wins where a control asks for another cursor. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+}
+
+/* Focus shows by control kind (DR-013). A control that is only
+   momentarily focused takes a thin brand outline. A text field does
+   not: a composer holds focus for a whole session, and a ring around
+   it all that time reads as a frame rather than as focus — so the
+   field's own border darkens instead, which is also what keeps the
+   composer box reading as one control. */
+:focus-visible {
+  outline: 1.5px solid var(--color-brand-500);
+  outline-offset: 1px;
+}
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+[contenteditable]:focus-visible {
+  outline: none;
+}
+@media (prefers-color-scheme: dark) {
+  :focus-visible {
+    outline-color: var(--color-brand-400);
+  }
+}
+
+::selection {
+  background: var(--color-brand-200);
+}
+@media (prefers-color-scheme: dark) {
+  ::selection {
+    background: var(--color-brand-800);
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100;
+}
+
+.markdown :is(p, ul, ol, pre, blockquote) {
+  @apply my-1.5;
+}
+.markdown ul {
+  @apply list-disc pl-5;
+}
+.markdown ol {
+  @apply list-decimal pl-5;
+}
+.markdown code {
+  @apply rounded bg-neutral-200/70 px-1 py-0.5 font-mono text-[0.85em] dark:bg-neutral-800;
+}
+/* A code block wraps its long lines like the prose around it: a
+   transcript pane can be 280px wide, and a box that scrolls sideways
+   there would be a keyboard trap for the reader who cannot scroll it
+   (run-view-3, run-view-50). */
+.markdown pre {
+  @apply rounded-md bg-neutral-100 p-2 whitespace-pre-wrap [overflow-wrap:anywhere] dark:bg-neutral-900;
+}
+.markdown pre code {
+  @apply bg-transparent p-0;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3 {
+  @apply mt-3 mb-1 font-semibold;
+}
+.markdown a {
+  @apply text-brand-600 underline dark:text-brand-300;
+}
+.markdown table {
+  @apply my-2 border-collapse text-sm;
+}
+.markdown th,
+.markdown td {
+  @apply border border-neutral-300 px-2 py-1 dark:border-neutral-700;
+}
+
+/* A dispatch line, a return line or a call reached from its other end
+   lights briefly, so the reader sees where they landed (run-view-181). */
+[data-flash="1"] {
+  @apply rounded ring-2 ring-brand-400 dark:ring-brand-500;
+}

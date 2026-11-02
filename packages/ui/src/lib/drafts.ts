@@ -1,0 +1,284 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// Pure helpers for playbook drafts (DR-058): the chip's word and
+// tooltip per state (playbook-library-50), the id rule the New
+// playbook field checks (playbook-library-51), the reason a control
+// waits (playbook-library-56/57), and the Register tab's derived
+// defaults (playbook-library-61). No DOM, so each is testable alone.
+
+import type {
+  AgentBlockInput,
+  AgentSummary,
+  DraftInfo,
+  MediaUploadOwner,
+} from "@sublang/spex-core/protocol";
+
+import { phaseLabel } from "./compile-log.js";
+import { ageSpan, relativeAge } from "./time.js";
+import { i18n } from "../i18n.js";
+import type { StatusTone } from "./labels.js";
+
+/** A playbook id names the spec package, the file, and the /command;
+ * it is an Agent Skills name as well (DR-104, playbook-library-51). */
+/** The media owner a draft's files belong to: the session named by its
+ * instance (media-4); none for a session file that will not read. */
+export function draftMediaOwner(draft: DraftInfo): MediaUploadOwner | undefined {
+  return draft.instance ? { kind: "draft", projectId: draft.projectId, id: draft.id, instance: draft.instance } : undefined;
+}
+
+export const DRAFT_ID_RULE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
+export const DRAFT_ID_MAX = 64;
+
+/** Whether an id meets the Agent Skills name rule. */
+export function isDraftId(id: string): boolean {
+  return id.length <= DRAFT_ID_MAX && DRAFT_ID_RULE.test(id);
+}
+
+/** The id field's caption (playbook-library-51). A function, never a
+ * constant: a text read at module load would freeze the language the
+ * module was imported in (localization-4). */
+export function draftIdCaption(id: string): string {
+  return i18n._({
+    id: "Lowercase, becomes /{id}",
+    comment: "caption of New playbook's id field: {id} is the id typed, or the example triage while none is",
+    values: { id },
+  });
+}
+
+/** The rule, as the refusal names it. */
+export function draftIdRuleText(): string {
+  return i18n._("Lowercase letters and digits in words joined by single hyphens, at most 64 characters");
+}
+
+/** A new spec package's org follows the manifest's name rule, the one
+ * an id follows (environments-1, playbook-library-51). */
+export function isPackageOrg(org: string): boolean {
+  return isDraftId(org);
+}
+
+/** The org rule, as the refusal names it (playbook-library-51). */
+export function packageOrgRuleText(): string {
+  return i18n._("Org: lowercase letters and digits in words joined by single hyphens, at most 64 characters");
+}
+
+/** The spec package folder under development, in the working folder
+ * (playbook-library-70): as the core names it, else
+ * `spex-packages/<org>/<id>` by its package's name where that is known
+ * (environments-10). */
+export function draftPackagePath(draft: DraftInfo): string {
+  return draft.packagePath ?? `spex-packages/${draft.package ?? draft.id}`;
+}
+
+/** The playbook artifact's `<id>.md`, in the working folder
+ * (playbook-library-56). */
+export function draftSourcePath(draft: DraftInfo): string {
+  return draft.sourcePath ?? `${draftPackagePath(draft)}/playbooks/en/${draft.id}/${draft.id}.md`;
+}
+
+/** The chip's word (playbook-library-50): at most 14 characters, the
+ * details in its title (DR-041 §9). */
+export function draftChipWord(draft: DraftInfo): string {
+  if (draft.sourceMissing) {
+    return i18n._({
+      id: "Source missing",
+      comment: "authoring state chip, at most 14 characters: the package's folder is gone from the project folder",
+    });
+  }
+  switch (draft.state) {
+    case "no-source":
+      return i18n._({
+        id: "No source",
+        comment: "draft state chip, at most 14 characters: nothing written to the draft's source file yet",
+      });
+    case "draft":
+      return i18n._({
+        id: "Draft",
+        comment: "draft state chip, at most 14 characters: a source stands, never compiled",
+      });
+    case "compiling":
+      return i18n._({
+        id: "Compiling",
+        comment: "draft state chip, at most 14 characters: a compile is running",
+      });
+    case "failed":
+      return i18n._({
+        id: "Failed",
+        comment: "draft state chip, at most 14 characters: the last compile failed",
+      });
+    case "interrupted":
+      return i18n._({
+        id: "Interrupted",
+        comment: "draft state chip, at most 14 characters: Spex closed while the draft compiled",
+      });
+    case "compiled":
+      return i18n._({
+        id: "Compiled",
+        comment: "draft state chip, at most 14 characters: the last compile succeeded",
+      });
+    case "changed":
+      return i18n._({
+        id: "Changed",
+        comment: "draft state chip, at most 14 characters: the source changed after the last compile",
+      });
+    case "enabled":
+      return i18n._({
+        id: "Enabled",
+        comment: "authoring state chip, at most 14 characters: the compiled playbook is enabled in a config",
+      });
+  }
+}
+
+/** The chip's tone: emerald for the live compile and a compiled draft,
+ * red for a failure or a missing source, amber for what needs a hand,
+ * neutral otherwise (DR-013: brand hue stays with interaction). */
+export function draftChipTone(draft: DraftInfo): StatusTone {
+  if (draft.sourceMissing) return "red";
+  switch (draft.state) {
+    case "compiling":
+    case "compiled":
+    case "enabled":
+      return "emerald";
+    case "failed":
+      return "red";
+    case "interrupted":
+    case "changed":
+      return "amber";
+    default:
+      return "neutral";
+  }
+}
+
+/** The chip's tooltip: the failed phase and the compile's age, never
+ * in the chip itself (playbook-library-50). */
+export function draftChipTitle(draft: DraftInfo, now: number): string | undefined {
+  if (draft.sourceMissing) {
+    return i18n._({
+      id: "Package folder not in the project folder · only Delete remains",
+      comment: "the title of an authoring session's chip Source missing: its package folder is gone from the project folder, so the session can only be deleted",
+    });
+  }
+  const compile = draft.compile;
+  if (!compile) return undefined;
+  const age = relativeAge(compile.at, now);
+  switch (compile.outcome) {
+    case "failed": {
+      // The compiler's own phase id rides along where the pipeline
+      // table names that phase; where it does not, the id stands alone.
+      const phase = compile.phase;
+      if (!phase) return i18n._("Failed at an unknown phase, {age}", { age });
+      return phaseLabel(phase) === phase
+        ? i18n._("Failed at {phase}, {age}", { phase, age })
+        : i18n._("Failed at {phase} ({id}), {age}", {
+            phase: phaseLabel(phase),
+            id: phase,
+            age,
+          });
+    }
+    case "running":
+      // "since" already says it is an age, so the span comes without
+      // "ago" rather than having the word cut off a translated text.
+      return i18n._("Compiling since {age}", { age: ageSpan(compile.at, now) });
+    case "interrupted":
+      return i18n._("Interrupted {age} — Spex closed while it compiled", { age });
+    case "canceled":
+      return i18n._("Canceled {age}", { age });
+    case "ok":
+      return draft.state === "changed"
+        ? i18n._("Compiled {age}; the source changed since", { age })
+        : i18n._("Compiled {age}", { age });
+  }
+}
+
+/** The agent block a new lane minted from a draft carries: the draft's
+ * effective agent, less the fields a lane does not take from it; the
+ * subagent model and its effort travel with the model (DR-093,
+ * DR-095). */
+export function agentBlockOf(agent: AgentSummary): AgentBlockInput {
+  const block: AgentBlockInput = { adapter: agent.adapter };
+  if (agent.model) block.model = agent.model;
+  if (agent.subagentModel !== undefined && agent.subagentModel !== "") block.subagentModel = agent.subagentModel;
+  if (agent.subagentEffort) block.subagentEffort = agent.subagentEffort;
+  if (agent.effort) block.effort = agent.effort;
+  block.permissions = agent.permissions?.mode
+    ? { mode: agent.permissions.mode }
+    : { mode: "auto" };
+  return block;
+}
+
+function normalizedRole(role: string): string {
+  return role.toLowerCase().replace(/[^a-z0-9_-]+/gu, "-");
+}
+
+/** A named role lane may already belong to the roster. A generic
+ * fallback does not establish that ownership (playbook-library-61). */
+export function existingRolePlayerId(role: string): string | undefined {
+  const normalized = normalizedRole(role);
+  return /^[a-z]/u.test(normalized) ? `dev.${normalized}` : undefined;
+}
+
+/** The valid base a role's new lane would mint (DR-032). */
+export function newPlayerId(role: string): string {
+  const normalized = normalizedRole(role);
+  if (/^[a-z]/u.test(normalized)) return `dev.${normalized}`;
+  const suffix = normalized.replace(/^[-_]+|[-_]+$/gu, "");
+  return suffix ? `dev.role-${suffix}` : "dev.role";
+}
+
+/** The intent's derived default (playbook-library-61): the source's
+ * first prose paragraph, else its title — a source written as a title
+ * over a `Roles:` list and numbered steps, as the app's own example
+ * is, holds no prose paragraph, and an empty intent refuses Register. */
+export function derivedIntent(markdown: string): string {
+  return firstProseParagraph(markdown) || firstTitle(markdown);
+}
+
+/** The text of the source's first level-one heading outside fenced
+ * code, closing hashes dropped; empty when it has none. */
+export function firstTitle(markdown: string): string {
+  let fenced = false;
+  for (const raw of markdown.replace(/\r\n/gu, "\n").split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("```")) {
+      fenced = !fenced;
+      continue;
+    }
+    if (fenced) continue;
+    const title = /^#\s+(.*?)(?:\s+#+)?$/u.exec(line)?.[1]?.trim();
+    if (title) return title;
+  }
+  return "";
+}
+
+/** The source's first prose paragraph, on one line. Headings, the
+ * `Roles:` list, list items, blockquotes, and fenced code are not
+ * prose. */
+export function firstProseParagraph(markdown: string): string {
+  const blocks = markdown.replace(/\r\n/gu, "\n").split(/\n\s*\n/u);
+  let fenced = false;
+  for (const block of blocks) {
+    const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (lines.length === 0) continue;
+    if (lines.some((line) => line.startsWith("```"))) {
+      // A fence toggles on each marker; a block with an odd count opens
+      // or closes one, and everything inside is code.
+      const markers = lines.filter((line) => line.startsWith("```")).length;
+      if (markers % 2 === 1) fenced = !fenced;
+      continue;
+    }
+    if (fenced) continue;
+    const first = lines[0];
+    if (
+      /^#/u.test(first) ||
+      /^roles?\s*:/iu.test(first) ||
+      /^[-*+]\s/u.test(first) ||
+      /^\d+[.)]\s/u.test(first) ||
+      first.startsWith(">") ||
+      first.startsWith("|")
+    ) {
+      continue;
+    }
+    return lines.join(" ");
+  }
+  return "";
+}

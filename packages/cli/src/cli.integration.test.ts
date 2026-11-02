@@ -1,0 +1,1616 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { execSync, spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import { readBundledMarkdown } from "./bundled-scaffold.js";
+import {
+  canonicalContentHash,
+  getFileHistory,
+  getLegacyFileHistory,
+} from "./copy-templates.js";
+
+const CLI = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "dist",
+  "cli.js",
+);
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const PRE_LOCALIZATION_META = resolve(
+  ROOT,
+  "src",
+  "__fixtures__",
+  "pre-localization-meta.md",
+);
+const LEGACY_SCAFFOLD = resolve(ROOT, "src", "__fixtures__", "legacy-scaffold");
+
+/** Files makeLegacyRepo() places under legacy directories (SCAF-27). */
+const LEGACY_REPO_FILES = [
+  "specs/dev/git.md",
+  "specs/dev/licensing.md",
+  "specs/test/licensing.md",
+  "specs/iterations/000-spdx-headers.md",
+  "specs/user/.gitkeep",
+] as const;
+
+function run(
+  args: string[],
+  opts?: { cwd?: string; env?: NodeJS.ProcessEnv },
+): { stdout: string; stderr: string; exitCode: number } {
+  // spawnSync captures stderr on success too, so warnings emitted on a
+  // zero-exit run (e.g. replaced user-modified framework files) are visible.
+  const result = spawnSync(process.execPath, [CLI, ...args], {
+    encoding: "utf-8",
+    cwd: opts?.cwd,
+    env: opts?.env === undefined ? process.env : { ...process.env, ...opts.env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return {
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    exitCode: result.status ?? 0,
+  };
+}
+
+function makeTmp(): string {
+  return realpathSync(mkdtempSync(join(tmpdir(), "spex-integ-")));
+}
+
+function initGit(dir: string): void {
+  execSync("git init", { cwd: dir, stdio: "ignore" });
+  execSync("git config user.email test@example.com", {
+    cwd: dir,
+    stdio: "ignore",
+  });
+  execSync("git config user.name Test", { cwd: dir, stdio: "ignore" });
+  execSync("git config commit.gpgsign false", { cwd: dir, stdio: "ignore" });
+}
+
+function gitCommit(dir: string, message: string): void {
+  execSync("git add specs", { cwd: dir, stdio: "ignore" });
+  execSync(`git commit -m "${message}"`, { cwd: dir, stdio: "ignore" });
+}
+
+// scaffold-53: a diagnostic is only usable if it names every step the
+// recovery takes — the marker line to set, the commit --update's
+// clean-tree precondition forces, and the rerun. Assert the elements,
+// not the prose, then perform exactly those steps.
+function assertRecoveryGuidance(message: string): void {
+  assert.match(message, /Authoring language/, "names the marker line");
+  assert.match(message, /commit/i, "names the commit step");
+  // Both halves: an alternation lets "--update needs a clean tree"
+  // satisfy a message that never tells the user to run it again.
+  assert.match(message, /\bagain\b/, "names the rerun action");
+  assert.match(message, /--update/, "names the rerun command");
+}
+
+function parseIndicators(stdout: string): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const line of stdout.split("\n")) {
+    const m = line.match(/^\s+(\S+)\s+\((.+)\)\s*$/);
+    if (m) map.set(m[1], m[2]);
+  }
+  return map;
+}
+
+function bundledPath(relPath: string): string {
+  return join(ROOT, "scaffold", relPath);
+}
+
+function overlayPath(language: string, relPath: string): string {
+  return join(ROOT, "scaffold", "i18n", language, relPath);
+}
+
+function legacyFixture(relPath: string): string {
+  return join(LEGACY_SCAFFOLD, relPath);
+}
+
+function write(dir: string, relPath: string, content: string | Buffer): void {
+  const target = join(dir, relPath);
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, content);
+}
+
+/** A committed repo on the legacy user/dev/test layout, from fixtures. */
+function makeLegacyRepo(): string {
+  const dir = makeTmp();
+  initGit(dir);
+  write(dir, "specs/meta.md", readFileSync(legacyFixture("specs/meta.md")));
+  write(dir, "specs/map.md", readFileSync(legacyFixture("specs/map.md")));
+  write(
+    dir,
+    "specs/iterations/000-spdx-headers.md",
+    readFileSync(legacyFixture("specs/iterations/000-spdx-headers.md")),
+  );
+  write(
+    dir,
+    "specs/dev/git.md",
+    readFileSync(legacyFixture("specs/dev/git.md")),
+  );
+  write(
+    dir,
+    "specs/dev/licensing.md",
+    readFileSync(legacyFixture("specs/dev/licensing.md")),
+  );
+  write(
+    dir,
+    "specs/test/licensing.md",
+    readFileSync(legacyFixture("specs/test/licensing.md")),
+  );
+  write(dir, "specs/user/.gitkeep", "");
+  // Frameworks are refreshed unconditionally, so the current bundled
+  // DR-000 stands in for whatever old version the repo carried.
+  write(
+    dir,
+    "specs/decisions/000-spec-structure-format.md",
+    readFileSync(bundledPath("specs/decisions/000-spec-structure-format.md")),
+  );
+  return dir;
+}
+
+function toCrlf(text: string): string {
+  return text.replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
+}
+
+function readBundledMergePrompt(): string {
+  return readBundledMarkdown("update-merge-prompt.md");
+}
+
+function readBundledMigrationPrompt(): string {
+  return readBundledMarkdown("spec-migration-prompt.md");
+}
+
+const GUIDANCE_MARKER = "Migrate every legacy Spex specs tree";
+
+/** SCAF-26: the bundled migration prompt replaces the merge prompt. */
+function assertMigrationPrompt(stdout: string): void {
+  const completedAt = stdout.indexOf("--update completed");
+  const guidanceAt = stdout.indexOf(GUIDANCE_MARKER);
+  assert.ok(guidanceAt >= 0, "the migration prompt must print");
+  assert.ok(
+    completedAt >= 0 && completedAt < guidanceAt,
+    "the migration prompt must print after the completion message",
+  );
+  assert.ok(stdout.includes(readBundledMigrationPrompt()));
+  assert.ok(!stdout.includes(readBundledMergePrompt()));
+  assert.ok(stdout.slice(guidanceAt).includes("spex lint"));
+}
+
+/** The usage block cli-21 writes, read from the spec itself. */
+function specUsage(): string {
+  const spec = readFileSync(resolve(ROOT, "..", "..", "specs", "packages", "cli.md"), "utf-8").replace(/\r\n/g, "\n");
+  const item = spec.slice(spec.indexOf("#### cli-21"));
+  const block = /```text\n([\s\S]*?)\n```/.exec(item);
+  assert.ok(block, "cli-21 holds the usage block");
+  return block[1]!;
+}
+
+/** The commands a usage line names: its leading words, up to its first
+ * argument. */
+function namesOfLine(line: string): string[] {
+  const names: string[] = [];
+  for (const word of line.trim().split(/\s{2,}/)[0]!.split(" ")) {
+    if (!/^[a-z]+,?$/.test(word)) break;
+    names.push(word.replace(",", ""));
+  }
+  return names;
+}
+
+/** Every command of the usage, its aliases and the options it takes. */
+const COMMAND_HELP: Record<string, { aliases?: string[]; options: string[] }> = {
+  add: { options: ["--path <folder>"] },
+  remove: { aliases: ["rm"], options: [] },
+  install: { aliases: ["i"], options: [] },
+  update: { options: [] },
+  list: { aliases: ["ls"], options: [] },
+  search: { options: [] },
+  export: { options: ["--spec <file>", "--skill <folder>", "--language <tag>", "--description <text>", "--license <id>"] },
+  publish: { options: ["--dry-run"] },
+  login: { options: ["--registry <url>", "--space <url>", "--force"] },
+  logout: { options: ["--registry <url>", "--space <url>"] },
+  whoami: { options: ["--registry <url>", "--space <url>"] },
+  scaffold: { options: ["--update", "--lang <code>", "--agents <names>"] },
+  lint: { options: [] },
+};
+
+/** Run the CLI in an empty folder with a home not yet made, and check
+ * the run wrote neither (cli-21). */
+function quietly(args: string[], check: (result: ReturnType<typeof run>) => void): void {
+  const scratch = makeTmp();
+  try {
+    const work = join(scratch, "work");
+    const home = join(scratch, "home");
+    mkdirSync(work);
+    const result = run(args, { cwd: work, env: { SPEX_HOME: home } });
+    check(result);
+    assert.deepEqual(readdirSync(work), [], `spex ${args.join(" ")} writes nothing in the folder`);
+    assert.equal(existsSync(home), false, `spex ${args.join(" ")} makes no home`);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+describe("CLI integration", () => {
+  // Acceptance: spex scaffold <path> creates full specs structure
+  it("scaffold <path> creates specs structure and agent files", () => {
+    const dir = makeTmp();
+    try {
+      const result = run(["scaffold", dir]);
+      assert.equal(result.exitCode, 0, `should exit 0: ${result.stderr}`);
+
+      // Directories: the meta-1 layout only, no legacy generation dirs.
+      assert.ok(existsSync(join(dir, "specs")));
+      assert.ok(existsSync(join(dir, "specs", "decisions")));
+      assert.ok(existsSync(join(dir, "specs", "intents")));
+      assert.ok(existsSync(join(dir, "specs", "packages")));
+      for (const legacy of [
+        "user",
+        "dev",
+        "test",
+        "items",
+        "interactions",
+        "compositions",
+        "iterations",
+      ]) {
+        assert.ok(
+          !existsSync(join(dir, "specs", legacy)),
+          `legacy specs/${legacy} must not be created`,
+        );
+      }
+
+      // Template files
+      assert.ok(existsSync(join(dir, "specs", "map.md")));
+      assert.ok(existsSync(join(dir, "specs", "meta.md")));
+      assert.ok(existsSync(join(dir, "specs", "packages", "git.md")));
+      assert.ok(existsSync(join(dir, "specs", "packages", "licensing.md")));
+      assert.ok(
+        existsSync(join(dir, "specs", "intents", "000-spdx-headers.md")),
+      );
+      assert.ok(
+        existsSync(
+          join(dir, "specs", "decisions", "000-spec-structure-format.md"),
+        ),
+      );
+
+      // Agent files
+      assert.ok(existsSync(join(dir, "CLAUDE.md")));
+      assert.ok(existsSync(join(dir, "AGENTS.md")));
+      assert.ok(existsSync(join(dir, "GEMINI.md")));
+      const claude = readFileSync(join(dir, "CLAUDE.md"), "utf-8");
+      assert.ok(claude.includes("## Specs (Source of Truth)"));
+      assert.ok(claude.includes("@specs/packages"));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // A freshly scaffolded tree satisfies the linter by construction.
+  // KNOWN RED: the bundled DR-000 carries five old-form citations
+  // (three with dead anchors) pending human approval to fix; this test
+  // stays red on exactly those findings until then.
+  it("scaffold output lints clean", () => {
+    const dir = makeTmp();
+    try {
+      assert.equal(run(["scaffold", dir]).exitCode, 0);
+      const result = run(["lint", dir]);
+      assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+      assert.match(result.stdout, /no problems found/);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-36 / SCAF-38: scaffold writes a top-level LICENSE and no NOTICE.
+  it("scaffold <path> writes a verbatim Apache-2.0 LICENSE and no NOTICE", () => {
+    const dir = makeTmp();
+    try {
+      const result = run(["scaffold", dir]);
+      assert.equal(result.exitCode, 0, `should exit 0: ${result.stderr}`);
+
+      const licensePath = join(dir, "LICENSE");
+      assert.ok(existsSync(licensePath), "top-level LICENSE should be written");
+      assert.deepEqual(
+        readFileSync(licensePath),
+        readFileSync(bundledPath("LICENSE")),
+        "LICENSE should be byte-identical to the bundled Apache-2.0 text",
+      );
+      assert.equal(
+        existsSync(join(dir, "NOTICE")),
+        false,
+        "no NOTICE file should be written",
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-36 / SCAF-38: an existing downstream LICENSE is never overwritten.
+  it("scaffold preserves an existing LICENSE with (already exists)", () => {
+    const dir = makeTmp();
+    try {
+      const licensePath = join(dir, "LICENSE");
+      const custom = "Downstream project license\n";
+      writeFileSync(licensePath, custom);
+
+      const result = run(["scaffold", dir]);
+      assert.equal(result.exitCode, 0, `should exit 0: ${result.stderr}`);
+      assert.equal(
+        readFileSync(licensePath, "utf-8"),
+        custom,
+        "existing LICENSE must not be overwritten",
+      );
+      assert.match(result.stdout, /LICENSE \(already exists\)/);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // scaffold-58 / scaffold-60: the licensing seed names the project's
+  // own holder, so an agent adding a file copies the project's line,
+  // not the template's upstream one.
+  it("scaffold pins the git identity as the copyright holder in licensing-9", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      const result = run(["scaffold", "--agents=claude", dir]);
+      assert.equal(result.exitCode, 0, `should exit 0: ${result.stderr}`);
+      assert.doesNotMatch(result.stderr, /placeholder/);
+
+      const licensing = readFileSync(
+        join(dir, "specs", "packages", "licensing.md"),
+        "utf-8",
+      );
+      const year = new Date().getFullYear();
+      const item = licensing.slice(licensing.indexOf("### licensing-9"));
+      assert.ok(
+        item.includes(
+          `<!-- SPDX-FileCopyrightText: ${year} Test <test@example.com> -->`,
+        ),
+        `markdown header names the holder:\n${item}`,
+      );
+      assert.ok(
+        item.includes(`// SPDX-FileCopyrightText: ${year} Test <test@example.com>`),
+      );
+      assert.ok(item.includes("// SPDX-License-Identifier: Apache-2.0"));
+      assert.doesNotMatch(item, /<holder>|<license>|<year>|SubLang/);
+
+      // Template files keep their upstream SPDX lines (licensing-5).
+      for (const relPath of [
+        "specs/map.md",
+        "specs/meta.md",
+        "specs/packages/licensing.md",
+        "specs/packages/git.md",
+        "specs/intents/000-spdx-headers.md",
+        "specs/decisions/000-spec-structure-format.md",
+      ]) {
+        assert.match(
+          readFileSync(join(dir, relPath), "utf-8").split("\n")[1] ?? "",
+          /SPDX-FileCopyrightText: \d{4} SubLang International/,
+          `${relPath} keeps the upstream line`,
+        );
+      }
+      const lint = run(["lint", dir]);
+      assert.equal(lint.exitCode, 0, lint.stdout + lint.stderr);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold without a git identity keeps the <holder> placeholder and says so", () => {
+    const dir = makeTmp();
+    try {
+      // No repository, and no global or system identity either.
+      const noGlobal = join(dir, "no-identity.gitconfig");
+      writeFileSync(noGlobal, "");
+      const result = run(["scaffold", "--agents=claude", dir], {
+        env: { GIT_CONFIG_GLOBAL: noGlobal, GIT_CONFIG_NOSYSTEM: "1" },
+      });
+      assert.equal(result.exitCode, 0, `should exit 0: ${result.stderr}`);
+      assert.match(result.stderr, /user\.name/);
+      assert.match(result.stderr, /<holder>/);
+      assert.match(result.stderr, /specs\/packages\/licensing\.md/);
+
+      const licensing = readFileSync(
+        join(dir, "specs", "packages", "licensing.md"),
+        "utf-8",
+      );
+      const item = licensing.slice(licensing.indexOf("### licensing-9"));
+      const year = new Date().getFullYear();
+      assert.ok(item.includes(`<!-- SPDX-FileCopyrightText: ${year} <holder> -->`));
+      assert.ok(item.includes("<!-- SPDX-License-Identifier: Apache-2.0 -->"));
+      assert.doesNotMatch(item, /SubLang/);
+      const lint = run(["lint", dir]);
+      assert.equal(lint.exitCode, 0, lint.stdout + lint.stderr);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold keeps the <license> placeholder when LICENSE is not the bundled text", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      writeFileSync(join(dir, "LICENSE"), "Downstream project license\n");
+      const result = run(["scaffold", "--agents=claude", dir]);
+      assert.equal(result.exitCode, 0, `should exit 0: ${result.stderr}`);
+      assert.match(result.stderr, /<license>/);
+      const item = readFileSync(
+        join(dir, "specs", "packages", "licensing.md"),
+        "utf-8",
+      );
+      assert.ok(item.includes("<!-- SPDX-License-Identifier: <license> -->"));
+      assert.ok(
+        item.includes(
+          `// SPDX-FileCopyrightText: ${new Date().getFullYear()} Test <test@example.com>`,
+        ),
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // Acceptance: re-running scaffold skips existing entries
+  it("scaffold rerun is idempotent", () => {
+    const dir = makeTmp();
+    try {
+      run(["scaffold", dir]);
+
+      // Modify a template file to verify it is not overwritten
+      const mapPath = join(dir, "specs", "map.md");
+      writeFileSync(mapPath, "# Custom\n");
+
+      const result = run(["scaffold", dir]);
+      assert.equal(result.exitCode, 0);
+      assert.ok(result.stdout.includes("(already exists)"));
+
+      // Custom content preserved
+      assert.equal(readFileSync(mapPath, "utf-8"), "# Custom\n");
+
+      // Agent files skipped
+      assert.ok(result.stdout.includes("(skipped)"));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // Acceptance: invalid path exits non-zero with error on stderr
+  it("scaffold with nonexistent path exits non-zero", () => {
+    const result = run(["scaffold", "/nonexistent-spex-path-xyz"]);
+    assert.notEqual(result.exitCode, 0);
+    assert.ok(result.stderr.includes("Path does not exist"));
+  });
+
+  // cli-13: a word naming no command is refused on one line, with what
+  // to do and no usage dump.
+  it("an unknown command or option is refused on one line naming spex --help", () => {
+    for (const [args, line] of [
+      [["bogus"], "spex: unknown command bogus \u2014 spex --help\n"],
+      [["help", "bogus"], "spex: unknown command bogus \u2014 spex --help\n"],
+      [["--bogus"], "spex: unknown option --bogus \u2014 spex --help\n"],
+    ] as const) {
+      const result = run([...args]);
+      assert.equal(result.exitCode, 1, `[cli-13] spex ${args.join(" ")} exits 1`);
+      assert.equal(result.stderr, line, `[cli-13] spex ${args.join(" ")} says what to do on one line`);
+      assert.equal(result.stdout, "");
+    }
+  });
+
+  // cli-21: the usage, as the spec writes it, for every way of asking.
+  it("spex, --help, -h and help print the usage cli-21 writes and exit zero, writing nothing", () => {
+    const usage = specUsage();
+    for (const args of [[], ["--help"], ["-h"], ["help"]]) {
+      quietly(args, (result) => {
+        assert.equal(result.exitCode, 0, `[cli-21] spex ${args.join(" ")} exits 0`);
+        assert.equal(result.stdout, `${usage}\n`, `[cli-21] spex ${args.join(" ")} prints the usage verbatim`);
+        assert.equal(result.stderr, "");
+      });
+    }
+  });
+
+  // cli-21: every command of the usage, scaffold and lint included,
+  // prints its own lines of the usage and every option it takes.
+  it("<command> --help, -h and help <command> print that command's lines and options for every command", () => {
+    const usageLines = specUsage().split("\n").filter((line) => line.startsWith("  "));
+    const named = [...new Set(usageLines.flatMap(namesOfLine))].sort();
+    const known = Object.entries(COMMAND_HELP).flatMap(([name, { aliases = [] }]) => [name, ...aliases]).sort();
+    assert.deepEqual(known, named, "[cli-21] the test covers every command the usage names");
+    for (const [name, { aliases = [], options }] of Object.entries(COMMAND_HELP)) {
+      const forms = [[name, "--help"], [name, "-h"], ["help", name], ...aliases.flatMap((alias) => [[alias, "--help"], ["help", alias]])];
+      let first: string | undefined;
+      for (const args of forms) {
+        quietly(args, (result) => {
+          assert.equal(result.exitCode, 0, `[cli-21] spex ${args.join(" ")} exits 0: ${result.stderr}`);
+          assert.equal(result.stderr, "");
+          first ??= result.stdout;
+          assert.equal(result.stdout, first, `[cli-21] spex ${args.join(" ")} prints ${name}'s help`);
+        });
+      }
+      const help = first!;
+      assert.match(help, new RegExp(`^Usage: spex ${name}\\b`), `[cli-21] ${name}'s help opens with its usage`);
+      for (const line of usageLines.filter((line) => namesOfLine(line).includes(name))) {
+        assert.ok(help.split("\n").includes(line), `[cli-21] ${name}'s help holds its usage line ${JSON.stringify(line)}`);
+      }
+      const rows = help.slice(help.indexOf("\nOptions\n") + "\nOptions\n".length).split("\n").filter((row) => row.startsWith("  -"));
+      assert.deepEqual(
+        rows.map((row) => row.trim().split(/\s{2,}/)[0]).sort(),
+        [...options, "-h, --help"].sort(),
+        `[cli-21] ${name}'s help lists every option it takes`,
+      );
+      for (const row of rows) assert.match(row, /^ {2}\S.*\S {2,}\S/, `[cli-21] ${name}'s option row ${JSON.stringify(row)} says what it does`);
+    }
+  });
+
+  // cli-21: the installed version.
+  it("--version and -V print the installed version and exit zero, writing nothing", () => {
+    const version = (JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8")) as { version: string }).version;
+    for (const args of [["--version"], ["-V"]]) {
+      quietly(args, (result) => {
+        assert.equal(result.exitCode, 0, `[cli-21] spex ${args[0]} exits 0`);
+        assert.equal(result.stdout, `spex ${version}\n`, `[cli-21] spex ${args[0]} prints spex <version>`);
+        assert.equal(result.stderr, "");
+      });
+    }
+  });
+
+  // cli-13: a command called wrongly names the cause in the CLI's words,
+  // never Node's, then its one-line usage, and writes nothing.
+  it("an option or argument a command does not take is refused in the CLI's words with its one-line usage", () => {
+    const addUsage = "Usage: spex add <org>/<pkg>[@<version>] | <org>/<pkg> --path <folder>";
+    for (const [args, cause] of [
+      [["install", "--bogus"], "spex install: unknown option --bogus\nUsage: spex install"],
+      [["add", "demo/tool", "--path"], `spex add: --path needs a folder\n${addUsage}`],
+      [["add", "demo/tool", "--path="], `spex add: --path needs a folder\n${addUsage}`],
+      [["add"], `spex add: missing <org>/<pkg>\n${addUsage}`],
+      [["rm", "demo/tool", "demo/other"], "spex rm: unexpected argument demo/other\nUsage: spex remove <org>/<pkg>"],
+      [["update", "extra"], "spex update: unexpected argument extra\nUsage: spex update"],
+      [["publish", "--dry-run=yes"], "spex publish: --dry-run takes no value\nUsage: spex publish [<org>/<pkg>] [--dry-run]"],
+      [["whoami", "stray"], "spex whoami: unexpected argument stray\nUsage: spex whoami [--registry <url> | --space <url>]"],
+      [["login", "--registry"], "spex login: --registry needs a URL\nUsage: spex login [--registry <url> | --space <url>] [--force]"],
+    ] as const) {
+      quietly([...args], (result) => {
+        assert.equal(result.exitCode, 1, `[cli-13] spex ${args.join(" ")} exits 1`);
+        assert.equal(result.stderr, `${cause}\n`, `[cli-13] spex ${args.join(" ")} names the cause, then the usage`);
+        assert.doesNotMatch(result.stderr, /Unknown option '|positional|argument missing|ambiguous/, "[cli-13] never Node's text");
+        assert.equal(result.stdout, "");
+      });
+    }
+  });
+
+  // Acceptance: scaffold without path in git repo uses repo root
+  it("scaffold without path resolves to git repo root", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+
+      const result = run(["scaffold"], { cwd: dir });
+      assert.equal(result.exitCode, 0, `should exit 0: ${result.stderr}`);
+      assert.ok(existsSync(join(dir, "specs", "map.md")));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold --lang zh applies localized overlays and English fallbacks", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      const result = run(["scaffold", "--lang", "zh", dir]);
+      assert.equal(result.exitCode, 0, `should exit 0: ${result.stderr}`);
+      assert.deepEqual(
+        readFileSync(join(dir, "specs", "meta.md")),
+        readFileSync(overlayPath("zh", "specs/meta.md")),
+      );
+      assert.deepEqual(
+        readFileSync(join(dir, "specs", "map.md")),
+        readFileSync(overlayPath("zh", "specs/map.md")),
+      );
+      assert.deepEqual(
+        readFileSync(join(dir, "specs", "packages", "git.md")),
+        readFileSync(overlayPath("zh", "specs/packages/git.md")),
+      );
+      for (const relPath of [
+        "specs/decisions/000-spec-structure-format.md",
+        "specs/intents/000-spdx-headers.md",
+      ]) {
+        assert.deepEqual(readFileSync(join(dir, relPath)), readFileSync(overlayPath("zh", relPath)));
+      }
+      const licensing = readFileSync(join(dir, "specs/packages/licensing.md"), "utf-8");
+      assert.equal(
+        licensing,
+        readFileSync(overlayPath("zh", "specs/packages/licensing.md"), "utf-8")
+          .replaceAll("<holder>", "Test <test@example.com>")
+          .replaceAll("<license>", "Apache-2.0")
+          .replaceAll("<year>", String(new Date().getFullYear())),
+      );
+      assert.doesNotMatch(licensing.slice(licensing.indexOf("### licensing-9")), /<holder>|<license>|<year>/);
+      assert.deepEqual(readFileSync(join(dir, "LICENSE")), readFileSync(bundledPath("LICENSE")));
+      assert.ok(
+        readFileSync(join(dir, "specs", "meta.md"), "utf-8").includes(
+          "Authoring language: zh",
+        ),
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold rejects unsupported language codes", () => {
+    const dir = makeTmp();
+    try {
+      const result = run(["scaffold", "--lang", "fr", dir]);
+      assert.notEqual(result.exitCode, 0);
+      assert.ok(result.stderr.includes("Unsupported language code: fr"));
+      assert.ok(result.stderr.includes("en, zh"));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold rejects language mismatches on existing specs trees", () => {
+    const dir = makeTmp();
+    try {
+      assert.equal(run(["scaffold", "--lang", "zh", dir]).exitCode, 0);
+      const before = readFileSync(join(dir, "specs", "map.md"));
+
+      const result = run(["scaffold", "--lang", "en", dir]);
+      assert.notEqual(result.exitCode, 0);
+      assert.ok(
+        result.stderr.includes("does not match existing authoring language zh"),
+      );
+      assert.deepEqual(readFileSync(join(dir, "specs", "map.md")), before);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // scaffold-54: a switch rewrites the bundled files in the target
+  // language and leaves the project's own specs to the printed prompt.
+  for (const [from, to] of [
+    ["en", "zh"],
+    ["zh", "en"],
+  ] as const) {
+    it(`update --lang switches the tree from ${from} to ${to}`, () => {
+      const dir = makeTmp();
+      try {
+        initGit(dir);
+        run(["scaffold", ...(from === "en" ? [] : ["--lang", from])], {
+          cwd: dir,
+        });
+        gitCommit(dir, `initial ${from} specs`);
+
+        const result = run(["scaffold", "--update", "--lang", to], {
+          cwd: dir,
+        });
+        assert.equal(result.exitCode, 0, result.stderr);
+
+        // Both overlay-bearing files convert, in either direction: the
+        // source language's bundled versions count as pristine, so they
+        // are converted rather than kept as user customizations.
+        for (const relPath of ["specs/meta.md", "specs/map.md"]) {
+          assert.deepEqual(
+            readFileSync(join(dir, relPath)),
+            readFileSync(
+              to === "en" ? bundledPath(relPath) : overlayPath(to, relPath),
+            ),
+            `${relPath} should be the ${to} bundled version`,
+          );
+        }
+
+        // A language change is not a user modification.
+        assert.doesNotMatch(result.stderr, /WARNING/);
+        assert.match(result.stdout, /switched from en to zh|switched from zh to en/);
+        // The project's own specs are the agent's job, and the prompt says so.
+        assert.match(result.stdout, /translate/i);
+      } finally {
+        rmSync(dir, { recursive: true });
+      }
+    });
+  }
+
+  // scaffold-39: a tree that declares no language could hold any
+  // bundled language, so all of them count as convertible — otherwise
+  // the switch anglicizes meta.md and keeps a Chinese map.md beside it.
+  it("update --lang converts a tree whose declaration was lost", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold", "--lang", "zh"], { cwd: dir });
+      gitCommit(dir, "initial zh specs");
+
+      const meta = join(dir, "specs", "meta.md");
+      writeFileSync(
+        meta,
+        readFileSync(meta, "utf-8").replace(
+          /^Authoring language: zh$/m,
+          "Authoring language",
+        ),
+      );
+      gitCommit(dir, "lose the declaration");
+
+      const result = run(["scaffold", "--update", "--lang", "en"], {
+        cwd: dir,
+      });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.match(result.stdout, /Authoring language set to en/);
+      assert.match(result.stdout, /Translate this project/);
+      for (const relPath of ["specs/meta.md", "specs/map.md"]) {
+        assert.deepEqual(
+          readFileSync(join(dir, relPath)),
+          readFileSync(bundledPath(relPath)),
+          `${relPath} should be the English bundled version`,
+        );
+      }
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("update --lang matching the declared language is an ordinary update", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+      gitCommit(dir, "initial specs");
+
+      const result = run(["scaffold", "--update", "--lang", "en"], {
+        cwd: dir,
+      });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.doesNotMatch(result.stdout, /switched from/);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold --update refreshes zh pristine files from active overlays", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      assert.equal(run(["scaffold", "--lang", "zh"], { cwd: dir }).exitCode, 0);
+      writeFileSync(
+        join(dir, "specs", "map.md"),
+        readFileSync(bundledPath("specs/map.md")),
+      );
+      gitCommit(dir, "zh scaffold with english map");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get("specs/map.md"),
+        "updated",
+      );
+      assert.deepEqual(
+        readFileSync(join(dir, "specs", "map.md")),
+        readFileSync(overlayPath("zh", "specs/map.md")),
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-24 cell: framework, hash equals bundled current.
+  it("update: framework at bundled current → (unchanged), bytes unchanged", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+      gitCommit(dir, "initial specs");
+
+      const target = join(dir, "specs", "meta.md");
+      const before = readFileSync(target);
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get("specs/meta.md"),
+        "unchanged",
+      );
+      assert.deepEqual(readFileSync(target), before);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-24 cell: framework, canonical hash equals bundled current.
+  it("update: framework at bundled current with CRLF → (unchanged), bytes unchanged", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+
+      const target = join(dir, "specs", "meta.md");
+      writeFileSync(target, toCrlf(readFileSync(target, "utf-8")));
+      gitCommit(dir, "initial specs with crlf framework");
+      const before = readFileSync(target);
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get("specs/meta.md"),
+        "unchanged",
+      );
+      assert.deepEqual(readFileSync(target), before);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-24 cell: framework, hash not in history (user-modified).
+  it("update: framework user-modified → (overwritten — user-modified), warns, bytes equal bundled", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+      gitCommit(dir, "initial specs");
+
+      const target = join(dir, "specs", "meta.md");
+      writeFileSync(target, "# locally extended\n\nAuthoring language: en\n");
+      gitCommit(dir, "extend meta");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get("specs/meta.md"),
+        "overwritten — user-modified",
+      );
+      assert.deepEqual(
+        readFileSync(target),
+        readFileSync(bundledPath("specs/meta.md")),
+      );
+
+      // SCAF-18: a warning names the replaced file and points to reconciliation.
+      assert.match(result.stderr, /WARNING/);
+      assert.match(result.stderr, /specs\/meta\.md/);
+      assert.match(result.stderr, /git diff -- specs/);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // scaffold-53: a damaged marker on an unrecognized meta.md is
+  // undeterminable, and guessing en would anglicize a localized tree,
+  // so the update stops before writing anything.
+  it("update: damaged marker stops the update and writes nothing", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold", "--lang", "zh"], { cwd: dir });
+      gitCommit(dir, "initial zh specs");
+
+      const target = join(dir, "specs", "meta.md");
+      const damaged = readFileSync(target, "utf-8").replace(
+        /^Authoring language: zh$/m,
+        "Authoring language",
+      );
+      writeFileSync(target, damaged);
+      gitCommit(dir, "damage the marker");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 1);
+      assert.match(result.stderr, /matches no bundled version/);
+      assertRecoveryGuidance(result.stderr);
+      // Nothing was written: the damaged file is still exactly as left.
+      assert.equal(readFileSync(target, "utf-8"), damaged);
+
+      // The printed recovery must actually work, run verbatim: restore
+      // the line, commit (--update needs a clean specs/ tree), re-run.
+      writeFileSync(
+        target,
+        damaged.replace(/^Authoring language$/m, "Authoring language: zh"),
+      );
+      gitCommit(dir, "restore the marker");
+      const recovered = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(recovered.exitCode, 0, recovered.stderr);
+      assert.deepEqual(
+        readFileSync(target),
+        readFileSync(overlayPath("zh", "specs/meta.md")),
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // scaffold-53: with no meta.md the language is unknown too, but
+  // --update repairs older trees by creating missing framework files,
+  // so it proceeds as en and says so rather than stopping.
+  it("update: missing meta.md warns that it proceeds as en", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold", "--lang", "zh"], { cwd: dir });
+      gitCommit(dir, "initial zh specs");
+
+      rmSync(join(dir, "specs", "meta.md"));
+      gitCommit(dir, "delete meta");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.match(result.stderr, /authoring language is unknown/);
+      assertRecoveryGuidance(result.stderr);
+      const target = join(dir, "specs", "meta.md");
+      assert.equal(existsSync(target), true);
+
+      // The printed recovery must actually work, run verbatim: set the
+      // line, commit (--update needs a clean specs/ tree), re-run.
+      writeFileSync(
+        target,
+        readFileSync(target, "utf-8").replace(
+          /^Authoring language: en$/m,
+          "Authoring language: zh",
+        ),
+      );
+      gitCommit(dir, "declare zh");
+      const recovered = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(recovered.exitCode, 0, recovered.stderr);
+      assert.deepEqual(
+        readFileSync(target),
+        readFileSync(overlayPath("zh", "specs/meta.md")),
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-24 cell: framework, hash in history but not current (older pristine).
+  // SCAF-35: a pre-localization specs tree updates cleanly without warning.
+  // SCAF-26: a pre-packages bundled meta.md is an old-generation marker,
+  // so the run also prints the migration prompt — with no legacy directory.
+  it("update: pre-localization framework (older pristine) → (updated), no warning, migration prompt", () => {
+    const dir = makeTmp();
+    try {
+      const fixture = readFileSync(PRE_LOCALIZATION_META);
+      const fixtureHash = canonicalContentHash(fixture);
+      const history = getFileHistory("specs/meta.md");
+      assert.ok(
+        history.includes(fixtureHash),
+        "fixture must be a recognized bundled meta.md version",
+      );
+      assert.notEqual(
+        fixtureHash,
+        history[history.length - 1],
+        "fixture must not be the current bundled meta.md",
+      );
+      assert.ok(
+        !fixture.toString("utf-8").includes("Authoring language"),
+        "fixture must predate the authoring-language declaration",
+      );
+
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+      const target = join(dir, "specs", "meta.md");
+      writeFileSync(target, fixture);
+      gitCommit(dir, "pre-localization specs tree");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get("specs/meta.md"),
+        "updated",
+      );
+      assert.deepEqual(
+        readFileSync(target),
+        readFileSync(bundledPath("specs/meta.md")),
+      );
+
+      // Updated cleanly: no warning of any kind — a bundled English
+      // meta.md predating the marker is recognized, not ambiguous
+      // (scaffold-53).
+      assert.doesNotMatch(result.stderr, /warning/i);
+
+      // Old-generation marker: the prompt prints without a legacy dir.
+      assertMigrationPrompt(result.stdout);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-24 cell: seed, hash equals bundled current.
+  it("update: seed at bundled current → (unchanged), bytes unchanged", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+      gitCommit(dir, "initial specs");
+
+      const target = join(dir, "specs", "packages", "git.md");
+      const before = readFileSync(target);
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get("specs/packages/git.md"),
+        "unchanged",
+      );
+      assert.deepEqual(readFileSync(target), before);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-24 cell: seed, canonical hash equals bundled current.
+  it("update: seed at bundled current with CRLF → (unchanged), bytes unchanged", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+
+      const target = join(dir, "specs", "packages", "git.md");
+      writeFileSync(target, toCrlf(readFileSync(target, "utf-8")));
+      gitCommit(dir, "initial specs with crlf seed");
+      const before = readFileSync(target);
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get("specs/packages/git.md"),
+        "unchanged",
+      );
+      assert.deepEqual(readFileSync(target), before);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-24 cell: seed, hash in history but not current. The map.md
+  // history holds the legacy-layout versions. An older bundled map is
+  // no old-generation marker on its own, so no migration prompt prints.
+  it("update: seed at prior bundled version → (updated), bytes equal bundled current", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+      const target = join(dir, "specs", "map.md");
+      writeFileSync(target, readFileSync(legacyFixture("specs/map.md")));
+      gitCommit(dir, "initial specs with prior map");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get("specs/map.md"),
+        "updated",
+      );
+      assert.deepEqual(
+        readFileSync(target),
+        readFileSync(bundledPath("specs/map.md")),
+      );
+      assert.ok(!result.stdout.includes(GUIDANCE_MARKER));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-24 cell: seed, hash not in history (user customized).
+  it("update: seed customized → (kept — user-modified), bytes unchanged", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+      gitCommit(dir, "initial specs");
+
+      const target = join(dir, "specs", "map.md");
+      writeFileSync(target, "# Custom map\n");
+      gitCommit(dir, "customize map");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get("specs/map.md"),
+        "kept — user-modified",
+      );
+      assert.equal(readFileSync(target, "utf-8"), "# Custom map\n");
+      assert.match(result.stdout, /--update[^\n]*complet/i);
+      assert.ok(result.stdout.includes("git diff -- specs"));
+      assert.ok(result.stdout.includes("spex lint"));
+      assert.ok(result.stdout.includes(readBundledMergePrompt()));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-52: plain scaffold refuses a legacy tree, writes nothing, and
+  // points at --update and its migration prompt.
+  it("scaffold refuses a legacy tree and points at --update", () => {
+    const dir = makeLegacyRepo();
+    try {
+      const result = run(["scaffold", dir]);
+      assert.notEqual(result.exitCode, 0, result.stdout);
+      assert.match(result.stderr, /legacy/);
+      assert.match(result.stderr, /--update/);
+      assert.match(result.stderr, /migration prompt/);
+      // Nothing was written: the current seed target must not exist,
+      // or migration would face two entangled generations.
+      assert.ok(!existsSync(join(dir, "specs", "packages", "git.md")));
+      assert.ok(!existsSync(join(dir, "specs", "intents")));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-52: a legacy specs/compositions/ directory also refuses.
+  it("scaffold refuses a tree with specs/compositions/", () => {
+    const dir = makeTmp();
+    try {
+      mkdirSync(join(dir, "specs", "compositions"), { recursive: true });
+      writeFileSync(
+        join(dir, "specs", "compositions", "flow.md"),
+        "# FLOW: Flow\n",
+      );
+
+      const result = run(["scaffold", dir]);
+      assert.notEqual(result.exitCode, 0, result.stdout);
+      assert.match(result.stderr, /specs\/compositions\//);
+      assert.match(result.stderr, /--update/);
+      assert.ok(!existsSync(join(dir, "specs", "packages")));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-24 cell: seed, file absent.
+  it("update: sample intent seed deleted → (created)", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+      gitCommit(dir, "initial specs");
+
+      const target = join(dir, "specs", "intents", "000-spdx-headers.md");
+      execSync("git rm specs/intents/000-spdx-headers.md", {
+        cwd: dir,
+        stdio: "ignore",
+      });
+      execSync('git commit -m "remove seed"', { cwd: dir, stdio: "ignore" });
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get(
+          "specs/intents/000-spdx-headers.md",
+        ),
+        "created",
+      );
+      assert.deepEqual(
+        readFileSync(target),
+        readFileSync(bundledPath("specs/intents/000-spdx-headers.md")),
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-26 / SCAF-27: --update on a legacy tree completes the template
+  // refresh, touches no legacy content, and prints the bundled migration
+  // prompt instead of the ordinary merge prompt.
+  it("update: legacy tree gets a template refresh, untouched legacy files, and migration prompt", () => {
+    const dir = makeLegacyRepo();
+    try {
+      const gitHash = canonicalContentHash(
+        readFileSync(legacyFixture("specs/dev/git.md")),
+      );
+      assert.ok(
+        getLegacyFileHistory("specs/dev/git.md").includes(gitHash),
+        "fixture must be a recognized legacy bundled version",
+      );
+      gitCommit(dir, "legacy tree");
+      const legacyBefore = new Map(
+        LEGACY_REPO_FILES.map((relPath) => [
+          relPath,
+          readFileSync(join(dir, relPath)),
+        ]),
+      );
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+
+      // The template refresh completed: frameworks and seeds are at the
+      // bundled current, absent seeds were created beside the legacy files.
+      const indicators = parseIndicators(result.stdout);
+      assert.equal(indicators.get("specs/meta.md"), "updated");
+      assert.equal(indicators.get("specs/map.md"), "updated");
+      assert.equal(
+        indicators.get("specs/decisions/000-spec-structure-format.md"),
+        "unchanged",
+      );
+      assert.equal(indicators.get("specs/packages/git.md"), "created");
+      assert.equal(indicators.get("specs/packages/licensing.md"), "created");
+      assert.equal(
+        indicators.get("specs/intents/000-spdx-headers.md"),
+        "created",
+      );
+      assert.deepEqual(
+        readFileSync(join(dir, "specs", "meta.md")),
+        readFileSync(bundledPath("specs/meta.md")),
+      );
+      assert.deepEqual(
+        readFileSync(join(dir, "specs", "packages", "git.md")),
+        readFileSync(bundledPath("specs/packages/git.md")),
+      );
+
+      // SCAF-27: every file under the legacy directories stays
+      // byte-identical and in place — the run moves, merges, rewrites,
+      // and deletes no legacy content.
+      for (const [relPath, before] of legacyBefore) {
+        assert.ok(existsSync(join(dir, relPath)), `${relPath} must remain`);
+        assert.deepEqual(
+          readFileSync(join(dir, relPath)),
+          before,
+          `${relPath} must stay byte-identical`,
+        );
+      }
+
+      // The migration prompt prints after the completion message.
+      assertMigrationPrompt(result.stdout);
+
+      // SCAF-11: exactly one indicator line per path, none after the
+      // selected structure-reconciliation prompt.
+      const metaIndicatorLines = result.stdout
+        .split("\n")
+        .filter((line) => /^\s+specs\/meta\.md \(/.test(line));
+      assert.equal(metaIndicatorLines.length, 1);
+      assert.ok(
+        result.stdout.indexOf("specs/meta.md (") <
+          result.stdout.indexOf("--update completed"),
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-25: over-eager indicator regression guard; a current-generation
+  // tree prints no migration prompt.
+  it("update: (updated) does not appear for any unchanged file", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+      gitCommit(dir, "initial specs");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      const indicators = parseIndicators(result.stdout);
+      for (const [path, indicator] of indicators) {
+        assert.notEqual(
+          indicator,
+          "updated",
+          `${path} reported (updated) on a freshly scaffolded repo`,
+        );
+      }
+      assert.ok(
+        !result.stdout.includes(GUIDANCE_MARKER),
+        "no migration prompt on a current-generation tree",
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // scaffold-5: inferred managed targets are refreshed without widening them.
+  it("update: refreshes only the inferred managed target", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      run(["scaffold"], { cwd: dir });
+      writeFileSync(
+        join(dir, "CLAUDE.md"),
+        "# Project\n\n## Specs (Source of Truth)\n\nStale section.\n- Run `spex lint` after editing specs.\n\n## Other\n\nKept.\n",
+      );
+      rmSync(join(dir, "AGENTS.md"));
+      rmSync(join(dir, "GEMINI.md"));
+      gitCommit(dir, "initial specs");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      const claude = readFileSync(join(dir, "CLAUDE.md"), "utf-8");
+      assert.ok(claude.includes("@specs/packages"));
+      assert.ok(!claude.includes("Stale section."));
+      // scaffold-56/scaffold-57: the bare `spex lint` form gives way to npx.
+      assert.ok(claude.includes("`npx @sublang/spex lint`"));
+      assert.ok(!claude.includes("Run `spex lint` after editing specs."));
+      assert.ok(claude.includes("## Other"));
+      assert.equal(
+        existsSync(join(dir, "AGENTS.md")),
+        false,
+        "--update should keep the inferred target set",
+      );
+      assert.equal(
+        existsSync(join(dir, "GEMINI.md")),
+        false,
+        "--update should keep the inferred target set",
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold --agents selects native targets without prompting", () => {
+    const dir = makeTmp();
+    try {
+      const result = run(["scaffold", "--agents=gemini", dir]);
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(existsSync(join(dir, "CLAUDE.md")), false);
+      assert.equal(existsSync(join(dir, "AGENTS.md")), false);
+      assert.ok(existsSync(join(dir, "GEMINI.md")));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("update: an explicit agent switch preserves unrelated prose", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      assert.equal(run(["scaffold"], { cwd: dir }).exitCode, 0);
+      writeFileSync(
+        join(dir, "CLAUDE.md"),
+        `${readFileSync(join(dir, "CLAUDE.md"), "utf-8")}\n## Project\n\nKeep.\n`,
+      );
+      gitCommit(dir, "initial specs");
+
+      const result = run(["scaffold", "--update", "--agents=gemini"], {
+        cwd: dir,
+      });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        readFileSync(join(dir, "CLAUDE.md"), "utf-8"),
+        "## Project\n\nKeep.\n",
+      );
+      assert.equal(existsSync(join(dir, "AGENTS.md")), false);
+      assert.ok(
+        readFileSync(join(dir, "GEMINI.md"), "utf-8").includes(
+          "## Specs (Source of Truth)",
+        ),
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("update: a target with no agent files receives the default set", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      assert.equal(run(["scaffold"], { cwd: dir }).exitCode, 0);
+      rmSync(join(dir, "CLAUDE.md"));
+      rmSync(join(dir, "AGENTS.md"));
+      rmSync(join(dir, "GEMINI.md"));
+      gitCommit(dir, "initial specs");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      for (const file of ["CLAUDE.md", "AGENTS.md", "GEMINI.md"]) {
+        assert.ok(existsSync(join(dir, file)), `${file} should be created`);
+      }
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold rejects an unknown agent before writing", () => {
+    const dir = makeTmp();
+    try {
+      const result = run(["scaffold", "--agents=cursor", dir]);
+      assert.notEqual(result.exitCode, 0);
+      assert.match(result.stderr, /Unknown agent/);
+      assert.equal(existsSync(join(dir, "specs")), false);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold --update rejects a path argument", () => {
+    const dir = makeTmp();
+    try {
+      const result = run(["scaffold", "--update", dir]);
+      assert.notEqual(result.exitCode, 0);
+      assert.ok(result.stderr.includes("--update does not accept a <path>"));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold --update rejects outside git repositories", () => {
+    const dir = makeTmp();
+    try {
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.notEqual(result.exitCode, 0);
+      assert.ok(result.stderr.includes("requires cwd inside a git repository"));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("scaffold --update rejects dirty specs trees", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      assert.equal(run(["scaffold"], { cwd: dir }).exitCode, 0);
+      gitCommit(dir, "initial specs");
+
+      writeFileSync(join(dir, "specs", "map.md"), "# Dirty\n");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.notEqual(result.exitCode, 0);
+      assert.ok(result.stderr.includes("requires a clean specs/ working tree"));
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // SCAF-17: missing framework files are created, and files outside
+  // the framework and seed sets stay unmodified (SCAF-11 step 4).
+  it("scaffold --update creates framework files missing from older specs trees", () => {
+    const dir = makeTmp();
+    try {
+      initGit(dir);
+      mkdirSync(join(dir, "specs", "decisions"), { recursive: true });
+      writeFileSync(join(dir, "specs", "spec-map.md"), "# Old map\n");
+      writeFileSync(
+        join(dir, "specs", "decisions", "000-initial-specs-structure.md"),
+        "# Old decision\n",
+      );
+      gitCommit(dir, "old scaffold specs");
+
+      const result = run(["scaffold", "--update"], { cwd: dir });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(
+        parseIndicators(result.stdout).get("specs/meta.md"),
+        "updated",
+      );
+      assert.equal(
+        parseIndicators(result.stdout).get(
+          "specs/decisions/000-spec-structure-format.md",
+        ),
+        "updated",
+      );
+      assert.deepEqual(
+        readFileSync(join(dir, "specs", "meta.md")),
+        readFileSync(bundledPath("specs/meta.md")),
+      );
+      assert.equal(
+        readFileSync(join(dir, "specs", "spec-map.md"), "utf-8"),
+        "# Old map\n",
+      );
+      assert.equal(
+        readFileSync(
+          join(dir, "specs", "decisions", "000-initial-specs-structure.md"),
+          "utf-8",
+        ),
+        "# Old decision\n",
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // lint CLI: clean and failing trees, plus target resolution.
+  it("lint reports errors with file:line and exits non-zero", () => {
+    const dir = makeTmp();
+    try {
+      write(
+        dir,
+        "specs/packages/auth.md",
+        "# AUTH: Auth\n\n## Intent\n\nSee [gone](missing.md).\n\n## External Behavior\n\n### OTHER-1\n\nX shall Y.\n",
+      );
+      write(
+        dir,
+        "specs/meta.md",
+        "# META: Spec Definition\n\n## Intent\n\nX.\n",
+      );
+      write(dir, "specs/map.md", "# Spec Map\n");
+
+      const result = run(["lint", dir]);
+      assert.equal(result.exitCode, 1);
+      assert.match(result.stdout, /specs\/packages\/auth\.md:\d+: error /);
+      assert.match(result.stdout, /\d+ errors?, \d+ warnings?/);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("lint flags legacy trees and exits non-zero", () => {
+    const dir = makeLegacyRepo();
+    try {
+      const result = run(["lint", dir]);
+      assert.equal(result.exitCode, 1);
+      assert.match(result.stdout, /legacy directory/);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // LINT-3: printed paths use forward slashes from any cwd — on
+  // Windows, neither the OS separator nor an 8.3 short-form cwd may
+  // leak into the reported paths.
+  it("lint prints forward-slash paths from any working directory", () => {
+    const dir = makeTmp();
+    try {
+      run(["scaffold"], { cwd: dir });
+      mkdirSync(join(dir, "specs", "user"));
+
+      const result = run(["lint", basename(dir)], { cwd: dirname(dir) });
+      assert.notEqual(result.exitCode, 0, result.stdout);
+      const findingLines = result.stdout
+        .split("\n")
+        .filter((line) => line.includes(": error "));
+      assert.ok(findingLines.length > 0, result.stdout);
+      for (const line of findingLines) {
+        assert.ok(!line.includes("\\"), line);
+      }
+      assert.ok(
+        findingLines.some((line) =>
+          line.startsWith(`${basename(dir)}/specs/user`),
+        ),
+        result.stdout,
+      );
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("lint exits non-zero without a specs tree", () => {
+    const dir = makeTmp();
+    try {
+      const result = run(["lint", dir]);
+      assert.equal(result.exitCode, 1);
+      assert.match(result.stdout, /no specs\/ directory/);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  // Packaging: the bundled assets ship with the npm package.
+  it("npm pack ships the manifests, agent prompts, and seeds", () => {
+    // execSync (a shell) so Windows resolves npm.cmd.
+    const output = execSync("npm pack --dry-run --json", {
+      cwd: ROOT,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const [{ files }] = JSON.parse(output) as [{ files: { path: string }[] }];
+    const paths = new Set(files.map((f) => f.path));
+    for (const required of [
+      "scaffold/.file-history.json",
+      "scaffold/.legacy-file-history.json",
+      "scaffold/update-merge-prompt.md",
+      "scaffold/spec-migration-prompt.md",
+      "scaffold/specs/intents/000-spdx-headers.md",
+      "scaffold/specs/packages/git.md",
+      "scaffold/specs/packages/licensing.md",
+    ]) {
+      assert.ok(paths.has(required), `${required} missing from npm pack`);
+    }
+    assert.ok(
+      !paths.has("scaffold/compositions-prompt.md"),
+      "the retired compositions prompt must not ship",
+    );
+  });
+
+  // Dogfood: this repository's own specs tree lints clean. Skipped
+  // when the monorepo specs are absent (standalone package checkout).
+  // KNOWN RED: the normative bundled DR-000 carries five old-form
+  // citations (three with dead anchors) pending human approval to fix.
+  it("repo specs lint clean", (t) => {
+    const repoSpecs = resolve(ROOT, "..", "..", "specs");
+    if (!existsSync(repoSpecs)) {
+      t.skip("monorepo specs/ not present");
+      return;
+    }
+    const result = run(["lint", resolve(ROOT, "..", "..")]);
+    assert.equal(result.exitCode, 0, result.stdout);
+  });
+});

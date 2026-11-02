@@ -1,0 +1,178 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+import { mergeEnv, parseEnvOutput } from "./shell-env.js";
+import { speak } from "./i18n.js";
+import { notificationFor } from "./notifications.js";
+import type { RecordEnvelope } from "@sublang/spex-core";
+
+function envelope(record: Record<string, unknown>, hidden = false): RecordEnvelope {
+  return {
+    sessionId: "s1",
+    seq: 1,
+    hidden,
+    record: record as unknown as RecordEnvelope["record"],
+  };
+}
+
+/** The mapping in English; i18n.test.ts covers the reader's language. */
+function notify(
+  received: RecordEnvelope,
+  prefs: Record<string, string>,
+): ReturnType<typeof notificationFor> {
+  return notificationFor(received, prefs, speak("en"));
+}
+
+test("parseEnvOutput reads keys after the marker and multi-line values", () => {
+  const parsed = parseEnvOutput(
+    "zsh: noise before\n__SPEX_ENV_START__\nANTHROPIC_API_KEY=sk-test\nMULTI=line one\nline two\nPATH=/usr/bin\n",
+  );
+  assert.equal(parsed.ANTHROPIC_API_KEY, "sk-test");
+  assert.equal(parsed.MULTI, "line one\nline two");
+  assert.equal(parsed.PATH, "/usr/bin");
+  assert.equal(parsed["zsh: noise before"], undefined);
+});
+
+test("mergeEnv never clobbers existing values", () => {
+  const target: NodeJS.ProcessEnv = { PATH: "/original" };
+  mergeEnv(target, { PATH: "/captured", NEW_KEY: "v" });
+  assert.equal(target.PATH, "/original");
+  assert.equal(target.NEW_KEY, "v");
+});
+
+test("notificationFor honors sink preferences and hidden records", () => {
+  assert.equal(
+    notify(envelope({ type: "turn_finished", turnId: 1 }), {
+      turn_finished: "off",
+    }),
+    null,
+  );
+  const shown = notify(envelope({ type: "turn_finished", turnId: 1 }), {});
+  assert.equal(shown?.event, "turn_finished");
+  assert.equal(shown?.sink, "desktop");
+  const belled = notify(envelope({ type: "turn_finished", turnId: 1 }), {
+    turn_finished: "bell",
+  });
+  assert.equal(belled?.sink, "bell");
+  assert.equal(
+    notify(envelope({ type: "turn_finished", turnId: 1 }, true), {}),
+    null,
+  );
+});
+
+test("notificationFor maps player_finished behind its off-by-default pref", () => {
+  const record = {
+    type: "player_finished",
+    playerId: "coder",
+    result: { status: "succeeded" },
+  };
+  assert.equal(notify(envelope(record), {}), null);
+  const shown = notify(envelope(record), {
+    player_finished: "desktop",
+  });
+  assert.equal(shown?.event, "player_finished");
+  assert.equal(shown?.sink, "desktop");
+  assert.equal(shown?.title, "Player finished");
+  assert.equal(shown?.body, "coder succeeded");
+  const belled = notify(envelope(record), { player_finished: "bell" });
+  assert.equal(belled?.sink, "bell");
+});
+
+test("notificationFor surfaces boss questions with the question text", () => {
+  const notification = notify(
+    envelope({
+      type: "captain_telemetry",
+      topic: "playbook.fsm.state",
+      payload: { to: "awaitBossReply", pendingBossQuestion: "Which flow?" },
+    }),
+    {},
+  );
+  assert.equal(notification?.event, "boss_question");
+  assert.equal(notification?.sink, "desktop");
+  assert.equal(notification?.body, "Which flow?");
+});
+
+test("notificationFor folds the 2.0 shell's object-shaped telemetry", () => {
+  // The real captain shell reports states as rich objects and the
+  // pending question as a {player, question, …} record; the string
+  // forms above come from the fake harness and older playbooks.
+  const notification = notify(
+    envelope({
+      type: "captain_telemetry",
+      topic: "playbook.fsm.state",
+      payload: {
+        event: { type: "NEEDS_BOSS" },
+        to: {
+          value: "awaitBossReply",
+          activeStateIds: ["awaitBossReply"],
+          tags: ["playbook.parked"],
+          stateId: "awaitBossReply",
+        },
+        pendingBossQuestion: {
+          player: "coder",
+          question: "Should I migrate the legacy sessions?",
+          resumeStateId: "coding",
+        },
+      },
+    }),
+    {},
+  );
+  assert.equal(notification?.event, "boss_question");
+  assert.equal(
+    notification?.body,
+    "Should I migrate the legacy sessions?",
+  );
+  // A non-parked object state stays silent.
+  assert.equal(
+    notify(
+      envelope({
+        type: "captain_telemetry",
+        topic: "playbook.fsm.state",
+        payload: { to: { stateId: "coding", value: "coding" } },
+      }),
+      {},
+    ),
+    null,
+  );
+});
+
+test("boss questions and failures are always desktop notifications", () => {
+  const failure = notify(
+    envelope({ type: "runtime_error", message: "boom" }),
+    { turn_finished: "off", turn_aborted: "off", player_finished: "off" },
+  );
+  assert.equal(failure?.event, "failure");
+  assert.equal(failure?.sink, "desktop");
+});
+
+test("notificationFor surfaces the 2.0 shell's failed state", () => {
+  const failure = notify(
+    envelope({
+      type: "captain_telemetry",
+      topic: "playbook.fsm.state",
+      payload: { to: { stateId: "failed", value: "failed" } },
+    }),
+    {},
+  );
+  assert.equal(failure?.event, "failure");
+  assert.equal(failure?.sink, "desktop");
+});
+
+test("main process installs external-navigation guards", () => {
+  const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  assert.match(source, /setWindowOpenHandler/);
+  assert.match(source, /will-navigate/);
+});
+
+test("the dock badge reads the core's one attention count, re-read whenever it moves (app-shell-4)", () => {
+  const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  // The count the core reads over its own badge and each open seat's
+  // (core-service-129), re-read on every move the core reports — this
+  // core's ledger or a seat's badge — never this core's badge alone.
+  assert.match(source, /service\.events\.onLedgerChange = \(\) => \{[^}]*app\.setBadgeCount\(service\?\.attentionCount\(\) \?\? 0\)/);
+  assert.doesNotMatch(source, /ledger\(\)\.badge/);
+});

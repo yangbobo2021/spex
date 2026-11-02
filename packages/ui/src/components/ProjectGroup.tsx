@@ -1,0 +1,1804 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// One project's ledger group (dashboard-26..30, DR-035): History,
+// Now, Up next, and Sources, drawn by this one component wherever the
+// group appears — the Dashboard lists every project's, the Overview
+// tab pins one (projects-4, DR-038, DR-027). Every state here is
+// derived; the group writes only Boss acts (queue, edit, close,
+// remove) and the Dashboard's reader-owned disclosure preference.
+
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ButtonHTMLAttributes,
+  type ReactNode,
+} from "react";
+import type {
+  ClosedIntent,
+  DerivedIntent,
+  IntentInfo,
+  IntentSource,
+  MediaAsset,
+  ProjectInfo,
+  SessionInfo,
+  SpecRecordInfo,
+  SpecTreeState,
+} from "@sublang/spex-core/protocol";
+
+import { intentMediaOwner, type ProjectMeta } from "../state/store.js";
+import { usePlaceStore } from "../state/place-context.js";
+import type { SessionView } from "../state/reducer.js";
+import {
+  ATTENTION_MARK_CLASS,
+  ATTENTION_RANK,
+  PROJECT_ATTENTION_WORDS,
+  type AttentionKind,
+} from "../state/dashboard.js";
+import { i18n } from "../i18n.js";
+import { stateLabel, type StatusTone } from "../lib/labels.js";
+import { parkedFailure } from "../lib/machine-frames.js";
+import { absoluteTitle, relativeAge } from "../lib/time.js";
+import { useAutoGrow } from "../lib/useAutoGrow.js";
+import { usePopover } from "../lib/usePopover.js";
+import { activatedByKeyboard, useUndoLine } from "../lib/useUndoLine.js";
+import {
+  currentSessionOf,
+  hasUnservedFinishedConversation,
+} from "../lib/sessions.js";
+import { contentTitle } from "../lib/message-content.js";
+import { useComposerAttachments } from "../lib/useComposerAttachments.js";
+import { ComposerBox } from "./Composer.js";
+import { canSubmitContent } from "./ComposerAttachments.js";
+import { intentTitle } from "./DeliveryCard.js";
+import { RunningMark } from "./RunningMark.js";
+import { SourcesBand } from "./SourcesTabs.js";
+import { openSourceIntents } from "./ForgeItemRow.js";
+import { Icon } from "./Icon.js";
+import { InlineConfirm } from "./InlineConfirm.js";
+import { RecordRow } from "./RecordRow.js";
+import { ResizableFrame } from "./ResizableFrame.js";
+import { Rich } from "./Rich.js";
+import {
+  QueuedMark,
+  QueueStandingPhrase,
+  runsOnPhrase,
+} from "./QueuedIntentPresentation.js";
+
+// ---------------------------------------------------------------------------
+// Copy and formatting
+// ---------------------------------------------------------------------------
+
+export function firstLine(text: string): string {
+  return text.split(/\r?\n/, 1)[0] ?? text;
+}
+
+/** A session's work in its own words: the Boss turn that opened the
+ * work it is doing, as the core names it — never an answer sent while
+ * the run's question stood (core-service-32, DR-119) — its first turn
+ * from a core that names none, and a plain stand-in before any turn.
+ * The Now band and the Running band read this one rule, so the two
+ * never disagree (dashboard-28, dashboard-50). */
+export function sessionWorkTitle(session: SessionInfo): string {
+  return firstLine(
+    session.workTitle ?? session.title ?? i18n._("no messages yet"),
+  );
+}
+
+/** A project's queue in the order the core serves it: oldest first
+ * (dashboard-29, core-service-107). */
+export function queueOf(
+  intents: DerivedIntent[],
+  projectId: string,
+): DerivedIntent[] {
+  return intents.filter(
+    (derived) =>
+      derived.intent.projectId === projectId && derived.state === "queued",
+  );
+}
+
+/** What a session is doing, in the one status vocabulary
+ * (dashboard-28, dashboard-50, DR-010 §2): the label the Now band
+ * shows and the raw state it speaks for, with activity supplied by
+ * the caller — a live turn with no leaf state says "working" while a
+ * player runs and "deciding" while the Captain has the floor, and a
+ * settled session with a run parked in its failure state reads that
+ * run's own state rather than the last one reported (run-view-59,
+ * DR-061). */
+export function sessionStatus(
+  view: SessionView | undefined,
+  turnActive: boolean | undefined,
+): { text: string; tone: StatusTone; state?: string } {
+  return stateLabel(view?.fsmState, {
+    pendingQuestion: view?.pendingQuestion !== undefined,
+    parkedFailure: parkedFailure(view?.frames ?? [])?.active ?? undefined,
+    turnActive,
+    playersRunning: runningPlayer(view) !== undefined,
+  });
+}
+
+/** The player holding the floor, when one runs: the Running band
+ * names it beside the state (dashboard-50). */
+export function runningPlayer(view: SessionView | undefined): string | undefined {
+  return Object.values(view?.players ?? {}).find((player) => player.running)?.id;
+}
+
+/** When the session's turn in flight began — the first line it drew,
+ * so its span reads without new state (dashboard-50). */
+export function turnStartedAt(view: SessionView | undefined): number | undefined {
+  if (!view?.turnActive) return undefined;
+  return view.captain.find((line) => line.turnId === view.currentTurnId)?.at;
+}
+
+/** Session-state chip classes per tone (DR-013: brand purple stays
+ * interactive, so status chips tint amber/red/neutral only; running
+ * aliveness is the emerald mark, not a chip hue). */
+export const TONE_CHIP: Record<StatusTone, string> = {
+  amber: "bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300",
+  red: "bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-300",
+  emerald:
+    "bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400",
+  neutral:
+    "bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400",
+};
+
+const TAG = "shrink-0 rounded-full px-1.5 py-0.5 text-xs";
+const NEUTRAL_TAG = `${TAG} bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400`;
+/** The band's one red tag (DR-038): a fixed bug, gone. */
+const BUG_TAG = `${TAG} bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300`;
+
+const MENU_ITEM =
+  "flex min-h-6 items-center gap-3 rounded px-2 py-1 text-left hover:bg-neutral-100 disabled:opacity-40 disabled:hover:bg-transparent dark:hover:bg-neutral-800";
+
+const TEXT_LINK =
+  "min-h-6 rounded px-1 text-brand-600 hover:underline dark:text-brand-300";
+
+/** How long a dropped intent's outcome line stands. */
+const NOTE_MS = 6_000;
+
+export interface CaptureInput {
+  projectId: string;
+  text: string;
+  attachments?: readonly MediaAsset[];
+  source?: IntentSource;
+}
+
+/** The ledger's read state, so an empty queue is never claimed before
+ * the ledger has been read (dashboard-8). */
+type LedgerState = "loading" | "failed" | "ready";
+
+// ---------------------------------------------------------------------------
+// The group's inputs, shared by every surface that draws one
+// ---------------------------------------------------------------------------
+
+/** A slow clock for the age labels: honest during quiet periods,
+ * never a re-render storm. */
+export function useNow(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+  return now;
+}
+
+/** The core's forge cache window (dashboard-14): lists older than this
+ * are asked for again while a group stays on screen, on a slow clock. */
+const FORGE_STALE_MS = 600_000;
+const FORGE_STALE_CHECK_MS = 60_000;
+
+/** The one fold, plus each group's inputs — meta, specs tree, History
+ * first page — load on demand once connected; forge lists past the
+ * cache window are asked for again while the groups stay on screen. */
+export function useGroupInputs(projects: readonly ProjectInfo[]): void {
+  const store = usePlaceStore();
+  const connection = store((state) => state.connection);
+  const key = projects.map((project) => project.id).join("\n");
+  useEffect(() => {
+    if (connection !== "open") return;
+    const state = store.getState();
+    if (!state.ledger && !state.ledgerError) void state.loadLedger();
+    for (const project of projects) {
+      if (!state.projectMeta[project.id]) void state.loadProjectMeta(project.id);
+      if (!state.specTrees[project.id]) void state.loadSpecs(project.id);
+      if (!state.history[project.id]) void state.loadHistory(project.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connection, key]);
+  useEffect(() => {
+    if (connection !== "open") return;
+    const timer = setInterval(() => {
+      const state = store.getState();
+      const now = Date.now();
+      for (const project of projects) {
+        const meta = state.projectMeta[project.id];
+        const at = meta?.forge?.at;
+        if (meta && !meta.loading && at !== undefined && now - at >= FORGE_STALE_MS) {
+          void state.loadProjectMeta(project.id);
+        }
+      }
+    }, FORGE_STALE_CHECK_MS);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connection, key]);
+}
+
+/** When each project's served forge lists were fetched — the moment
+ * the core carries with them (dashboard-14), so a client that first
+ * sees a cached list shows the data's age and not its own read's; a
+ * core without the moment falls back to the read. */
+export function useForgeAge(
+  projects: readonly ProjectInfo[],
+): (projectId: string) => number | undefined {
+  const store = usePlaceStore();
+  const projectMeta = store((state) => state.projectMeta);
+  const metaSeen = useRef(new Map<string, ProjectMeta>());
+  const [fetchedAt, setFetchedAt] = useState<Record<string, number>>({});
+  useEffect(() => {
+    const updates: Record<string, number> = {};
+    for (const project of projects) {
+      const meta = projectMeta[project.id];
+      if (meta && !meta.loading && metaSeen.current.get(project.id) !== meta) {
+        metaSeen.current.set(project.id, meta);
+        updates[project.id] = meta.forge?.at ?? Date.now();
+      }
+    }
+    if (Object.keys(updates).length > 0) {
+      setFetchedAt((current) => ({ ...current, ...updates }));
+    }
+  }, [projectMeta, projects]);
+  return (projectId) => fetchedAt[projectId];
+}
+
+/** Capture reveals the shelf (dashboard-31): the new row lands with
+ * a brief highlight where it landed. */
+export function useCaptureReveal(): {
+  highlightId?: string;
+  capture: (input: CaptureInput) => Promise<IntentInfo>;
+} {
+  const store = usePlaceStore();
+  const queueIntent = store((state) => state.queueIntent);
+  const [highlightId, setHighlightId] = useState<string>();
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current);
+    },
+    [],
+  );
+  const capture = async (input: CaptureInput): Promise<IntentInfo> => {
+    const intent = await queueIntent(input);
+    setHighlightId(intent.id);
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => setHighlightId(undefined), 2500);
+    return intent;
+  };
+  return { highlightId, capture };
+}
+
+// ---------------------------------------------------------------------------
+// History
+// ---------------------------------------------------------------------------
+
+function BandHeading({ children }: { children: ReactNode }) {
+  return (
+    <h4 className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
+      {children}
+    </h4>
+  );
+}
+
+export type HistoryRow =
+  | { kind: "intent"; id: string; at: number; intent: IntentInfo }
+  | { kind: "record"; id: string; at: number; record: SpecRecordInfo };
+
+/** The moment a finished record's status line dates it — "Done
+ * (2026-09-02)" — when it carries one (dashboard-27). */
+export function statusDate(status: string | undefined): number | undefined {
+  const match = /\b(\d{4}-\d{2}-\d{2})\b/.exec(status ?? "");
+  if (!match) return undefined;
+  const at = Date.parse(match[1]);
+  return Number.isFinite(at) ? at : undefined;
+}
+
+/** The band's one timeline (dashboard-27, DR-038): the served worked
+ * closed intents and the tree's finished records, newest first — a
+ * record a closed intent names as its provenance lists once, as that
+ * intent. Intents order by close time, records by the date their
+ * status line carries, else by their file's last change. */
+export function historyRows(
+  closed: readonly ClosedIntent[],
+  records: readonly SpecRecordInfo[],
+): HistoryRow[] {
+  const named = new Set<string>();
+  const rows: HistoryRow[] = [];
+  for (const { intent } of closed) {
+    if (intent.source?.kind === "record") named.add(intent.source.ref);
+    rows.push({
+      kind: "intent",
+      id: intent.id,
+      at: intent.closedAt ?? 0,
+      intent,
+    });
+  }
+  for (const record of records) {
+    if (!record.finished || named.has(record.id)) continue;
+    rows.push({
+      kind: "record",
+      id: record.id,
+      at: statusDate(record.status) ?? record.updatedAt ?? 0,
+      record,
+    });
+  }
+  return rows.sort((a, b) => b.at - a.at);
+}
+
+/** A fixed bug (DR-038): an intent closed done whose captured source
+ * labels carry a bug label — provenance, never a later forge read. */
+export function isBugFix(intent: IntentInfo): boolean {
+  return (
+    intent.closedAs === "done" &&
+    (intent.source?.labels ?? []).some((label) => /bug/i.test(label))
+  );
+}
+
+function Check() {
+  return (
+    <span
+      aria-hidden="true"
+      className="shrink-0 text-emerald-700 dark:text-emerald-400"
+    >
+      ✓
+    </span>
+  );
+}
+
+/** An age in the one time vocabulary (DR-010 §2): "3m ago" with the
+ * absolute moment in the tooltip. */
+function Age({ at, now }: { at?: number; now: number }) {
+  if (at === undefined) return null;
+  return (
+    <span
+      className="shrink-0 text-xs text-neutral-500"
+      title={absoluteTitle(at)}
+    >
+      {relativeAge(at, now)}
+    </span>
+  );
+}
+
+/** The row grammar (dashboard-27): done wears a check; a fixed bug is
+ * struck through under the red tag and wears none; work dropped
+ * after it ran wears a quiet tag, dimmed, never struck. The row also
+ * carries its way off the record — revealed on hover and on focus,
+ * behind the house confirm (DR-010 §4). */
+function IntentHistoryRow({
+  intent,
+  now,
+  confirming,
+  onAsk,
+  onKeep,
+  onRemove,
+}: {
+  intent: IntentInfo;
+  now: number;
+  confirming: boolean;
+  onAsk: () => void;
+  onKeep: () => void;
+  onRemove: () => void;
+}) {
+  const verdict =
+    intent.closedAs === "dropped"
+      ? "dropped"
+      : isBugFix(intent)
+        ? "bug"
+        : "done";
+  const title = intentTitle(intent);
+  return (
+    <li
+      data-testid={`history-row-${intent.id}`}
+      data-kind="intent"
+      data-verdict={verdict}
+      className={`group flex h-6 shrink-0 items-center gap-2 text-sm ${
+        verdict === "dropped" ? "text-neutral-500" : ""
+      }`}
+    >
+      {confirming ? (
+        <span
+          data-testid={`history-remove-confirm-${intent.id}`}
+          className="min-w-0 flex-1"
+        >
+          <InlineConfirm
+            question={i18n._("Remove this intent from history?")}
+            confirmLabel={i18n._({
+              id: "Remove",
+              comment: "confirm: take this row off the record",
+            })}
+            cancelLabel={i18n._({
+              id: "Keep",
+              comment: "cancel a destructive confirm: leave things as they are",
+            })}
+            onConfirm={onRemove}
+            onCancel={onKeep}
+          />
+        </span>
+      ) : (
+        <>
+          {verdict === "done" ? <Check /> : null}
+          <span className="sr-only">
+            {verdict === "bug"
+              ? i18n._({
+                  id: "bug fixed",
+                  comment: "history row, spoken only: a bug this work closed",
+                })
+              : verdict === "dropped"
+                ? i18n._({
+                    id: "dropped",
+                    comment: "history row tag: work let go after it ran",
+                  })
+                : i18n._({
+                    id: "done",
+                    comment: "history row: work carried through and confirmed",
+                  })}
+          </span>
+          {verdict === "bug" ? (
+            <span data-testid="history-tag" className={BUG_TAG}>
+              {i18n._({ id: "bug", comment: "history row tag: a fixed bug" })}
+            </span>
+          ) : null}
+          {verdict === "dropped" ? (
+            <span data-testid="history-tag" className={NEUTRAL_TAG}>
+              {i18n._({
+                id: "dropped",
+                comment: "history row tag: work let go after it ran",
+              })}
+            </span>
+          ) : null}
+          <span
+            className={`min-w-0 flex-1 truncate ${
+              verdict === "bug" ? "line-through" : ""
+            }`}
+            title={title}
+          >
+            {title}
+          </span>
+          <Age at={intent.closedAt} now={now} />
+          <button
+            type="button"
+            data-testid={`history-remove-${intent.id}`}
+            aria-label={i18n._("Remove {title} from history", { title })}
+            title={i18n._("Remove this intent from history")}
+            onClick={onAsk}
+            className="-my-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-neutral-500 opacity-0 hover:text-red-600 focus:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 dark:hover:text-red-400"
+          >
+            <Icon name="trash" className="h-3.5 w-3.5" />
+          </button>
+        </>
+      )}
+    </li>
+  );
+}
+
+/** A finished record (dashboard-27): a check before its record row
+ * (dashboard-40), opening in the records reader; a superseded one
+ * wears that word as a trailing tag, dimmed, with no check. */
+function RecordHistoryRow({
+  record,
+  now,
+  onOpen,
+}: {
+  record: SpecRecordInfo;
+  now: number;
+  onOpen: () => void;
+}) {
+  const superseded = record.finished === "superseded";
+  return (
+    <li
+      data-testid={`history-row-${record.id}`}
+      data-kind="record"
+      data-verdict={superseded ? "superseded" : "done"}
+      className={`flex h-6 shrink-0 items-center gap-2 text-sm ${
+        superseded ? "text-neutral-500" : ""
+      }`}
+    >
+      {superseded ? null : <Check />}
+      <span className="sr-only">
+        {superseded
+          ? i18n._({
+              id: "superseded",
+              comment: "history row tag: a later record replaced this one",
+            })
+          : i18n._({
+              id: "done",
+              comment: "history row: work carried through and confirmed",
+            })}
+      </span>
+      <RecordRow
+        record={record}
+        onClick={onOpen}
+        className="flex-1"
+        trailing={
+          superseded ? (
+            <span data-testid="history-tag" className={NEUTRAL_TAG}>
+              {i18n._({
+                id: "superseded",
+                comment: "history row tag: a later record replaced this one",
+              })}
+            </span>
+          ) : undefined
+        }
+      />
+      <Age at={statusDate(record.status) ?? record.updatedAt} now={now} />
+    </li>
+  );
+}
+
+/** The History frame's height in rows (dashboard-27): every loaded row
+ * lists inside it, and it scrolls once the rows exceed it. Each row is
+ * `h-6` (1.5rem) tall, so the frame's height counts in rows exactly —
+ * eight by default, four to twenty-four once the reader has pulled its
+ * bottom edge (DR-030). */
+const HISTORY_ROW = 24;
+const HISTORY_FRAME = 8;
+const HISTORY_MIN = 4;
+const HISTORY_MAX = 24;
+
+function HistoryBand({
+  project,
+  tree,
+  chatFinished,
+  now,
+  onOpenIntent,
+}: {
+  project: ProjectInfo;
+  tree?: SpecTreeState;
+  /** The project holds a finished conversation serving no intent: its
+   * work is in the sidebar, not here (dashboard-8). */
+  chatFinished: boolean;
+  now: number;
+  onOpenIntent: (projectId: string, path: string, anchor: string) => void;
+}) {
+  const store = usePlaceStore();
+  const history = store((state) => state.history[project.id]);
+  const loadHistory = store((state) => state.loadHistory);
+  const removeIntent = store((state) => state.removeIntent);
+  /** The one row asking to leave the record (DR-010 §4). */
+  const [confirming, setConfirming] = useState<string>();
+  /** Where focus lands once the confirm closes (DR-010 §6): the named
+   * row's control, or — for the empty name — the band itself. */
+  const [refocus, setRefocus] = useState<string>();
+  const band = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (refocus === undefined) return;
+    setRefocus(undefined);
+    const control = refocus
+      ? band.current?.querySelector<HTMLElement>(
+          `[data-testid="history-remove-${refocus}"]`,
+        )
+      : undefined;
+    (control ?? band.current)?.focus();
+  }, [refocus]);
+
+  const more = history?.more ?? false;
+  const rows = historyRows(history?.intents ?? [], tree?.intents ?? []);
+  // Loading reads as loading until the page has answered
+  // (dashboard-8): an unread band never claims nothing was done, and
+  // the control says a page is in flight while records already show.
+  const inFlight = history === undefined || history.loading === true;
+  // "Older…" stands at the end of the scrolled list while unfetched
+  // rows wait (dashboard-27): paging keeps its semantics, and the
+  // group's height never grows past the frame.
+  const older = more || inFlight;
+  // The cut edges and the frame's own focus stand while the rows run
+  // past it (dashboard-27); the frame measures that and says so, so a
+  // frame the reader resized answers for its new height.
+  const [overflowing, setOverflowing] = useState(false);
+  const fetchOlder = () => {
+    if (more && !inFlight) void loadHistory(project.id, true);
+  };
+  /** The row leaves at once, and focus lands where the reader was
+   * working: the next row's control, or the band itself (DR-010 §6). */
+  const remove = (intentId: string): void => {
+    const intentIds = rows
+      .filter((row) => row.kind === "intent")
+      .map((row) => row.id);
+    const next = intentIds[intentIds.indexOf(intentId) + 1] ?? "";
+    setConfirming(undefined);
+    void removeIntent(intentId).finally(() => setRefocus(next));
+  };
+  return (
+    <div
+      ref={band}
+      tabIndex={-1}
+      className="flex flex-col gap-1 focus:outline-none"
+      data-testid={`history-${project.id}`}
+    >
+      <BandHeading>
+        {i18n._({
+          id: "History",
+          comment: "project band heading: work already finished",
+        })}
+      </BandHeading>
+      {rows.length === 0 ? (
+        <div
+          className="text-xs text-neutral-500"
+          data-testid={`history-empty-${project.id}`}
+        >
+          {inFlight
+            ? i18n._({ id: "Loading…", comment: "a read is still in flight" })
+            : chatFinished
+              ? // Work sent as chat turns is no ledger work: one key
+                // phrase says where it is and what lands here
+                // (dashboard-8, DR-038, DR-069).
+                i18n._({
+                  id: "Nothing done here yet · finished conversations are in the sidebar; work queued as an intent lands here",
+                  comment:
+                    "History band, empty while the project's finished conversations served no intent: they list in the sidebar, and only work queued as an intent lists in History",
+                })
+              : i18n._("Nothing done here yet.")}
+        </div>
+      ) : (
+        // The cut edges draw only where the frame overflows, so a short
+        // history reads as a plain list, and the grip beneath them is
+        // the frame's own (DR-030).
+        <ResizableFrame
+          as="ul"
+          frameId={`history:${project.id}`}
+          label={i18n._("Resize History")}
+          unit={HISTORY_ROW}
+          defaultSteps={HISTORY_FRAME}
+          minSteps={HISTORY_MIN}
+          maxSteps={HISTORY_MAX}
+          onOverflow={setOverflowing}
+          data-testid={`history-frame-${project.id}`}
+          aria-label={i18n._({
+            id: "History",
+            comment: "project band heading: work already finished",
+          })}
+          // A frame that scrolls is reachable by keyboard as well as
+          // through the controls it holds (DR-010 §5).
+          tabIndex={overflowing ? 0 : undefined}
+          className={`flex flex-col rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 ${
+            overflowing
+              ? "border-y border-neutral-200 dark:border-neutral-800"
+              : ""
+          }`}
+        >
+          {rows.map((row) =>
+            row.kind === "intent" ? (
+              <IntentHistoryRow
+                key={`intent:${row.id}`}
+                intent={row.intent}
+                now={now}
+                confirming={confirming === row.id}
+                onAsk={() => setConfirming(row.id)}
+                onKeep={() => {
+                  setConfirming(undefined);
+                  setRefocus(row.id);
+                }}
+                onRemove={() => remove(row.id)}
+              />
+            ) : (
+              <RecordHistoryRow
+                key={`record:${row.id}`}
+                record={row.record}
+                now={now}
+                onOpen={() =>
+                  onOpenIntent(
+                    project.id,
+                    row.record.path,
+                    `record-row-${row.record.id}`,
+                  )
+                }
+              />
+            ),
+          )}
+          {older ? (
+            <li className="flex h-6 shrink-0 items-center">
+              <button
+                type="button"
+                data-testid={`history-older-${project.id}`}
+                disabled={inFlight}
+                onClick={fetchOlder}
+                className={`${TEXT_LINK} text-xs disabled:opacity-50`}
+              >
+                {inFlight
+                  ? i18n._({ id: "Loading…", comment: "a read is still in flight" })
+                  : i18n._({
+                      id: "Older…",
+                      comment: "History pager: fetch the next page back in time",
+                    })}
+              </button>
+            </li>
+          ) : null}
+        </ResizableFrame>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Now
+// ---------------------------------------------------------------------------
+
+function NowBand({
+  project,
+  session,
+  intents,
+  now,
+  onOpenSession,
+}: {
+  project: ProjectInfo;
+  session?: SessionInfo;
+  intents: DerivedIntent[];
+  now: number;
+  onOpenSession: (sessionId: string) => void;
+}) {
+  const store = usePlaceStore();
+  const view = store((state) =>
+    session ? state.views[session.id] : undefined,
+  );
+  const closeIntent = store((state) => state.closeIntent);
+  // Drop on the served intent (dashboard-41): behind the inline
+  // confirm, since work is underway; the outcome line lasts six
+  // seconds, and focus goes back to the control — or, once the
+  // control has left with the intent, to the session row.
+  const [confirmDrop, setConfirmDrop] = useState(false);
+  const [dropping, setDropping] = useState(false);
+  // The note carries whether it failed, never a phrase the tone is
+  // read back out of: a text is no longer the same string in every
+  // language (localization-4).
+  const [dropNote, setDropNote] = useState<{ text: string; failed?: boolean }>();
+  const [refocusDrop, setRefocusDrop] = useState(false);
+  const dropRef = useRef<HTMLButtonElement>(null);
+  const rowRef = useRef<HTMLButtonElement>(null);
+  const noteTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => {
+    if (!refocusDrop || confirmDrop) return;
+    (dropRef.current ?? rowRef.current)?.focus();
+    setRefocusDrop(false);
+  }, [refocusDrop, confirmDrop]);
+  useEffect(
+    () => () => {
+      if (noteTimer.current) clearTimeout(noteTimer.current);
+    },
+    [],
+  );
+  if (!session) {
+    // Quiet when the project has no conversation yet (dashboard-8/28).
+    return (
+      <div className="flex flex-col gap-1" data-testid={`now-${project.id}`}>
+        <BandHeading>
+          {i18n._({
+            id: "Now",
+            comment: "project band heading: the current conversation",
+          })}
+        </BandHeading>
+        <div className="text-xs text-neutral-500">
+          {i18n._("Idle — no conversation yet.")}
+        </div>
+      </div>
+    );
+  }
+  const turnActive = session.turnActive ?? view?.turnActive;
+  const label = sessionStatus(view, turnActive);
+  // The open intent this lane serves: the newest open dispatch into
+  // the session owns the conversation (dashboard-28/33).
+  const served = intents
+    .filter(
+      (derived) =>
+        derived.intent.dispatched?.sessionId === session.id &&
+        (derived.state === "working" || derived.state === "interrupted"),
+    )
+    .sort(
+      (a, b) =>
+        (b.intent.dispatched?.at ?? 0) - (a.intent.dispatched?.at ?? 0),
+    )[0];
+  // Serving no intent, the row leads with the turn that opened the work
+  // the session is doing, as the core names it — never an answer sent
+  // while the run's question stood (dashboard-28, DR-119).
+  const title = served ? contentTitle(served.intent) : sessionWorkTitle(session);
+  const playbook = view?.frames[0]?.playbookId;
+
+  const drop = async () => {
+    if (!served) return;
+    const dropped = served.intent;
+    const droppedTitle = intentTitle(dropped);
+    setConfirmDrop(false);
+    setDropping(true);
+    try {
+      // The verdict closes the intent; the session keeps its turn
+      // (dashboard-41) — History lists the drop once that turn ends.
+      await closeIntent(dropped.id, "dropped");
+      setDropNote({
+        text: i18n._("Dropped “{title}” — the session keeps running.", {
+          title: droppedTitle,
+        }),
+      });
+    } catch (cause) {
+      setDropNote({
+        text: i18n._("Couldn't drop “{title}”: {reason}", {
+          title: droppedTitle,
+          reason: (cause as Error).message,
+        }),
+        failed: true,
+      });
+    } finally {
+      setDropping(false);
+      setRefocusDrop(true);
+    }
+    if (noteTimer.current) clearTimeout(noteTimer.current);
+    noteTimer.current = setTimeout(() => setDropNote(undefined), NOTE_MS);
+  };
+
+  return (
+    <div className="flex flex-col gap-1" data-testid={`now-${project.id}`}>
+      <BandHeading>
+        {i18n._({
+          id: "Now",
+          comment: "project band heading: the current conversation",
+        })}
+      </BandHeading>
+      {/* The row fits its band (DR-041): the title owns the slack, the
+          age hides below @md and the playbook name below @xs. */}
+      <div className="@container flex items-center gap-2">
+        <button
+          ref={rowRef}
+          type="button"
+          data-testid={`now-session-${project.id}`}
+          data-intent-id={served?.intent.id}
+          onClick={() => onOpenSession(session.id)}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-neutral-200 bg-white px-3 py-2 text-left text-sm dark:border-neutral-800 dark:bg-neutral-900"
+        >
+          <RunningMark running={turnActive ?? false} />
+          {/* The playbook only once a run draws one: "no playbook" says
+              nothing a reader can act on (dashboard-28). */}
+          {playbook ? (
+            <span className="hidden shrink-0 text-xs text-neutral-500 @xs:inline">
+              {playbook}
+            </span>
+          ) : null}
+          <span
+            className={`shrink-0 rounded px-1.5 py-0.5 text-xs ${TONE_CHIP[label.tone]}`}
+            title={label.state}
+          >
+            {label.text}
+          </span>
+          <span className="min-w-0 flex-1 truncate" title={title}>
+            {title}
+          </span>
+          <span
+            className="hidden shrink-0 text-xs text-neutral-500 @md:inline"
+            title={absoluteTitle(session.createdAt)}
+          >
+            {i18n._("started {age}", {
+              age: relativeAge(session.createdAt, now),
+            })}
+          </span>
+        </button>
+        {served ? (
+          <button
+            ref={dropRef}
+            type="button"
+            data-testid={`now-drop-${project.id}`}
+            disabled={dropping}
+            aria-label={i18n._("Drop {title}", { title })}
+            title={i18n._(
+              "Close this intent as dropped — the session keeps running",
+            )}
+            onClick={() => setConfirmDrop(true)}
+            className="min-h-6 shrink-0 rounded-md border border-neutral-300 px-2 py-0.5 text-xs text-neutral-600 hover:border-red-300 hover:text-red-600 disabled:animate-pulse dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-red-800 dark:hover:text-red-400"
+          >
+            {dropping
+              ? i18n._({
+                  id: "Dropping…",
+                  comment: "verdict control, busy: the verdict is in flight",
+                })
+              : i18n._({
+                  id: "Drop",
+                  comment: "verdict control: let this work go, unaccepted",
+                })}
+          </button>
+        ) : null}
+      </div>
+      {confirmDrop && served ? (
+        <div data-testid={`now-drop-confirm-${project.id}`}>
+          <InlineConfirm
+            question={i18n._("Drop “{title}”? Work is underway.", { title })}
+            confirmLabel={i18n._({
+              id: "Drop",
+              comment: "verdict control: let this work go, unaccepted",
+            })}
+            cancelLabel={i18n._({
+              id: "Keep",
+              comment: "cancel a destructive confirm: leave things as they are",
+            })}
+            onConfirm={() => void drop()}
+            onCancel={() => {
+              setConfirmDrop(false);
+              setRefocusDrop(true);
+            }}
+          />
+        </div>
+      ) : null}
+      {dropNote ? (
+        <div
+          role="status"
+          data-testid={`now-note-${project.id}`}
+          className={`text-xs ${
+            dropNote.failed
+              ? "text-red-600 dark:text-red-400"
+              : "text-neutral-500"
+          }`}
+        >
+          {dropNote.text}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Up next
+// ---------------------------------------------------------------------------
+
+/** One entry of the row menu: the label, and the keyboard shortcut
+ * where one exists — shown for the eye, carried by aria-keyshortcuts
+ * for the ear. */
+function MenuItem({
+  children,
+  hint,
+  ...props
+}: ButtonHTMLAttributes<HTMLButtonElement> & { hint?: string }) {
+  return (
+    <button type="button" role="menuitem" className={MENU_ITEM} {...props}>
+      <span className="flex-1">{children}</span>
+      {hint ? (
+        <span aria-hidden="true" className="text-neutral-500">
+          {hint}
+        </span>
+      ) : null}
+    </button>
+  );
+}
+
+/** Whether a row's menu carries a provenance action (dashboard-29):
+ * an issue or PR with its page, a record, or a capturing session —
+ * exactly the intents `ProvenanceAction` draws an item for. */
+function offersProvenance(intent: IntentInfo): boolean {
+  const source = intent.source;
+  if (!source) return false;
+  return source.kind === "issue" || source.kind === "pr" ? !!source.url : true;
+}
+
+/** The provenance action, named after what it opens (dashboard-29,
+ * DR-038): an issue or PR page, the record, or the capturing session. */
+function ProvenanceAction({
+  intent,
+  recordPath,
+  sessionKnown,
+  onOpenIntent,
+  onOpenSession,
+  onDone,
+}: {
+  intent: IntentInfo;
+  recordPath?: string;
+  sessionKnown: boolean;
+  onOpenIntent: (projectId: string, path: string, anchor: string) => void;
+  onOpenSession: (sessionId: string) => void;
+  onDone: () => void;
+}) {
+  const store = usePlaceStore();
+  // The record's title for its row (dashboard-40), from the tree the
+  // path came from.
+  const record = store((state) =>
+    intent.source?.kind === "record"
+      ? state.specTrees[intent.projectId]?.intents.find(
+          (entry) => entry.id === intent.source?.ref,
+        )
+      : undefined,
+  );
+  const source = intent.source;
+  if (!source) return null;
+  const testId = `upnext-source-${intent.id}`;
+  if (source.kind === "issue" || source.kind === "pr") {
+    if (!source.url) return null;
+    return (
+      <a
+        href={source.url}
+        target="_blank"
+        rel="noreferrer"
+        role="menuitem"
+        data-testid={testId}
+        onClick={onDone}
+        className={MENU_ITEM}
+      >
+        {source.kind === "issue"
+          ? i18n._("Issue #{ref} ↗", { ref: source.ref })
+          : i18n._("PR #{ref} ↗", { ref: source.ref })}
+      </a>
+    );
+  }
+  if (source.kind === "record") {
+    // The one record row (dashboard-40), as a menu item.
+    return (
+      <RecordRow
+        role="menuitem"
+        data-testid={testId}
+        record={{ id: source.ref, title: record?.title ?? "" }}
+        disabled={!recordPath}
+        title={
+          recordPath
+            ? i18n._("Open {id} in Specs", { id: source.ref })
+            : i18n._("This record is not in the project's specs tree")
+        }
+        onClick={() => {
+          onDone();
+          // The menu closes with the pick: its trigger is what Back
+          // returns to (spec-view-57).
+          if (recordPath) {
+            onOpenIntent(
+              intent.projectId,
+              recordPath,
+              `upnext-menu-${intent.id}`,
+            );
+          }
+        }}
+        className="w-full px-2 py-1"
+      />
+    );
+  }
+  return (
+    <MenuItem
+      data-testid={testId}
+      disabled={!sessionKnown}
+      title={
+        sessionKnown
+          ? i18n._("Open the session this was captured from")
+          : i18n._("The capturing session is gone")
+      }
+      onClick={() => {
+        onDone();
+        onOpenSession(source.ref);
+      }}
+    >
+      {i18n._({
+        id: "Session",
+        comment: "row menu item: open the session this intent came from",
+      })}
+    </MenuItem>
+  );
+}
+
+function QueueRow({
+  derived,
+  highlighted,
+  menuOpen,
+  projects,
+  recordPath,
+  sessionKnown,
+  onMenuToggle,
+  onStart,
+  onEdit,
+  onRemove,
+  onOpenIntent,
+  onOpenSession,
+}: {
+  derived: DerivedIntent;
+  highlighted: boolean;
+  /** Whether this row's menu is the band's one open menu. */
+  menuOpen: boolean;
+  projects: ProjectInfo[];
+  /** The record path for a record-sourced row, when the tree knows it. */
+  recordPath?: string;
+  /** Whether a chat-sourced row's capturing session still exists. */
+  sessionKnown: boolean;
+  onMenuToggle: (open: boolean) => void;
+  /** Dispatch this row's intent: the next row's visible Start and any
+   * row's menu Start take the same act (dashboard-29). */
+  onStart: () => void;
+  onEdit: (text: string, attachments: readonly MediaAsset[]) => Promise<void>;
+  /** Remove acts on the click; a keyboard-driven one hands focus to
+   * the Undo line (dashboard-29). */
+  onRemove: (byKeyboard: boolean) => Promise<void>;
+  onOpenIntent: (projectId: string, path: string, anchor: string) => void;
+  onOpenSession: (sessionId: string) => void;
+}) {
+  const store = usePlaceStore();
+  const [editing, setEditing] = useState<string>();
+  const [saving, setSaving] = useState(false);
+  const [editError, setEditError] = useState<string>();
+  const mediaKey = `intent:${derived.intent.id}`;
+  const media = useComposerAttachments(mediaKey, { kind: "project", id: derived.intent.projectId });
+  const rowRef = useRef<HTMLLIElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const returnToRow = useRef(false);
+  const menuRef = usePopover<HTMLDivElement>(menuOpen, {
+    anchorRef: triggerRef,
+    onClose: () => onMenuToggle(false),
+    menu: true,
+  });
+  const intent = derived.intent;
+  const title = intentTitle(intent);
+  const ownerName =
+    projects.find((project) => project.id === intent.projectId)?.name ??
+    intent.projectId;
+  // Presence is the core-published Next marker (core-service-107):
+  // the oldest queued row.
+  const schedule = derived.next;
+  // Assigned to another runtime, the intent runs there alone
+  // (dashboard-29, DR-134): the row reads where it runs in place of
+  // any standing, carries no Start, and its menu offers only its
+  // provenance — never Start, Edit or Remove, acts the core refuses
+  // here. With no provenance to offer, the row draws no menu.
+  const runsOn = derived.runsOn;
+  const startable = runsOn === undefined;
+  const menuOffered = startable || offersProvenance(intent);
+
+  // Leaving the edit — saved or cancelled — puts focus back on the
+  // row it replaced, never on the page body (DR-010 §6).
+  const leaveEdit = () => {
+    media.consume();
+    store.getState().setAttachmentDraftText(mediaKey, undefined);
+    setEditError(undefined);
+    returnToRow.current = true;
+    setEditing(undefined);
+  };
+  useEffect(() => {
+    if (editing === undefined && returnToRow.current) {
+      returnToRow.current = false;
+      rowRef.current?.focus();
+    }
+  }, [editing]);
+
+  if (editing !== undefined) {
+    const save = async () => {
+      if (saving || !canSubmitContent(editing, media.controls.files)) return;
+      setSaving(true);
+      setEditError(undefined);
+      try { await onEdit(editing, media.assets); leaveEdit(); }
+      catch (error) { setEditError((error as Error).message); }
+      finally { setSaving(false); }
+    };
+    return (
+      <li className="min-w-0">
+        <ComposerBox
+          attachments={{ ...media.controls, disabled: saving }}
+          field={<input
+            autoFocus
+            data-testid={`upnext-edit-${intent.id}`}
+            value={editing}
+            disabled={saving}
+            onChange={(event) => {
+              setEditing(event.target.value);
+              store.getState().setAttachmentDraftText(mediaKey, event.target.value);
+            }}
+            onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+              if (event.key === "Enter") { event.preventDefault(); void save(); }
+              else if (event.key === "Escape" && !saving) leaveEdit();
+            }}
+            aria-label={i18n._("Edit intent text")}
+            className="min-h-6 w-full bg-transparent px-1 py-1 text-sm outline-none"
+          />}
+          caption={editError ? <span role="alert" className="text-red-600 dark:text-red-400">{editError}</span> : null}
+          secondary={<button type="button" disabled={saving} onClick={leaveEdit} className={TEXT_LINK}>{i18n._("Cancel")}</button>}
+          actions={<button type="button" disabled={saving || !canSubmitContent(editing, media.controls.files)} onClick={() => void save()} className={TEXT_LINK}>{i18n._("Save")}</button>}
+        />
+      </li>
+    );
+  }
+
+  const menuId = `upnext-menu-${intent.id}-items`;
+  return (
+    <li
+      ref={rowRef}
+      data-testid={`upnext-row-${intent.id}`}
+      data-intent-id={intent.id}
+      data-next={schedule ? "true" : undefined}
+      data-highlight={highlighted ? "true" : undefined}
+      tabIndex={0}
+      className={`@container group relative flex min-h-6 items-center gap-2 rounded px-1 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 ${
+        highlighted ? "ring-2 ring-brand-400" : ""
+      }`}
+    >
+      <div
+        data-testid={`upnext-text-${intent.id}`}
+        className="flex min-w-0 flex-1 flex-col @md:flex-row @md:items-baseline @md:gap-2"
+      >
+        <span
+          data-testid={`upnext-title-${intent.id}`}
+          className={`min-w-0 truncate @md:flex-1 ${schedule ? "font-medium" : ""}`}
+          title={intent.text}
+        >
+          {title}
+        </span>
+        {runsOn !== undefined ? (
+          // In the standing's place, sharing its region and its
+          // truncation (dashboard-29).
+          <span
+            data-testid={`upnext-standing-${intent.id}`}
+            title={runsOnPhrase(runsOn)}
+            className="min-w-0 truncate text-xs text-neutral-500 @md:max-w-[45%]"
+          >
+            {runsOnPhrase(runsOn)}
+          </span>
+        ) : schedule ? (
+          <QueueStandingPhrase
+            schedule={schedule}
+            testId={`upnext-standing-${intent.id}`}
+            className="min-w-0 truncate text-xs text-neutral-500 @md:max-w-[45%]"
+          />
+        ) : null}
+      </div>
+      <QueuedMark testId={`upnext-queued-${intent.id}`} />
+      {startable && schedule?.manualStart ? (
+        <button
+          type="button"
+          data-testid={`upnext-start-${intent.id}`}
+          aria-label={i18n._("Start {title} in {project}", {
+            title,
+            project: ownerName,
+          })}
+          onClick={onStart}
+          title={i18n._({
+            id: "Start",
+            comment: "queue row control: begin this queued intent",
+          })}
+          className="flex min-h-6 shrink-0 items-center rounded bg-brand-600 px-2 py-0.5 text-xs font-medium text-white hover:bg-brand-700 dark:bg-brand-500 dark:hover:bg-brand-400"
+        >
+          {/* Below the row's @xs step the word yields to its icon, the
+              name and title unchanged (DR-041's ladder): on Linux fonts
+              the fixed marks of a 174px row overran it by two pixels. */}
+          <Icon name="play" className="h-3 w-3 @xs:hidden" />
+          <span className="hidden @xs:inline">
+            {i18n._({
+              id: "Start",
+              comment: "queue row control: begin this queued intent",
+            })}
+          </span>
+        </button>
+      ) : null}
+      {menuOffered ? (
+        <button
+          ref={triggerRef}
+          type="button"
+          aria-label={i18n._("Actions for {title}", { title })}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          aria-controls={menuOpen ? menuId : undefined}
+          data-testid={`upnext-menu-${intent.id}`}
+          onClick={() => onMenuToggle(!menuOpen)}
+          className="min-h-6 min-w-6 shrink-0 rounded px-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-600 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
+        >
+          ⋯
+        </button>
+      ) : null}
+      {menuOpen && menuOffered ? (
+        <div
+          ref={menuRef}
+          id={menuId}
+          role="menu"
+          aria-label={i18n._("Actions for {title}", { title })}
+          className="absolute right-0 top-full z-10 mt-0.5 flex min-w-44 flex-col rounded-md border border-neutral-200 bg-white p-1 text-xs shadow-lg dark:border-neutral-700 dark:bg-neutral-900"
+        >
+          {/* The queue has no order of its own to change: age orders
+              it, and any row this runtime runs may be started directly
+              (dashboard-29). */}
+          {startable ? (
+            <>
+              <MenuItem
+                data-testid={`upnext-start-action-${intent.id}`}
+                onClick={() => {
+                  onMenuToggle(false);
+                  onStart();
+                }}
+              >
+                {i18n._({
+                  id: "Start",
+                  comment: "queue row control: begin this queued intent",
+                })}
+              </MenuItem>
+              <MenuItem
+                data-testid={`upnext-edit-action-${intent.id}`}
+                onClick={() => {
+                  onMenuToggle(false);
+                  const state = store.getState();
+                  const retained = state.attachmentDraftTexts[mediaKey];
+                  if (retained === undefined) {
+                    state.stageAttachmentAssets(mediaKey, intentMediaOwner(intent), intent.attachments ?? []);
+                    state.setAttachmentDraftText(mediaKey, intent.text);
+                  }
+                  setEditing(retained ?? intent.text);
+                }}
+              >
+                {i18n._({
+                  id: "Edit",
+                  comment: "row menu item: edit this intent's text and files",
+                })}
+              </MenuItem>
+              <MenuItem
+                data-testid={`upnext-remove-action-${intent.id}`}
+                // Remove acts on the click (dashboard-29, DR-038): no
+                // confirmation, no history — the band's Undo line is the
+                // way back.
+                onClick={(event) => {
+                  onMenuToggle(false);
+                  void onRemove(activatedByKeyboard(event));
+                }}
+              >
+                {i18n._({
+                  id: "Remove",
+                  comment: "row menu item: take this row out of the queue",
+                })}
+              </MenuItem>
+            </>
+          ) : null}
+          <ProvenanceAction
+            intent={intent}
+            recordPath={recordPath}
+            sessionKnown={sessionKnown}
+            onOpenIntent={onOpenIntent}
+            onOpenSession={onOpenSession}
+            onDone={() => onMenuToggle(false)}
+          />
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+/** A removal held for Undo (dashboard-29): the row's text and
+ * provenance, which Undo captures again. */
+interface Removal {
+  intent: IntentInfo;
+  error?: string;
+}
+
+function UpNextBand({
+  project,
+  queue,
+  ledgerState,
+  projects,
+  sessions,
+  tree,
+  highlightId,
+  onStartIntent,
+  onOpenIntent,
+  onOpenSession,
+  onCapture,
+}: {
+  project: ProjectInfo;
+  queue: DerivedIntent[];
+  ledgerState: LedgerState;
+  projects: ProjectInfo[];
+  sessions: SessionInfo[];
+  tree?: SpecTreeState;
+  highlightId?: string;
+  onStartIntent: (intent: IntentInfo) => Promise<void> | void;
+  onOpenIntent: (projectId: string, path: string, anchor: string) => void;
+  onOpenSession: (sessionId: string) => void;
+  onCapture: (input: CaptureInput) => Promise<IntentInfo>;
+}) {
+  const store = usePlaceStore();
+  const editIntent = store((state) => state.editIntent);
+  const closeIntent = store((state) => state.closeIntent);
+  const loadLedger = store((state) => state.loadLedger);
+  const draftKey = `queue:${project.id}`;
+  const draft = store((state) => state.attachmentDraftTexts[draftKey] ?? "");
+  const setDraft = (text: string) => store.getState().setAttachmentDraftText(draftKey, text);
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState<string>();
+  const media = useComposerAttachments(`queue:${project.id}`, { kind: "project", id: project.id });
+  const addRef = useRef<HTMLTextAreaElement>(null);
+  useAutoGrow(addRef, draft);
+  // One row menu open at a time (dashboard-29): the band holds whose.
+  const [menuFor, setMenuFor] = useState<string>();
+  const [focusRowId, setFocusRowId] = useState<string>();
+  const bandRef = useRef<HTMLDivElement>(null);
+  // The six-second Undo line, taking focus only from a keyboard-driven
+  // removal (dashboard-29).
+  const { removed, undoRef, show, dismiss } = useUndoLine<Removal>();
+
+  const add = () => {
+    if (adding || !canSubmitContent(draft, media.controls.files)) return;
+    setAdding(true);
+    setAddError(undefined);
+    void onCapture({ projectId: project.id, text: draft, ...(media.assets.length ? { attachments: media.assets } : {}) })
+      .then(() => { setDraft(""); media.consume(); })
+      .catch((error: Error) => setAddError(error.message))
+      .finally(() => setAdding(false));
+  };
+
+  // A restored row gets focus once the ledger serves it again.
+  useEffect(() => {
+    if (!focusRowId) return;
+    const row = Array.from(
+      bandRef.current?.querySelectorAll<HTMLElement>("li[data-intent-id]") ??
+        [],
+    ).find((el) => el.dataset.intentId === focusRowId);
+    if (!row) return;
+    row.focus();
+    setFocusRowId(undefined);
+  }, [focusRowId, queue]);
+
+  const remove = async (intent: IntentInfo, byKeyboard: boolean) => {
+    try {
+      // A queued intent has never run, so the core's drop leaves no
+      // trace (core-service-46): the row's Remove.
+      await closeIntent(intent.id, "dropped");
+      show({ intent }, { byKeyboard });
+    } catch (cause) {
+      show(
+        {
+          intent,
+          error: i18n._("Couldn't remove “{title}”: {reason}", {
+            title: intentTitle(intent),
+            reason: (cause as Error).message,
+          }),
+        },
+        { byKeyboard },
+      );
+    }
+  };
+
+  const undo = async () => {
+    if (!removed || removed.error) return;
+    const { intent } = removed;
+    dismiss();
+    try {
+      // Captured again, it takes its place by age: the queue has no
+      // order of its own to restore (dashboard-29).
+      const restored = await onCapture({
+        projectId: project.id,
+        text: intent.text,
+        ...(intent.attachments ? { attachments: intent.attachments } : {}),
+        source: intent.source,
+      });
+      setFocusRowId(restored.id);
+    } catch (cause) {
+      show(
+        {
+          intent,
+          error: i18n._("Couldn't undo: {reason}", {
+            reason: (cause as Error).message,
+          }),
+        },
+        { byKeyboard: true },
+      );
+    }
+  };
+
+  return (
+    <div
+      ref={bandRef}
+      className="flex flex-col gap-1"
+      data-testid={`upnext-${project.id}`}
+    >
+      <BandHeading>
+        {i18n._({
+          id: "Up next",
+          comment: "band heading: the project's queued work",
+        })}
+      </BandHeading>
+      {queue.length === 0 ? (
+        <div className="text-xs text-neutral-500">
+          {ledgerState === "ready" ? (
+            i18n._(
+              "Nothing queued — add an intent below, or Queue an issue, PR, or record from Sources.",
+            )
+          ) : ledgerState === "loading" ? (
+            i18n._({ id: "Loading…", comment: "a read is still in flight" })
+          ) : (
+            // One whole sentence with its control inside it
+            // (localization-4).
+            <Rich
+              text={i18n._("The queue could not be loaded. <0>Retry</0>")}
+              components={[
+                <button
+                  key="retry"
+                  type="button"
+                  onClick={() => void loadLedger()}
+                  className={TEXT_LINK}
+                />,
+              ]}
+            />
+          )}
+        </div>
+      ) : null}
+      <ul className="flex flex-col gap-0.5">
+        {queue.map((derived) => {
+          const source = derived.intent.source;
+          return (
+            <QueueRow
+              key={derived.intent.id}
+              derived={derived}
+              highlighted={derived.intent.id === highlightId}
+              menuOpen={menuFor === derived.intent.id}
+              projects={projects}
+              recordPath={
+                source?.kind === "record"
+                  ? tree?.intents.find((record) => record.id === source.ref)
+                      ?.path
+                  : undefined
+              }
+              sessionKnown={
+                source?.kind === "chat" &&
+                sessions.some((session) => session.id === source.ref)
+              }
+              onMenuToggle={(open) =>
+                setMenuFor((current) =>
+                  open
+                    ? derived.intent.id
+                    : current === derived.intent.id
+                      ? undefined
+                      : current,
+                )
+              }
+              onStart={() => void onStartIntent(derived.intent)}
+              onEdit={(text, attachments) => editIntent(derived.intent.id, text, attachments)}
+              onRemove={(byKeyboard) => remove(derived.intent, byKeyboard)}
+              onOpenIntent={onOpenIntent}
+              onOpenSession={onOpenSession}
+            />
+          );
+        })}
+      </ul>
+      {removed ? (
+        <div
+          role="status"
+          data-testid={`upnext-removed-${project.id}`}
+          className="flex items-center gap-1.5 text-xs text-neutral-500"
+        >
+          {removed.error ? (
+            <span className="min-w-0 truncate text-red-600 dark:text-red-400">
+              {removed.error}
+            </span>
+          ) : (
+            <>
+              <span className="min-w-0 truncate">
+                {i18n._("Removed “{title}”", {
+                  title: intentTitle(removed.intent),
+                })}
+              </span>
+              <span aria-hidden="true">—</span>
+              <button
+                ref={undoRef}
+                type="button"
+                onClick={() => void undo()}
+                className={TEXT_LINK}
+              >
+                {i18n._({
+                  id: "Undo",
+                  comment: "put the row just removed back where it was",
+                })}
+              </button>
+            </>
+          )}
+        </div>
+      ) : null}
+      <div
+        data-testid={`add-intent-row-${project.id}`}
+        className="min-w-0"
+      >
+        <ComposerBox
+          attachments={{ ...media.controls, disabled: adding }}
+          caption={addError ? <span role="alert" className="text-red-600 dark:text-red-400">{addError}</span> : null}
+          field={<textarea
+          ref={addRef}
+          rows={1}
+          value={draft}
+          data-testid={`add-intent-${project.id}`}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              add();
+            }
+          }}
+          placeholder={i18n._("Add intent…")}
+          aria-label={i18n._("Add an intent to {project}", {
+            project: project.name,
+          })}
+          className="min-h-6 w-full min-w-0 resize-none rounded border border-dashed border-neutral-300 bg-transparent px-2 py-1 text-sm placeholder:text-neutral-500 focus:border-solid focus:border-brand-400 focus:outline-none [field-sizing:content] max-h-[max(40vh,1.75rem)] dark:border-neutral-700"
+        />}
+          actions={<button
+          type="button"
+          data-testid={`queue-intent-${project.id}`}
+          aria-label={i18n._("Queue an intent in {project}", {
+            project: project.name,
+          })}
+          disabled={adding || !canSubmitContent(draft, media.controls.files)}
+          onClick={add}
+          className="min-h-6 shrink-0 rounded bg-brand-600 px-2.5 py-0.5 text-xs font-medium text-white hover:bg-brand-700 disabled:bg-neutral-200 disabled:text-neutral-500 dark:bg-brand-500 dark:hover:bg-brand-400 dark:disabled:bg-neutral-800 dark:disabled:text-neutral-500"
+        >
+          {i18n._({
+            id: "Queue",
+            comment: "capture control: put this artifact in the queue",
+          })}
+        </button>}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The group
+// ---------------------------------------------------------------------------
+
+export interface ProjectGroupProps {
+  project: ProjectInfo;
+  now: number;
+  /** When the served forge lists were fetched — the core's moment,
+   * the Sources line's data age (dashboard-14); the client's read
+   * only where the core sends none. */
+  fetchedAt?: number;
+  /** The just-captured row to reveal (dashboard-31). */
+  highlightId?: string;
+  /** The Dashboard names each group; the Overview's header already
+   * does, so it draws the group bare (projects-4). */
+  heading?: boolean;
+  /** Open a session; with a turnId, land at that turn's place. */
+  onOpenSession: (sessionId: string, turnId?: number) => void;
+  /** Open an intent record in its project's records reader. */
+  onOpenIntent: (projectId: string, path: string, anchor: string) => void;
+  /** Stage an intent's dispatch (run-view-86). */
+  onStartIntent: (intent: IntentInfo) => Promise<void> | void;
+  onCapture: (input: CaptureInput) => Promise<IntentInfo>;
+  /** Navigation to the project's Overview tab, where the repository
+   * header shows the GitHub binding (dashboard-8); absent on the
+   * Overview itself. */
+  onOpenOverview?: () => void;
+}
+
+export function ProjectGroup({
+  project,
+  now,
+  fetchedAt,
+  highlightId,
+  heading = true,
+  onOpenSession,
+  onOpenIntent,
+  onStartIntent,
+  onCapture,
+  onOpenOverview,
+}: ProjectGroupProps) {
+  const store = usePlaceStore();
+  const projects = store((state) => state.projects);
+  const sessions = store((state) => state.sessions);
+  const ledger = store((state) => state.ledger);
+  const ledgerError = store((state) => state.ledgerError);
+  const meta = store((state) => state.projectMeta[project.id]);
+  const tree = store((state) => state.specTrees[project.id]);
+  const loadProjectMeta = store((state) => state.loadProjectMeta);
+  const collapsed = store(
+    (state) => state.dashboardGroupsCollapsed[project.id] ?? false,
+  );
+  const setCollapsed = store(
+    (state) => state.setDashboardGroupCollapsed,
+  );
+  const intents = ledger?.intents ?? [];
+  const ledgerState: LedgerState = ledger
+    ? "ready"
+    : ledgerError
+      ? "failed"
+      : "loading";
+  // The Now band shows the project's current conversation
+  // (dashboard-28, DR-051): working, waiting, or idle.
+  const session = currentSessionOf(sessions, project.id);
+  const attentionKind = ledger?.attention.reduce<AttentionKind | undefined>(
+    (worst, entry) => {
+      if (entry.projectId !== project.id) return worst;
+      return !worst || ATTENTION_RANK[entry.kind] < ATTENTION_RANK[worst]
+        ? entry.kind
+        : worst;
+    },
+    undefined,
+  );
+  const attentionDescription = attentionKind
+    ? PROJECT_ATTENTION_WORDS[attentionKind]()
+    : undefined;
+  const bodyId = `project-bands-${project.id}`;
+  const attentionId = `project-attention-description-${project.id}`;
+  return (
+    <div
+      data-testid={`project-group-${project.id}`}
+      data-collapsed={heading && collapsed ? "true" : undefined}
+      className="flex flex-col gap-3 rounded-lg border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900"
+    >
+      {heading ? (
+        <>
+          <h3 aria-label={project.name} className="text-sm font-semibold">
+            <button
+              type="button"
+              data-testid={`project-toggle-${project.id}`}
+              aria-expanded={!collapsed}
+              aria-controls={bodyId}
+              aria-label={
+                collapsed
+                  ? i18n._("Expand {project}", { project: project.name })
+                  : i18n._("Collapse {project}", { project: project.name })
+              }
+              aria-describedby={attentionDescription ? attentionId : undefined}
+              title={attentionDescription}
+              onClick={() => setCollapsed(project.id, !collapsed)}
+              className="flex min-h-6 w-full min-w-0 items-center gap-1 rounded text-left hover:text-neutral-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 dark:hover:text-neutral-200"
+            >
+              <Icon
+                name={collapsed ? "caretRight" : "caretDown"}
+                className="h-3.5 w-3.5 shrink-0 text-neutral-500"
+              />
+              <span className="min-w-0 flex-1 truncate">{project.name}</span>
+              {attentionKind ? (
+                <span
+                  aria-hidden="true"
+                  data-testid={`project-attention-${project.id}`}
+                  className={`h-2 w-2 shrink-0 rounded-full ${ATTENTION_MARK_CLASS[attentionKind]}`}
+                />
+              ) : null}
+            </button>
+          </h3>
+          {attentionDescription ? (
+            <span id={attentionId} className="sr-only">
+              {attentionDescription}
+            </span>
+          ) : null}
+        </>
+      ) : null}
+      <div
+        id={bodyId}
+        data-testid={bodyId}
+        hidden={heading && collapsed}
+        className={`${heading && collapsed ? "hidden" : "flex"} flex-col gap-3`}
+      >
+        <HistoryBand
+          project={project}
+          tree={tree}
+          chatFinished={
+            ledger !== undefined &&
+            hasUnservedFinishedConversation(sessions, intents, project.id)
+          }
+          now={now}
+          onOpenIntent={onOpenIntent}
+        />
+        <NowBand
+          project={project}
+          session={session}
+          intents={intents}
+          now={now}
+          onOpenSession={onOpenSession}
+        />
+        <UpNextBand
+          project={project}
+          queue={queueOf(intents, project.id)}
+          ledgerState={ledgerState}
+          projects={projects}
+          sessions={sessions}
+          tree={tree}
+          highlightId={highlightId}
+          onStartIntent={onStartIntent}
+          onOpenIntent={onOpenIntent}
+          onOpenSession={onOpenSession}
+          onCapture={onCapture}
+        />
+        <SourcesBand
+          project={project}
+          meta={meta}
+          tree={tree}
+          openSources={openSourceIntents(ledger, project.id)}
+          fetchedAt={fetchedAt}
+          now={now}
+          onRefresh={() => void loadProjectMeta(project.id, true)}
+          onQueue={(text, source) =>
+            onCapture({ projectId: project.id, text, source })
+          }
+          onOpenIntent={onOpenIntent}
+          onOpenOverview={onOpenOverview}
+        />
+      </div>
+    </div>
+  );
+}

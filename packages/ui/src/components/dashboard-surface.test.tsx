@@ -1,0 +1,3589 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// The Dashboard as the intent ledger's surface (DR-035): the two-band
+// attention queue with its verdict acts (dashboard-1..4), the
+// all-clear pull (dashboard-8), the per-project groups' disclosure
+// and four bands (dashboard-26..30, 45), capture with the shelf reveal
+// (dashboard-30/31, 37), the paged Sources tabs with the captured-artifact swap
+// (dashboard-19/20/24/25), History as done work (dashboard-27/38,
+// DR-038), empty states without takeover (dashboard-8/21/22), the
+// age-ordered queue whose row menu is the house popover with Start,
+// Edit, Remove and Undo (dashboard-29), focus hand-offs (dashboard-4,
+// projects-9, DR-010 §6), and the Overview tab's header over the
+// shared group with its two-step removal (projects-4/6/7/9,
+// forge-work-lists-1).
+
+import { afterEach, beforeEach, describe, expect, test, vi, type Mock } from "vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import type {
+  AttentionEntry,
+  DerivedIntent,
+  ForgeState,
+  IntentInfo,
+  IntentSource,
+  LedgerState,
+  QueueSchedule,
+  SpecTreeState,
+} from "@sublang/spex-core/protocol";
+
+import { DashboardSurface } from "./DashboardSurface.js";
+import { OverviewTab } from "./ProjectsSurface.js";
+import { setClientForTests, useAppStore, type AppStore } from "../state/store.js";
+import { initialSessionView } from "../state/reducer.js";
+import { SpexCommandError } from "../lib/client.js";
+import { currentLocale } from "../i18n.js";
+import { groupsState } from "../fixtures/groups-state.js";
+
+afterEach(() => {
+  cleanup();
+  setClientForTests(undefined);
+  vi.restoreAllMocks();
+});
+
+const commandMock = vi.fn();
+
+const NOW = Date.now();
+const MIN = 60_000;
+
+const PROJECTS = [
+  { id: "me/alpha-spex", name: "alpha", path: "/tmp/alpha", registeredAt: 0, repository: { key: "me/alpha-spex", name: "alpha-spex", group: "me", own: true } },
+  { id: "me/beta-spex", name: "beta", path: "/tmp/beta", registeredAt: 1, repository: { key: "me/beta-spex", name: "beta-spex", group: "me", own: true } },
+];
+
+const EMPTY_TREE: SpecTreeState = {
+  present: true,
+  legacy: false,
+  files: [],
+  decisions: [],
+  intents: [],
+  notices: [],
+  readAt: NOW,
+};
+
+const EMPTY_LEDGER: LedgerState = { intents: [], attention: [], badge: 0 };
+const MANUAL_READY: QueueSchedule = {
+  standing: "manual-ready",
+  manualStart: true,
+};
+
+function info(
+  over: Partial<IntentInfo> & { id: string; projectId: string; text: string },
+): IntentInfo {
+  return { createdAt: NOW - 60 * MIN, ...over };
+}
+
+function q(
+  id: string,
+  projectId: string,
+  text: string,
+  over: Partial<DerivedIntent> = {},
+): DerivedIntent {
+  return { intent: info({ id, projectId, text }), state: "queued", ...over };
+}
+
+/** A Groups state holding no spex repository: the Overview's records
+ * field reads its row from it (projects-4). */
+const EMPTY_GROUPS = groupsState();
+
+/** Seed the real store; the client is faked via setClientForTests. */
+function seed(over: Record<string, unknown> = {}) {
+  useAppStore.setState({
+    space: EMPTY_GROUPS,
+    attachmentDraftTexts: {},
+    attachmentDrafts: {},
+    connection: "open",
+    projects: PROJECTS,
+    projectMeta: { "me/alpha-spex": {}, "me/beta-spex": {} },
+    specTrees: { "me/alpha-spex": EMPTY_TREE, "me/beta-spex": EMPTY_TREE },
+    sessions: [],
+    views: {},
+    history: {
+      "me/alpha-spex": { intents: [], more: false },
+      "me/beta-spex": { intents: [], more: false },
+    },
+    ledger: EMPTY_LEDGER,
+    ledgerError: undefined,
+    stagedIntents: {},
+    foldedSources: {},
+    dashboardGroupsCollapsed: {},
+    ...over,
+  } as never);
+}
+
+beforeEach(() => {
+  commandMock.mockReset();
+  commandMock.mockImplementation(async (type: string) => {
+    if (type === "ledger.get") {
+      return useAppStore.getState().ledger ?? EMPTY_LEDGER;
+    }
+    if (type === "ledger.history") return { intents: [], more: false };
+    if (type === "space.get") return EMPTY_GROUPS;
+    return {};
+  });
+  setClientForTests({
+    command: commandMock,
+    subscribe: vi.fn(async () => null),
+  } as never);
+});
+
+function renderSurface(over: {
+  onOpenSession?: Mock<(sessionId: string, turnId?: number) => void>;
+  onOpenIntent?: Mock<(projectId: string, path: string, anchor: string) => void>;
+  onStartIntent?: Mock<(intent: IntentInfo) => void>;
+  onNavigate?: Mock<(surface: "Workspace", place: AppStore) => void>;
+} = {}) {
+  const onOpenSession =
+    over.onOpenSession ?? vi.fn<(sessionId: string, turnId?: number) => void>();
+  const onOpenIntent =
+    over.onOpenIntent ??
+    vi.fn<(projectId: string, path: string, anchor: string) => void>();
+  const onStartIntent =
+    over.onStartIntent ?? vi.fn<(intent: IntentInfo) => void>();
+  const onNavigate = over.onNavigate ?? vi.fn<(surface: "Workspace", place: AppStore) => void>();
+  render(
+    <DashboardSurface
+      onOpenSession={onOpenSession}
+      onOpenIntent={onOpenIntent}
+      onStartIntent={onStartIntent}
+      onNavigate={onNavigate}
+    />,
+  );
+  return { onOpenSession, onOpenIntent, onStartIntent, onNavigate };
+}
+
+function callsOf(type: string) {
+  return commandMock.mock.calls
+    .filter((call) => call[0] === type)
+    .map((call) => call[1]);
+}
+
+/** A stateful ledger behind the command mock: close removes, queue
+ * appends, move reorders, and ledger.get serves the current state —
+ * enough for the queue's acts to read back the way the core's fold
+ * would serve them. */
+function ledgerMock(initial: LedgerState): () => LedgerState {
+  let current = initial;
+  let minted = 0;
+  commandMock.mockImplementation(async (type: string, fields) => {
+    if (type === "ledger.get") return current;
+    if (type === "ledger.history") return { intents: [], more: false };
+    if (type === "intent.close") {
+      const { intentId } = fields as { intentId: string };
+      current = {
+        ...current,
+        intents: current.intents.filter((d) => d.intent.id !== intentId),
+        attention: current.attention.filter((e) => e.intentId !== intentId),
+      };
+      return {};
+    }
+    if (type === "intent.queue") {
+      const input = fields as {
+        projectId: string;
+        text: string;
+        source?: IntentSource;
+      };
+      minted += 1;
+      const intent = info({
+        id: `i-new-${minted}`,
+        projectId: input.projectId,
+        text: input.text,
+        ...(input.source ? { source: input.source } : {}),
+      });
+      current = {
+        ...current,
+        intents: [...current.intents, { intent, state: "queued" }],
+      };
+      return intent;
+    }
+    return {};
+  });
+  return () => current;
+}
+
+// ---------------------------------------------------------------------------
+// Attention queue
+// ---------------------------------------------------------------------------
+
+const ATTENTION: AttentionEntry[] = [
+  {
+    band: "interrupted",
+    kind: "question",
+    intentId: "iq",
+    title: "Fix login",
+    projectId: "me/alpha-spex",
+    sessionId: "s1",
+    turnId: 4,
+    since: NOW - 10 * MIN,
+  },
+  {
+    band: "interrupted",
+    kind: "failure",
+    title: "tidy the fixtures",
+    projectId: "me/alpha-spex",
+    sessionId: "s6",
+    since: NOW - 6 * MIN,
+  },
+  {
+    band: "interrupted",
+    kind: "failure",
+    parked: true,
+    intentId: "if",
+    title: "Migrate DB",
+    projectId: "me/beta-spex",
+    sessionId: "s2",
+    since: NOW - 5 * MIN,
+    // The runtime's own account of the failure, which the row phrases
+    // rather than restating that something failed (DR-075).
+    cause: {
+      code: "pre-existing-lost",
+      evidence: { paths: { lost: ["db/schema.sql"], truncated: 2 } },
+    },
+  },
+  {
+    band: "finished",
+    kind: "finish",
+    intentId: "id1",
+    title: "Ship docs",
+    projectId: "me/alpha-spex",
+    sessionId: "s3",
+    turnId: 9,
+    since: NOW - 30 * MIN,
+    stats: { reviewRounds: 2, turns: 3, elapsedMs: 12 * MIN },
+  },
+  {
+    band: "finished",
+    kind: "finish",
+    intentId: "id2",
+    title: "Tidy CI",
+    projectId: "me/beta-spex",
+    sessionId: "s5",
+    since: NOW - 8 * MIN,
+    stats: { turns: 1, elapsedMs: MIN },
+  },
+  {
+    band: "finished",
+    kind: "review",
+    title: "chat about tests",
+    projectId: "me/beta-spex",
+    sessionId: "s4",
+    turnId: 2,
+    since: NOW - 2 * MIN,
+  },
+];
+
+describe("dashboard-1/2/3/35: the two-band attention queue", () => {
+  test("bands render in served order with human reasons and tones", () => {
+    seed({ ledger: { intents: [], attention: ATTENTION, badge: 6 } });
+    const { onOpenSession } = renderSurface();
+
+    const queue = screen.getByTestId("attention-queue");
+    const rows = Array.from(queue.querySelectorAll("[data-band]"));
+    expect(rows.map((row) => row.getAttribute("data-testid"))).toEqual([
+      "attention-iq-question",
+      "attention-s6-failure",
+      "attention-if-failure",
+      "attention-id1-finish",
+      "attention-id2-finish",
+      "attention-s4-review",
+    ]);
+    // Interrupted before finished, as the fold serves it.
+    expect(rows.map((row) => row.getAttribute("data-band"))).toEqual([
+      "interrupted",
+      "interrupted",
+      "interrupted",
+      "finished",
+      "finished",
+      "finished",
+    ]);
+    // Amber waits on the human; only the unacknowledged failure is red.
+    expect(
+      rows.map((row) => row.getAttribute("data-tone")),
+    ).toEqual(["amber", "red", "red", "amber", "amber", "amber"]);
+
+    // Status speaks human (DR-010 §2), and the row names its project
+    // and how long it has waited.
+    const question = screen.getByTestId("attention-iq-question");
+    expect(question.textContent).toContain("needs your reply");
+    expect(question.textContent).toContain("Fix login");
+    expect(question.textContent).toContain("alpha");
+    // The age says "ago" and carries the absolute moment (DR-010 §2).
+    expect(question.textContent).toContain("10m ago");
+    expect(
+      within(question).getByTitle(
+        new Date(ATTENTION[0].since).toLocaleString(currentLocale()),
+      ),
+    ).toBeTruthy();
+    expect(screen.getByTestId("attention-s6-failure").textContent).toContain(
+      "failed",
+    );
+    expect(screen.getByTestId("attention-if-failure").textContent).toContain(
+      "failed",
+    );
+    expect(screen.getByTestId("attention-id1-finish").textContent).toContain(
+      "finished — confirm?",
+    );
+    expect(screen.getByTestId("attention-s4-review").textContent).toContain(
+      "unread turn",
+    );
+
+    // Every row names the act that ends it (dashboard-53): a control
+    // on the row where the act is a ruling, an act line naming the
+    // turn the session must run otherwise.
+    expect(screen.getByTestId("attention-act-iq").textContent).toBe(
+      "Open to reply — the run is waiting.",
+    );
+    expect(screen.getByTestId("attention-act-if").textContent).toBe(
+      "Open to retry or drop the run.",
+    );
+    // A failure the fold carried a cause for says why, above its act
+    // line, in the catalogue's phrase (dashboard-1, DR-075); one it
+    // carried none for says nothing it cannot support.
+    expect(screen.getByTestId("attention-why-if").textContent).toBe(
+      "Uncommitted changes you had were lost: db/schema.sql, … and 2 more",
+    );
+    expect(screen.queryByTestId("attention-why-s6")).toBeNull();
+    expect(screen.getByTestId("attention-act-s6").textContent).toBe(
+      "Open and send a message to pick it up.",
+    );
+    expect(screen.getByTestId("attention-act-s4").textContent).toBe(
+      "Nothing owed — open it, or mark it reviewed.",
+    );
+    // The finished intent's own act is its verdict, right here.
+    expect(screen.queryByTestId("attention-act-id1")).toBeNull();
+    expect(screen.getByTestId("attention-confirm-id1")).toBeTruthy();
+    // The unread turn's act is a control too, and it reads within the
+    // label budget (DR-041).
+    const reviewed = screen.getByTestId("attention-reviewed-s4");
+    expect(reviewed.textContent).toBe("Reviewed");
+    expect(reviewed.getAttribute("aria-label")).toBe(
+      "Mark chat about tests reviewed",
+    );
+    // An interrupted intent carries Drop; a session stand-in carries
+    // none, its act being a turn (dashboard-56).
+    expect(screen.getByTestId("attention-drop-if")).toBeTruthy();
+    expect(screen.queryByTestId("attention-drop-s6")).toBeNull();
+
+    // Finished stats: review rounds foremost, omitted when zero
+    // (dashboard-35).
+    expect(screen.getByTestId("attention-stats-id1").textContent).toBe(
+      "2 review rounds · 3 turns · 12m",
+    );
+    expect(screen.getByTestId("attention-stats-id2").textContent).toBe(
+      "1 turn · 1m",
+    );
+
+    // Activation opens the session at the entry's place (dashboard-3).
+    fireEvent.click(
+      within(question).getByRole("button", { name: /Open Fix login/ }),
+    );
+    expect(onOpenSession).toHaveBeenCalledWith("s1", 4);
+  });
+
+  test("Reviewed clears an unread turn without opening it, and reports a refusal", async () => {
+    seed({ ledger: { intents: [], attention: ATTENTION, badge: 6 } });
+    let refuse = false;
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "session.viewed") {
+        if (refuse) throw new Error("Space is syncing");
+        return null;
+      }
+      if (type === "ledger.get") return useAppStore.getState().ledger;
+      return {};
+    });
+    const { onOpenSession } = renderSurface();
+
+    // The act reads no runtime state of the session and opens nothing
+    // (dashboard-55): the row itself settles it.
+    fireEvent.click(screen.getByTestId("attention-reviewed-s4"));
+    await vi.waitFor(() =>
+      expect(callsOf("session.viewed")).toEqual([
+        { sessionId: "s4", turnId: 2 },
+      ]),
+    );
+    expect(onOpenSession).not.toHaveBeenCalled();
+
+    // A refusal says so on the row, in the act's own words, and the
+    // entry stands (dashboard-53).
+    refuse = true;
+    cleanup();
+    renderSurface();
+    fireEvent.click(screen.getByTestId("attention-reviewed-s4"));
+    await screen.findByText("Couldn't mark it reviewed: Space is syncing");
+    const control = screen.getByTestId("attention-reviewed-s4");
+    expect(control.textContent).toBe("Reviewed");
+    expect((control as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  test("an interrupted intent's Drop asks before it rules", async () => {
+    seed({ ledger: { intents: [], attention: ATTENTION, badge: 6 } });
+    commandMock.mockImplementation(async (type: string) =>
+      type === "ledger.get" ? useAppStore.getState().ledger : {},
+    );
+    renderSurface();
+
+    // Its work is still in play, so the ruling is not one click
+    // (dashboard-56).
+    fireEvent.click(screen.getByTestId("attention-drop-if"));
+    expect(callsOf("intent.close")).toEqual([]);
+    const row = screen.getByTestId("attention-if-failure");
+    expect(row.textContent).toContain("Drop this work?");
+
+    fireEvent.click(screen.getByTestId("attention-drop-keep-if"));
+    expect(row.textContent).not.toContain("Drop this work?");
+    expect(callsOf("intent.close")).toEqual([]);
+
+    fireEvent.click(screen.getByTestId("attention-drop-if"));
+    fireEvent.click(screen.getByTestId("attention-drop-confirm-if"));
+    await vi.waitFor(() =>
+      expect(callsOf("intent.close")).toEqual([
+        { intentId: "if", as: "dropped" },
+      ]),
+    );
+  });
+
+  test("the interrupted Drop is one command, and its refusal stands on the row", async () => {
+    // The whole ruling is the close's (dashboard-56, DR-073): the core
+    // ends the parked run before it records the verdict, so the row
+    // orchestrates nothing — and a refused ending leaves the entry.
+    seed({ ledger: { intents: [], attention: ATTENTION, badge: 6 } });
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "intent.close") {
+        throw new Error("the run is still parked, so the intent stays open");
+      }
+      if (type === "ledger.get") return useAppStore.getState().ledger;
+      return {};
+    });
+    renderSurface();
+
+    fireEvent.click(screen.getByTestId("attention-drop-if"));
+    fireEvent.click(screen.getByTestId("attention-drop-confirm-if"));
+    await screen.findByText(
+      "Couldn't record the verdict: the run is still parked, so the intent stays open",
+    );
+    expect(callsOf("session.control")).toEqual([]);
+    expect(screen.getByTestId("attention-if-failure")).toBeTruthy();
+    expect(
+      (screen.getByTestId("attention-drop-confirm-if") as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+
+  test("a session's question names both of its doors", () => {
+    // Its acts are a reply and the ending its run's own notice takes
+    // (dashboard-4, dashboard-53, DR-073), so the row names both and
+    // carries no control of its own — no verdict is owed.
+    const asking: AttentionEntry = {
+      band: "interrupted",
+      kind: "question",
+      title: "chat about the migration",
+      projectId: "me/alpha-spex",
+      sessionId: "s7",
+      turnId: 3,
+      since: NOW - 4 * MIN,
+    };
+    seed({ ledger: { intents: [], attention: [asking], badge: 1 } });
+    renderSurface();
+
+    expect(screen.getByTestId("attention-act-s7").textContent).toBe(
+      "Open to reply, or drop the run.",
+    );
+    expect(screen.queryByTestId("attention-drop-s7")).toBeNull();
+  });
+
+  test("Confirm closes done with an in-frame busy state; Drop acts on the click", async () => {
+    seed({ ledger: { intents: [], attention: ATTENTION, badge: 6 } });
+    let settleClose!: () => void;
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "intent.close") {
+        return new Promise((resolve) => {
+          settleClose = () => resolve({});
+        });
+      }
+      if (type === "ledger.get") return useAppStore.getState().ledger;
+      return {};
+    });
+    renderSurface();
+
+    const confirm = screen.getByTestId("attention-confirm-id1");
+    fireEvent.click(confirm);
+    // The action acknowledges where it was taken (DR-010 §5).
+    expect(confirm.textContent).toBe("Confirming…");
+    expect((confirm as HTMLButtonElement).disabled).toBe(true);
+    expect(callsOf("intent.close")).toEqual([
+      { intentId: "id1", as: "done" },
+    ]);
+    await act(async () => settleClose());
+
+    // Drop is a verdict on the click (dashboard-4, DR-038): no guard —
+    // the History row it produces is the record of it.
+    fireEvent.click(screen.getByTestId("attention-drop-id2"));
+    const row = screen.getByTestId("attention-id2-finish");
+    expect(row.textContent).not.toContain("Drop this intent?");
+    expect(callsOf("intent.close")).toEqual([
+      { intentId: "id1", as: "done" },
+      { intentId: "id2", as: "dropped" },
+    ]);
+    await act(async () => settleClose());
+  });
+
+  test("a verdict hands focus to the next entry, global all-clear, or filtered empty note", async () => {
+    const current = ledgerMock({
+      intents: [q("n1", "me/alpha-spex", "Polish README", { next: MANUAL_READY })],
+      attention: [ATTENTION[3], ATTENTION[4]],
+      badge: 2,
+    });
+    seed({ ledger: current() });
+    renderSurface();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("attention-confirm-id1"));
+    });
+    // The row that took the closed one's place holds focus.
+    expect(screen.queryByTestId("attention-id1-finish")).toBeNull();
+    const next = screen.getByTestId("attention-id2-finish");
+    expect(document.activeElement).toBe(
+      within(next).getByRole("button", { name: /Open Tidy CI/ }),
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("attention-drop-id2"));
+    });
+    // The last verdict lands on the all-clear's Start, never on body.
+    expect(screen.queryByTestId("attention-id2-finish")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByTestId("all-clear-start"));
+
+    // Under a project filter, another project's hidden summons means
+    // the global all-clear is false. The scoped note is still a real
+    // focus destination when the last visible verdict leaves.
+    cleanup();
+    const filtered = ledgerMock({
+      intents: [q("n1", "me/alpha-spex", "Polish README", { next: MANUAL_READY })],
+      attention: [ATTENTION[3], ATTENTION[4]],
+      badge: 2,
+    });
+    seed({ ledger: filtered() });
+    renderSurface();
+    fireEvent.change(screen.getByRole("combobox", { name: "Filter by project" }), {
+      target: { value: "me/beta-spex" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("attention-drop-id2"));
+    });
+    expect(screen.queryByTestId("attention-all-clear")).toBeNull();
+    const filteredEmpty = screen.getByTestId("attention-filter-empty");
+    expect(filteredEmpty.textContent).toBe("Nothing in beta needs attention.");
+    expect(document.activeElement).toBe(filteredEmpty);
+  });
+});
+
+describe("dashboard-8: no false all-clear before the ledger is read", () => {
+  test("a quiet loading row until the ledger arrives", () => {
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "ledger.get") return new Promise(() => {});
+      if (type === "ledger.history") return { intents: [], more: false };
+      return {};
+    });
+    seed({ ledger: undefined, ledgerError: undefined });
+    renderSurface();
+
+    const loading = screen.getByTestId("attention-loading");
+    expect(loading.getAttribute("role")).toBe("status");
+    expect(loading.textContent).toBe("Loading…");
+    expect(screen.queryByTestId("attention-all-clear")).toBeNull();
+    // The queue band waits too, rather than claiming an empty queue.
+    const upnext = screen.getByTestId("upnext-me/alpha-spex");
+    expect(upnext.textContent).toContain("Loading…");
+    expect(upnext.textContent).not.toContain("Nothing queued");
+  });
+
+  test("a failed load shows the failure strip with Retry and nothing else in the box", async () => {
+    seed({ ledger: undefined, ledgerError: "state root unreadable" });
+    renderSurface();
+
+    const strip = screen.getByTestId("ledger-error");
+    expect(strip.textContent).toContain("state root unreadable");
+    expect(screen.queryByTestId("attention-all-clear")).toBeNull();
+    expect(screen.queryByTestId("attention-loading")).toBeNull();
+    expect(screen.getByTestId("upnext-me/alpha-spex").textContent).toContain(
+      "could not be loaded",
+    );
+
+    // Retry reads the ledger again; only a loaded ledger brings the
+    // all-clear.
+    await act(async () => {
+      fireEvent.click(within(strip).getByRole("button", { name: "Retry" }));
+    });
+    expect(callsOf("ledger.get")).toHaveLength(1);
+    expect(screen.queryByTestId("ledger-error")).toBeNull();
+    expect(screen.getByTestId("attention-all-clear")).toBeTruthy();
+  });
+});
+
+describe("dashboard-8: the all-clear names the globally published next", () => {
+  test("the first published next by sidebar order carries Start", () => {
+    // Ledger order is deliberately reversed: project/sidebar order owns
+    // the global reading when more than one project publishes a next.
+    seed({
+      ledger: {
+        intents: [
+          q("beta-next", "me/beta-spex", "Polish README\nwith details", {
+            next: MANUAL_READY,
+          }),
+          q("alpha-next", "me/alpha-spex", "Ship alpha", { next: MANUAL_READY }),
+        ],
+        attention: [],
+        badge: 0,
+      },
+    });
+    const { onStartIntent } = renderSurface();
+
+    const allClear = screen.getByTestId("attention-all-clear");
+    expect(allClear.textContent).toContain("Ship alpha");
+    expect(allClear.textContent).toContain("alpha");
+    expect(allClear.textContent).not.toContain("Polish README");
+    const allClearStart = within(allClear).getByRole("button", {
+      name: "Start Ship alpha in alpha",
+    });
+    expect(allClearStart.textContent).toBe("Start");
+    expect(
+      within(screen.getByTestId("upnext-row-alpha-next")).getByRole("button", {
+        name: "Start Ship alpha in alpha",
+      }).textContent,
+    ).toBe("Start");
+    expect(
+      within(screen.getByTestId("upnext-row-beta-next")).getByRole("button", {
+        name: "Start Polish README in beta",
+      }).textContent,
+    ).toBe("Start");
+    expect(
+      within(screen.getByTestId("add-intent-row-me/alpha-spex")).getByRole("button", {
+        name: "Queue an intent in alpha",
+      }).textContent,
+    ).toBe("Queue");
+    expect(
+      within(screen.getByTestId("add-intent-row-me/beta-spex")).getByRole("button", {
+        name: "Queue an intent in beta",
+      }).textContent,
+    ).toBe("Queue");
+    fireEvent.click(allClearStart);
+    expect(onStartIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "alpha-next", text: "Ship alpha" }),
+    );
+  });
+
+  test("plain all-clear copy when no project publishes a next", () => {
+    seed({
+      ledger: {
+        intents: [q("b1", "me/alpha-spex", "Unpublished")],
+        attention: [],
+        badge: 0,
+      },
+    });
+    renderSurface();
+    expect(
+      screen.getByTestId("attention-all-clear").textContent,
+    ).toContain("All clear — nothing waiting");
+    expect(screen.queryByTestId("all-clear-start")).toBeNull();
+  });
+
+  test("the project filter keeps the global next but distinguishes hidden attention", () => {
+    seed({
+      sessions: [
+        {
+          id: "s-alpha",
+          projectId: "me/alpha-spex",
+          projectPath: "/tmp/alpha",
+          title: "Alpha running",
+          createdAt: NOW - MIN,
+          live: true,
+          endedAt: null,
+          players: [],
+          initialVisible: [],
+          turns: 1,
+          failed: false,
+          turnActive: true,
+        },
+      ],
+      ledger: {
+        intents: [
+          q("alpha-next", "me/alpha-spex", "Alpha goes first", {
+            next: MANUAL_READY,
+          }),
+          q("beta-next", "me/beta-spex", "Beta follows", { next: MANUAL_READY }),
+        ],
+        attention: [],
+        badge: 0,
+      },
+    });
+    renderSurface();
+    fireEvent.change(screen.getByRole("combobox", { name: "Filter by project" }), {
+      target: { value: "me/beta-spex" },
+    });
+
+    expect(screen.queryByTestId("project-group-me/alpha-spex")).toBeNull();
+    expect(screen.getByTestId("project-group-me/beta-spex")).toBeTruthy();
+    expect(screen.queryByTestId("running-session-s-alpha")).toBeNull();
+    const allClear = screen.getByTestId("attention-all-clear");
+    expect(allClear.textContent).toContain("All clear across projects");
+    expect(allClear.textContent).toContain("Alpha goes first");
+    expect(allClear.textContent).toContain("alpha");
+    expect(allClear.textContent).not.toContain("Beta follows");
+
+    act(() => {
+      useAppStore.setState({
+        ledger: {
+          ...useAppStore.getState().ledger!,
+          attention: [ATTENTION[0]],
+          badge: 1,
+        },
+      });
+    });
+    expect(screen.queryByTestId("attention-iq-question")).toBeNull();
+    expect(screen.queryByTestId("attention-all-clear")).toBeNull();
+    const filteredEmpty = screen.getByTestId("attention-filter-empty");
+    expect(filteredEmpty.textContent).toBe("Nothing in beta needs attention.");
+    expect(within(filteredEmpty).queryByRole("button")).toBeNull();
+    expect(useAppStore.getState().ledger?.badge).toBe(1);
+
+    // A registered project can disappear while this surface stays
+    // mounted. Its stale filter falls back to the unfiltered view in
+    // the same render, then reconciles the select state.
+    act(() => {
+      useAppStore.setState({ projects: [PROJECTS[0]] });
+    });
+    expect(
+      (screen.getByRole("combobox", {
+        name: "Filter by project",
+      }) as HTMLSelectElement).value,
+    ).toBe("all");
+    expect(screen.getByTestId("attention-iq-question")).toBeTruthy();
+    expect(screen.getByTestId("running-session-s-alpha")).toBeTruthy();
+    expect(screen.getByTestId("project-group-me/alpha-spex")).toBeTruthy();
+    expect(screen.queryByTestId("project-group-me/beta-spex")).toBeNull();
+    expect(screen.queryByTestId("attention-filter-empty")).toBeNull();
+    expect(screen.queryByTestId("attention-all-clear")).toBeNull();
+
+    // The reconciliation is durable: beta returning to the registry
+    // does not silently revive the filter that named it.
+    act(() => {
+      useAppStore.setState({ projects: PROJECTS });
+    });
+    expect(
+      (screen.getByRole("combobox", {
+        name: "Filter by project",
+      }) as HTMLSelectElement).value,
+    ).toBe("all");
+    expect(screen.getByTestId("project-group-me/alpha-spex")).toBeTruthy();
+    expect(screen.getByTestId("project-group-me/beta-spex")).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Project groups: Up next
+// ---------------------------------------------------------------------------
+
+describe("dashboard-26/29: groups and the queue band", () => {
+  const QUEUE_LEDGER: LedgerState = {
+    intents: [
+      q("q1", "me/alpha-spex", "First thing", { next: MANUAL_READY }),
+      q("q2", "me/alpha-spex", "Second thing"),
+      q("q3", "me/alpha-spex", "Third thing"),
+    ],
+    attention: [],
+    badge: 0,
+  };
+
+  test("groups render in sidebar order with all four bands", () => {
+    seed({ ledger: QUEUE_LEDGER });
+    renderSurface();
+    const groups = screen.getAllByTestId(/^project-group-/);
+    expect(groups.map((el) => el.getAttribute("data-testid"))).toEqual([
+      "project-group-me/alpha-spex",
+      "project-group-me/beta-spex",
+    ]);
+    const p1 = screen.getByTestId("project-group-me/alpha-spex");
+    expect(within(p1).getByTestId("history-me/alpha-spex")).toBeTruthy();
+    expect(within(p1).getByTestId("now-me/alpha-spex")).toBeTruthy();
+    expect(within(p1).getByTestId("upnext-me/alpha-spex")).toBeTruthy();
+    expect(within(p1).getByTestId("sources-me/alpha-spex")).toBeTruthy();
+  });
+
+  test("dashboard-45: groups fold independently, keep their draft and attention, and leave Overview open", () => {
+    seed({
+      ledger: { intents: [], attention: ATTENTION, badge: ATTENTION.length },
+    });
+    renderSurface();
+
+    const p1 = screen.getByTestId("project-group-me/alpha-spex");
+    const p2 = screen.getByTestId("project-group-me/beta-spex");
+    const toggle = within(p1).getByTestId("project-toggle-me/alpha-spex");
+    const body = within(p1).getByTestId("project-bands-me/alpha-spex");
+    const draft = within(p1).getByTestId("add-intent-me/alpha-spex") as HTMLTextAreaElement;
+    fireEvent.change(draft, { target: { value: "Keep this draft" } });
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(toggle.getAttribute("aria-label")).toBe("Collapse alpha");
+    expect(toggle.getAttribute("aria-describedby")).toBe(
+      "project-attention-description-me/alpha-spex",
+    );
+    const heading = within(p1).getByRole("heading", {
+      level: 3,
+      name: "alpha",
+    });
+    const description = document.getElementById(
+      "project-attention-description-me/alpha-spex",
+    )!;
+    expect(description.textContent).toBe("A session failed");
+    expect(heading.contains(description)).toBe(false);
+    expect(
+      within(p1).getByTestId("project-attention-me/alpha-spex").className,
+    ).toContain("bg-red-500");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(body.hidden).toBe(true);
+    expect(p1.dataset.collapsed).toBe("true");
+    expect(p2.dataset.collapsed).toBeUndefined();
+    expect(useAppStore.getState().dashboardGroupsCollapsed).toEqual({ "me/alpha-spex": true });
+
+    // New work updates the group without taking disclosure back from
+    // the reader, and the other project keeps its independent state.
+    act(() => {
+      useAppStore.setState({
+        ledger: {
+          intents: [q("arrived", "me/alpha-spex", "Arrived behind the fold")],
+          attention: [ATTENTION[0]],
+          badge: 1,
+        },
+      });
+    });
+    expect(body.hidden).toBe(true);
+    expect(description.textContent).toBe("A session is waiting for your reply");
+    expect(
+      within(p1).getByTestId("project-attention-me/alpha-spex").className,
+    ).toContain("bg-amber-500");
+    expect(
+      within(p2).getByTestId("project-toggle-me/beta-spex").getAttribute("aria-expanded"),
+    ).toBe("true");
+
+    // Disclosure hides rather than remounts the group: an unfinished
+    // capture is still there when the reader opens it again.
+    fireEvent.click(toggle);
+    expect(body.hidden).toBe(false);
+    expect(draft.value).toBe("Keep this draft");
+    fireEvent.click(toggle);
+
+    // A redraw reads the same preference; the Overview deliberately
+    // ignores it because this one project is the tab's whole content.
+    cleanup();
+    renderSurface();
+    expect(screen.getByTestId("project-bands-me/alpha-spex").hidden).toBe(true);
+    cleanup();
+    const { overview } = renderOverview();
+    expect(within(overview).queryByTestId("project-toggle-me/alpha-spex")).toBeNull();
+    expect(
+      (within(overview).getByTestId("project-bands-me/alpha-spex") as HTMLDivElement)
+        .hidden,
+    ).toBe(false);
+    expect(within(overview).getByTestId("history-me/alpha-spex")).toBeTruthy();
+  });
+
+  test("published next is emphasized; every row is Queued in the served order; later rows carry no Start", () => {
+    seed({ ledger: QUEUE_LEDGER });
+    const { onStartIntent } = renderSurface();
+
+    const head = screen.getByTestId("upnext-row-q1");
+    expect(head.getAttribute("data-next")).toBe("true");
+    fireEvent.click(screen.getByTestId("upnext-start-q1"));
+    expect(onStartIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "q1" }),
+    );
+    for (const id of ["q1", "q2", "q3"]) {
+      expect(screen.getByTestId(`upnext-queued-${id}`).textContent).toBe(
+        "Queued",
+      );
+    }
+    // The rows stand in the order the core serves them, oldest first
+    // (dashboard-29): the band sorts nothing of its own.
+    expect(
+      screen
+        .getAllByTestId(/^upnext-row-/)
+        .map((el) => el.getAttribute("data-testid")),
+    ).toEqual(["upnext-row-q1", "upnext-row-q2", "upnext-row-q3"]);
+
+    // A later row carries only its Queued tag: age says it is later.
+    for (const id of ["q2", "q3"]) {
+      expect(screen.queryByTestId(`upnext-start-${id}`)).toBeNull();
+      expect(screen.queryByTestId(`upnext-standing-${id}`)).toBeNull();
+      expect(screen.getByTestId(`upnext-row-${id}`).getAttribute("data-next")).toBeNull();
+    }
+  });
+
+  test("the queue has no order of its own to change: no grip, no drag, no move control (dashboard-29)", async () => {
+    seed({ ledger: QUEUE_LEDGER });
+    renderSurface();
+
+    const row = screen.getByTestId("upnext-row-q3");
+    expect(row.getAttribute("draggable")).toBeNull();
+    expect(row.querySelector("svg.cursor-grab")).toBeNull();
+    await act(async () => {
+      fireEvent.keyDown(row, { key: "ArrowUp", altKey: true });
+    });
+    fireEvent.click(screen.getByTestId("upnext-menu-q3"));
+    const menu = screen.getByRole("menu", { name: "Actions for Third thing" });
+    expect(
+      within(menu)
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual(["Start", "Edit", "Remove"]);
+    expect(commandMock.mock.calls.map(([type]) => type)).not.toContain("intent.move");
+  });
+
+  test("a later row's menu offers Start, which starts that very intent (dashboard-29)", async () => {
+    seed({ ledger: QUEUE_LEDGER });
+    const { onStartIntent } = renderSurface();
+
+    const trigger = screen.getByTestId("upnext-menu-q3");
+    fireEvent.click(trigger);
+    const menu = screen.getByRole("menu", { name: "Actions for Third thing" });
+    await act(async () => {
+      fireEvent.click(within(menu).getByRole("menuitem", { name: "Start" }));
+    });
+    expect(onStartIntent).toHaveBeenCalledTimes(1);
+    expect(onStartIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "q3", text: "Third thing" }),
+    );
+    // The menu closes with the pick.
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  const standingCases: Array<{
+    name: string;
+    schedule: QueueSchedule;
+    phrase?: string;
+  }> = [
+    {
+      name: "active work",
+      schedule: { standing: "after-current-work", manualStart: false },
+      phrase: "after current work",
+    },
+    {
+      name: "question park",
+      schedule: { standing: "question-park", manualStart: false },
+      phrase: "waiting — your reply",
+    },
+    {
+      name: "failure park",
+      schedule: {
+        standing: "failure-park",
+        manualStart: false,
+        cause: { code: "commit-missing" },
+      },
+      phrase: "waiting — current work failed — Committed nothing",
+    },
+    {
+      name: "previous failure",
+      schedule: {
+        standing: "failed",
+        manualStart: true,
+        cause: { code: "commit-missing" },
+      },
+      phrase: "waiting — previous work failed — Committed nothing",
+    },
+    {
+      name: "stopped work",
+      schedule: { standing: "stopped", manualStart: true },
+      phrase: "waiting — previous work stopped",
+    },
+    {
+      name: "manual ready",
+      schedule: MANUAL_READY,
+    },
+  ];
+
+  test.each(standingCases)(
+    "dashboard-59/60: $name has one shared row and all-clear presentation",
+    ({ schedule, phrase }) => {
+      seed({
+        projects: [PROJECTS[0]],
+        ledger: {
+          intents: [
+            q("next", "me/alpha-spex", "The published next", { next: schedule }),
+            q("later", "me/alpha-spex", "Later queued work"),
+          ],
+          attention: [],
+          badge: 0,
+        },
+      });
+      renderSurface();
+
+      const next = screen.getByTestId("upnext-row-next");
+      expect(next.getAttribute("data-next")).toBe("true");
+      expect(screen.getByTestId("upnext-queued-next").textContent).toBe(
+        "Queued",
+      );
+      expect(screen.getByTestId("upnext-queued-later").textContent).toBe(
+        "Queued",
+      );
+      expect(screen.getByTestId("upnext-row-later").getAttribute("data-next")).toBeNull();
+      expect(screen.queryByTestId("upnext-start-later")).toBeNull();
+      expect(screen.queryByTestId("upnext-standing-later")).toBeNull();
+
+      const rowStanding = screen.queryByTestId("upnext-standing-next");
+      const allClearStanding = screen.queryByTestId("all-clear-standing");
+      if (phrase) {
+        expect(rowStanding?.textContent).toBe(phrase);
+        expect(rowStanding?.getAttribute("title")).toBe(phrase);
+        expect(allClearStanding?.textContent).toBe(phrase);
+      } else {
+        expect(rowStanding).toBeNull();
+        expect(allClearStanding).toBeNull();
+      }
+      expect(screen.queryByTestId("upnext-start-next") !== null).toBe(
+        schedule.manualStart,
+      );
+      expect(screen.queryByTestId("all-clear-start") !== null).toBe(
+        schedule.manualStart,
+      );
+      expect(screen.getByTestId("attention-all-clear").textContent).toContain(
+        "The published next",
+      );
+    },
+  );
+
+  test("the published marker, not a local first-eligible guess, chooses Next", () => {
+    seed({
+      projects: [PROJECTS[0]],
+      ledger: {
+        intents: [
+          q("earlier", "me/alpha-spex", "Earlier but not published"),
+          q("published", "me/alpha-spex", "Core-published next", {
+            next: MANUAL_READY,
+          }),
+        ],
+        attention: [],
+        badge: 0,
+      },
+    });
+    renderSurface();
+
+    expect(screen.getByTestId("upnext-row-earlier").getAttribute("data-next")).toBeNull();
+    expect(screen.queryByTestId("upnext-start-earlier")).toBeNull();
+    expect(screen.getByTestId("upnext-row-published").getAttribute("data-next")).toBe("true");
+    expect(screen.getByTestId("attention-all-clear").textContent).toContain(
+      "Core-published next",
+    );
+  });
+
+  test("the row popover edits queued text and removes on the click", async () => {
+    seed({ ledger: QUEUE_LEDGER });
+    renderSurface();
+
+    fireEvent.click(screen.getByTestId("upnext-menu-q1"));
+    fireEvent.click(screen.getByTestId("upnext-edit-action-q1"));
+    const input = screen.getByTestId("upnext-edit-q1") as HTMLInputElement;
+    expect(input.value).toBe("First thing");
+    fireEvent.change(input, { target: { value: "First thing, sharper" } });
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    expect(callsOf("intent.edit")).toEqual([
+      { intentId: "q1", text: "First thing, sharper", attachments: [] },
+    ]);
+
+    // Remove acts on the click (dashboard-29, DR-038): no confirm, and
+    // the word is Remove, never Drop — a queued intent never ran.
+    fireEvent.click(screen.getByTestId("upnext-menu-q3"));
+    const row = screen.getByTestId("upnext-row-q3");
+    expect(within(row).queryByText("Drop")).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("upnext-remove-action-q3"));
+    });
+    expect(row.textContent).not.toContain("Drop?");
+    expect(callsOf("intent.close")).toEqual([
+      { intentId: "q3", as: "dropped" },
+    ]);
+  });
+
+  test("the row menu is the house popover: focus in, arrows, Escape and outside close, focus back, one at a time", () => {
+    seed({ ledger: QUEUE_LEDGER });
+    renderSurface();
+
+    const trigger = screen.getByTestId("upnext-menu-q1");
+    expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    trigger.focus();
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    const menu = screen.getByRole("menu", { name: "Actions for First thing" });
+    // Focus lands on the first item; arrows walk the items.
+    expect(document.activeElement).toBe(
+      within(menu).getByRole("menuitem", { name: "Start" }),
+    );
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(
+      within(menu).getByRole("menuitem", { name: "Edit" }),
+    );
+    // Escape closes and returns focus to the trigger.
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(trigger);
+
+    // Opening another row's menu closes this one: one menu at a time.
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId("upnext-menu-q2"));
+    expect(screen.getAllByRole("menu")).toHaveLength(1);
+    expect(
+      screen.getByRole("menu", { name: "Actions for Second thing" }),
+    ).toBeTruthy();
+    // A click outside closes.
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  test("Remove offers Undo, which re-queues the same text and provenance, landing by age (dashboard-29)", async () => {
+    const current = ledgerMock({
+      intents: [
+        q("q1", "me/alpha-spex", "First thing"),
+        {
+          intent: info({
+            id: "q2",
+            projectId: "me/alpha-spex",
+            text: "Address #7: Fix the bug",
+            source: {
+              kind: "issue",
+              ref: "7",
+              url: "https://github.com/x/y/issues/7",
+              labels: ["bug"],
+            },
+          }),
+          state: "queued",
+        },
+        q("q3", "me/alpha-spex", "Third thing"),
+      ],
+      attention: [],
+      badge: 0,
+    });
+    seed({ ledger: current() });
+    renderSurface();
+
+    fireEvent.click(screen.getByTestId("upnext-menu-q2"));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("upnext-remove-action-q2"));
+    });
+    expect(screen.queryByTestId("upnext-row-q2")).toBeNull();
+    const notice = screen.getByTestId("upnext-removed-me/alpha-spex");
+    expect(notice.getAttribute("role")).toBe("status");
+    expect(notice.textContent).toContain("Removed “Address #7: Fix the bug”");
+    const undo = within(notice).getByRole("button", { name: "Undo" });
+    // The removed row took focus with it; Undo is where it lands.
+    expect(document.activeElement).toBe(undo);
+
+    await act(async () => {
+      fireEvent.click(undo);
+    });
+    // The same text and provenance, captured again: it takes its place
+    // by age, revealed and focused, and nothing moves it (dashboard-29).
+    expect(callsOf("intent.queue")).toEqual([
+      {
+        projectId: "me/alpha-spex",
+        text: "Address #7: Fix the bug",
+        source: {
+          kind: "issue",
+          ref: "7",
+          url: "https://github.com/x/y/issues/7",
+          labels: ["bug"],
+        },
+      },
+    ]);
+    expect(callsOf("intent.move")).toEqual([]);
+    expect(screen.queryByTestId("upnext-removed-me/alpha-spex")).toBeNull();
+    const restored = screen.getByTestId("upnext-row-i-new-1");
+    expect(restored.getAttribute("data-highlight")).toBe("true");
+    expect(document.activeElement).toBe(restored);
+    expect(
+      screen
+        .getAllByTestId(/^upnext-row-/)
+        .map((el) => el.getAttribute("data-testid")),
+    ).toEqual(["upnext-row-q1", "upnext-row-q3", "upnext-row-i-new-1"]);
+  });
+
+  test("the Undo line stays six seconds, and longer while its control holds focus", async () => {
+    vi.useFakeTimers();
+    try {
+      const current = ledgerMock(QUEUE_LEDGER);
+      seed({ ledger: current() });
+      renderSurface();
+      fireEvent.click(screen.getByTestId("upnext-menu-q3"));
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("upnext-remove-action-q3"));
+      });
+      const undo = within(screen.getByTestId("upnext-removed-me/alpha-spex")).getByRole(
+        "button",
+        { name: "Undo" },
+      );
+      expect(document.activeElement).toBe(undo);
+      act(() => {
+        vi.advanceTimersByTime(6_000);
+      });
+      // Still there: a keyboard user on the control is never raced.
+      expect(screen.getByTestId("upnext-removed-me/alpha-spex")).toBeTruthy();
+      undo.blur();
+      act(() => {
+        vi.advanceTimersByTime(6_000);
+      });
+      expect(screen.queryByTestId("upnext-removed-me/alpha-spex")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a pointer Remove leaves the pointer where it is, and the line lapses on schedule", async () => {
+    vi.useFakeTimers();
+    try {
+      const current = ledgerMock(QUEUE_LEDGER);
+      seed({ ledger: current() });
+      renderSurface();
+      fireEvent.click(screen.getByTestId("upnext-menu-q3"));
+      // A mouse click carries its click count (detail 1); the keyboard
+      // sends none, which is the case the test above covers.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("upnext-remove-action-q3"), {
+          detail: 1,
+        });
+      });
+      const notice = screen.getByTestId("upnext-removed-me/alpha-spex");
+      const undo = within(notice).getByRole("button", { name: "Undo" });
+      expect(document.activeElement).not.toBe(undo);
+      act(() => {
+        vi.advanceTimersByTime(6_000);
+      });
+      expect(screen.queryByTestId("upnext-removed-me/alpha-spex")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("the provenance action is named after what it opens (dashboard-29, DR-038)", () => {
+    const sourced = (
+      id: string,
+      text: string,
+      source: IntentSource,
+    ): DerivedIntent => ({
+      intent: info({ id, projectId: "me/alpha-spex", text, source }),
+      state: "queued",
+    });
+    seed({
+      specTrees: {
+        "me/alpha-spex": {
+          ...EMPTY_TREE,
+          intents: [
+            { id: "IR-3", title: "Half done", path: "intents/003-half.md" },
+          ],
+        },
+        "me/beta-spex": EMPTY_TREE,
+      },
+      sessions: [
+        {
+          id: "s-chat",
+          projectId: "me/alpha-spex",
+          projectPath: "/tmp/alpha",
+          createdAt: NOW - MIN,
+          live: false,
+          endedAt: NOW,
+          players: [],
+          initialVisible: [],
+          turns: 1,
+          failed: false,
+        },
+      ],
+      ledger: {
+        intents: [
+          sourced("i1", "Address #7: Fix the bug", {
+            kind: "issue",
+            ref: "7",
+            url: "https://github.com/x/y/issues/7",
+          }),
+          sourced("i2", "Review PR #8: Add tests", {
+            kind: "pr",
+            ref: "8",
+            url: "https://github.com/x/y/pull/8",
+          }),
+          sourced("i3", "Resume IR-3: Half done", { kind: "record", ref: "IR-3" }),
+          sourced("i4", "later: tidy the docs", { kind: "chat", ref: "s-chat" }),
+          sourced("i5", "orphaned chat", { kind: "chat", ref: "s-gone" }),
+        ],
+        attention: [],
+        badge: 0,
+      },
+    });
+    const { onOpenIntent, onOpenSession } = renderSurface();
+
+    fireEvent.click(screen.getByTestId("upnext-menu-i1"));
+    const issue = screen.getByTestId("upnext-source-i1");
+    expect(issue.textContent).toBe("Issue #7 ↗");
+    expect(issue.getAttribute("href")).toBe("https://github.com/x/y/issues/7");
+    expect(screen.queryByText("Open source")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("upnext-menu-i2"));
+    expect(screen.getByTestId("upnext-source-i2").textContent).toBe("PR #8 ↗");
+
+    fireEvent.click(screen.getByTestId("upnext-menu-i3"));
+    // The record item is the one record row (dashboard-40): chip,
+    // title, named as an opener, a menu item still.
+    const record = screen.getByTestId("upnext-source-i3");
+    expect(record.getAttribute("role")).toBe("menuitem");
+    expect(within(record).getByText("IR-3").className).toContain("font-mono");
+    expect(record.textContent).toContain("Half done");
+    expect(record.getAttribute("aria-label")).toBe("Open IR-3: Half done");
+    expect(record.getAttribute("title")).toBe("Open IR-3 in Specs");
+    fireEvent.click(record);
+    // The menu item leaves with its menu: the trigger is the origin's
+    // control (spec-view-57).
+    expect(onOpenIntent).toHaveBeenCalledWith(
+      "me/alpha-spex",
+      "intents/003-half.md",
+      "upnext-menu-i3",
+    );
+
+    fireEvent.click(screen.getByTestId("upnext-menu-i4"));
+    const session = screen.getByTestId("upnext-source-i4");
+    expect(session.textContent).toBe("Session");
+    fireEvent.click(session);
+    expect(onOpenSession).toHaveBeenCalledWith("s-chat");
+
+    // A capturing session that is gone leaves the action inert.
+    fireEvent.click(screen.getByTestId("upnext-menu-i5"));
+    expect(
+      (screen.getByTestId("upnext-source-i5") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  test("dashboard-60: a row assigned to another runtime reads where it runs, carries no Start, and its menu offers its provenance alone (dashboard-29)", async () => {
+    // Another runtime's captures, as the core serves them: kept in the
+    // queue by age with that runtime's label, never next here
+    // (core-service-107).
+    const theirs = (
+      id: string,
+      text: string,
+      minutesAgo: number,
+      source?: IntentSource,
+    ): DerivedIntent => ({
+      intent: info({
+        id,
+        projectId: "me/alpha-spex",
+        text,
+        createdAt: NOW - minutesAgo * MIN,
+        ...(source ? { source } : {}),
+      }),
+      state: "queued",
+      runsOn: "build-server",
+    });
+    seed({
+      projects: [PROJECTS[0]],
+      sessions: [
+        {
+          id: "s-chat",
+          projectId: "me/alpha-spex",
+          projectPath: "/tmp/alpha",
+          createdAt: NOW - 2 * MIN,
+          live: false,
+          endedAt: NOW - MIN,
+          players: [],
+          initialVisible: [],
+          turns: 1,
+          failed: false,
+          runsOn: "build-server",
+          continuationReason: "Runs on build-server",
+        },
+      ],
+      ledger: {
+        intents: [
+          theirs("theirs-chat", "Ship the parser", 90, { kind: "chat", ref: "s-chat" }),
+          {
+            intent: info({ id: "mine", projectId: "me/alpha-spex", text: "Mine to run", createdAt: NOW - 60 * MIN }),
+            state: "queued",
+            next: MANUAL_READY,
+          },
+          theirs("theirs-issue", "Address #7: Fix the bug", 45, {
+            kind: "issue",
+            ref: "7",
+            url: "https://github.com/x/y/issues/7",
+          }),
+          theirs("theirs-bare", "Document the parser", 30),
+        ],
+        attention: [],
+        badge: 0,
+      },
+    });
+    const { onOpenSession, onStartIntent } = renderSurface();
+
+    // Each keeps its Queued tag and its place by age, the core's
+    // order, the oldest row this runtime may run being next.
+    expect(
+      screen
+        .getAllByTestId(/^upnext-row-/)
+        .map((el) => el.getAttribute("data-testid")),
+    ).toEqual([
+      "upnext-row-theirs-chat",
+      "upnext-row-mine",
+      "upnext-row-theirs-issue",
+      "upnext-row-theirs-bare",
+    ]);
+    expect(screen.getByTestId("upnext-row-mine").getAttribute("data-next")).toBe("true");
+    expect(screen.getByTestId("upnext-start-mine")).toBeTruthy();
+    for (const id of ["theirs-chat", "theirs-issue", "theirs-bare"]) {
+      expect(screen.getByTestId(`upnext-queued-${id}`).textContent).toBe("Queued");
+      expect(screen.getByTestId(`upnext-row-${id}`).getAttribute("data-next")).toBeNull();
+      // "Runs on <label>" in place of any standing, in full in its
+      // title, and no Start (dashboard-29).
+      const phrase = screen.getByTestId(`upnext-standing-${id}`);
+      expect(phrase.textContent).toBe("Runs on build-server");
+      expect(phrase.getAttribute("title")).toBe("Runs on build-server");
+      expect(screen.queryByTestId(`upnext-start-${id}`)).toBeNull();
+    }
+    // The all-clear pulls this runtime's next, never the older row
+    // another runtime runs (dashboard-8).
+    expect(screen.getByTestId("attention-all-clear").textContent).toContain("Mine to run");
+    expect(screen.getByTestId("attention-all-clear").textContent).not.toContain("Ship the parser");
+
+    // The menu offers neither Start, Edit nor Remove: the provenance
+    // action alone, which still opens what it names (dashboard-29).
+    const items = (title: string) =>
+      within(screen.getByRole("menu", { name: `Actions for ${title}` }))
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent);
+    fireEvent.click(screen.getByTestId("upnext-menu-theirs-chat"));
+    expect(items("Ship the parser")).toEqual(["Session"]);
+    for (const verb of ["start", "edit", "remove"]) {
+      expect(screen.queryByTestId(`upnext-${verb}-action-theirs-chat`)).toBeNull();
+    }
+    fireEvent.click(screen.getByTestId("upnext-source-theirs-chat"));
+    expect(onOpenSession).toHaveBeenCalledWith("s-chat");
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("upnext-menu-theirs-issue"));
+    expect(items("Address #7: Fix the bug")).toEqual(["Issue #7 ↗"]);
+    expect(screen.getByTestId("upnext-source-theirs-issue").getAttribute("href")).toBe(
+      "https://github.com/x/y/issues/7",
+    );
+    fireEvent.click(screen.getByTestId("upnext-menu-theirs-issue"));
+
+    // With no provenance there is nothing to offer, so no menu.
+    expect(screen.queryByTestId("upnext-menu-theirs-bare")).toBeNull();
+
+    // This runtime's own row keeps every act.
+    fireEvent.click(screen.getByTestId("upnext-menu-mine"));
+    expect(items("Mine to run")).toEqual(["Start", "Edit", "Remove"]);
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("upnext-start-action-mine"));
+    });
+    expect(onStartIntent).toHaveBeenCalledTimes(1);
+    expect(onStartIntent).toHaveBeenCalledWith(expect.objectContaining({ id: "mine" }));
+    expect(callsOf("intent.close")).toEqual([]);
+    expect(callsOf("intent.edit")).toEqual([]);
+  });
+
+  test("dashboard-10/54: another runtime's records enter no band, the fold serving none of them", () => {
+    // Another runtime's work in every state, with the fold serving no
+    // attention for it (core-service-49): the surface adds none.
+    const elsewhere = (
+      id: string,
+      state: DerivedIntent["state"],
+      over: Partial<DerivedIntent> = {},
+    ): DerivedIntent => ({
+      intent: info({
+        id,
+        projectId: "me/alpha-spex",
+        text: `Their ${id}`,
+        dispatched: { sessionId: "s-there", turnId: 1, at: NOW - 10 * MIN },
+      }),
+      state,
+      runsOn: "build-server",
+      ...over,
+    });
+    seed({
+      projects: [PROJECTS[0]],
+      sessions: [
+        {
+          id: "s-there",
+          projectId: "me/alpha-spex",
+          projectPath: "/tmp/alpha",
+          createdAt: NOW - 20 * MIN,
+          live: false,
+          endedAt: NOW - 5 * MIN,
+          players: [],
+          initialVisible: [],
+          turns: 3,
+          failed: true,
+          title: "Their session",
+          runsOn: "build-server",
+          continuationReason: "Runs on build-server",
+        },
+      ],
+      ledger: {
+        intents: [
+          elsewhere("finished", "finished"),
+          elsewhere("failed", "interrupted", { reason: "failure" }),
+          elsewhere("asking", "interrupted", { reason: "question" }),
+          elsewhere("working", "working"),
+        ],
+        attention: [],
+        badge: 0,
+      },
+    });
+    renderSurface();
+
+    const queue = screen.getByTestId("attention-queue");
+    expect(queue.querySelectorAll("[data-band]")).toHaveLength(0);
+    expect(within(queue).getByTestId("attention-all-clear")).toBeTruthy();
+    expect(queue.textContent).not.toContain("Their");
+    expect(screen.getByTestId("running-empty")).toBeTruthy();
+    expect(screen.queryByTestId("project-attention-me/alpha-spex")).toBeNull();
+    // Never this runtime's conversation (core-service-93), and none of
+    // it queued here.
+    expect(screen.getByTestId("now-me/alpha-spex").textContent).toContain(
+      "Idle — no conversation yet.",
+    );
+    expect(screen.queryAllByTestId(/^upnext-row-/)).toHaveLength(0);
+  });
+
+  test("the inline Queue action captures a later row and reveals it without a standing", async () => {
+    let current: LedgerState = { ...QUEUE_LEDGER };
+    commandMock.mockImplementation(async (type: string, fields) => {
+      if (type === "intent.queue") {
+        const input = fields as { projectId: string; text: string };
+        current = {
+          ...current,
+          intents: [
+            ...current.intents,
+            q("i-new", input.projectId, input.text),
+          ],
+        };
+        return info({ id: "i-new", projectId: input.projectId, text: input.text });
+      }
+      if (type === "ledger.get") return current;
+      return {};
+    });
+    seed({ ledger: QUEUE_LEDGER });
+    renderSurface();
+
+    const addRow = screen.getByTestId("add-intent-row-me/alpha-spex");
+    const add = screen.getByTestId("add-intent-me/alpha-spex") as HTMLTextAreaElement;
+    const queue = within(addRow).getByRole("button", {
+      name: "Queue an intent in alpha",
+    });
+    expect(add.tagName).toBe("TEXTAREA");
+    expect(add.rows).toBe(1);
+    expect((queue as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      within(addRow).queryByRole("button", { name: /^Start\b/ }),
+    ).toBeNull();
+    Object.defineProperty(add, "scrollHeight", {
+      configurable: true,
+      value: 64,
+    });
+    fireEvent.change(add, { target: { value: "New idea" } });
+    expect(add.style.height).toBe("64px");
+    expect(add.style.overflowY).toBe("hidden");
+    await act(async () => {
+      fireEvent.keyDown(add, { key: "Enter", shiftKey: true });
+    });
+    expect(callsOf("intent.queue")).toEqual([]);
+    fireEvent.change(add, { target: { value: "  New idea\nwith details  " } });
+    expect((queue as HTMLButtonElement).disabled).toBe(false);
+    const timerSpy = vi.spyOn(globalThis, "setTimeout");
+    await act(async () => {
+      fireEvent.click(queue);
+    });
+    // Captured with no source (dashboard-29's inline add).
+    expect(callsOf("intent.queue")).toEqual([
+      { projectId: "me/alpha-spex", text: "  New idea\nwith details  " },
+    ]);
+    const row = await screen.findByTestId("upnext-row-i-new");
+    expect(row.getAttribute("data-highlight")).toBe("true");
+    expect(screen.getByTestId("upnext-queued-i-new").textContent).toBe(
+      "Queued",
+    );
+    expect(row.getAttribute("data-next")).toBeNull();
+    expect(screen.queryByTestId("upnext-standing-i-new")).toBeNull();
+    expect(screen.queryByTestId("upnext-start-i-new")).toBeNull();
+    expect(callsOf("turn.submit")).toEqual([]);
+    expect(add.value).toBe("");
+    const clearHighlight = timerSpy.mock.calls.find(
+      ([, delay]) => delay === 2_500,
+    )?.[0];
+    expect(clearHighlight).toBeTypeOf("function");
+    act(() => {
+      (clearHighlight as () => void)();
+    });
+    expect(row.getAttribute("data-highlight")).toBeNull();
+    timerSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Project groups: Now
+// ---------------------------------------------------------------------------
+
+describe("dashboard-28: the Now band reads the live lane", () => {
+  test.each(
+    (["Dashboard", "Overview"] as const).flatMap((surface) =>
+      (["missing", "stale", "player running"] as const).map((transcript) => ({ surface, transcript })),
+    ),
+  )("$surface uses summary activity for the Now label and mark with a $transcript transcript", ({ surface, transcript }) => {
+    const view = initialSessionView([{ id: "dev.coder" }]);
+    view.players["dev.coder"].running = transcript === "player running";
+    const session = {
+      id: "s-live", projectId: "me/alpha-spex", projectPath: "/tmp/alpha",
+      title: "Current work", createdAt: NOW - MIN, live: true,
+      endedAt: null, players: [], initialVisible: [], turns: 2,
+      failed: false, turnActive: true,
+    };
+    seed({
+      sessions: [session],
+      views: transcript === "missing" ? {} : { "s-live": view },
+    });
+    if (surface === "Dashboard") renderSurface();
+    else renderOverview();
+    const row = screen.getByTestId("now-session-me/alpha-spex");
+    // The mark says "running" to a screen reader as the label does.
+    expect(within(row).getAllByText(transcript === "player running" ? "running" : "deciding").length).toBeGreaterThan(0);
+    expect(row.querySelector('[data-running="true"]')).toBeTruthy();
+
+    // A stale active transcript cannot keep the mark or label running
+    // after the authoritative summary reports the turn finished.
+    act(() => useAppStore.setState({
+      sessions: [{ ...session, turnActive: false }],
+      views: transcript === "missing" ? {} : { "s-live": { ...view, turnActive: true } },
+    }));
+    expect(within(row).queryByText("deciding")).toBeNull();
+    expect(within(row).queryByText("running")).toBeNull();
+    expect(row.querySelector('[data-running="false"]')).toBeTruthy();
+    expect(within(row).getAllByText("idle")).toHaveLength(2);
+  });
+
+  test("mark, playbook, state label, served intent, and elapsed", () => {
+    const view = initialSessionView([]);
+    view.turnActive = true;
+    view.fsmState = "codeReview";
+    view.frames = [{ playbookId: "code" } as never];
+    seed({
+      sessions: [
+        {
+          id: "s-live",
+          projectId: "me/alpha-spex",
+          projectPath: "/tmp/alpha",
+          createdAt: NOW - 45 * MIN,
+          live: true,
+          endedAt: null,
+          players: [],
+          initialVisible: [],
+          turns: 3,
+          failed: false,
+        },
+      ],
+      views: { "s-live": view },
+      ledger: {
+        intents: [
+          {
+            intent: info({
+              id: "w1",
+              projectId: "me/alpha-spex",
+              text: "Fix login flow\nmore detail",
+              dispatched: { sessionId: "s-live", turnId: 3, at: NOW - 10 * MIN },
+            }),
+            state: "working",
+            stats: { turns: 1 },
+          },
+        ],
+        attention: [],
+        badge: 0,
+      },
+    });
+    const { onOpenSession } = renderSurface();
+
+    const row = screen.getByTestId("now-session-me/alpha-spex");
+    expect(
+      row.querySelector("[data-running]")?.getAttribute("data-running"),
+    ).toBe("true");
+    expect(row.textContent).toContain("code");
+    // Humanized state, raw id in the tooltip (DR-010 §2).
+    expect(row.textContent).toContain("code review");
+    expect(row.querySelector('[title="codeReview"]')).toBeTruthy();
+    expect(row.textContent).toContain("Fix login flow");
+    // The start reads as an age with the moment in the tooltip.
+    expect(row.textContent).toContain("started 45m ago");
+    expect(
+      within(row).getByTitle(new Date(NOW - 45 * MIN).toLocaleString(currentLocale())),
+    ).toBeTruthy();
+    fireEvent.click(row);
+    expect(onOpenSession).toHaveBeenCalledWith("s-live");
+
+    // A project with no live session stays quiet (dashboard-8).
+    expect(screen.getByTestId("now-me/beta-spex").textContent).toContain(
+      "Idle — no conversation yet.",
+    );
+    expect(screen.queryByTestId("now-drop-me/beta-spex")).toBeNull();
+  });
+
+  test("before a run draws, the row names no playbook and a live turn reads working", () => {
+    const view = initialSessionView([{ id: "dev.coder" }]);
+    view.turnActive = true;
+    view.players["dev.coder"].running = true;
+    seed({
+      sessions: [
+        {
+          id: "s-live",
+          projectId: "me/alpha-spex",
+          projectPath: "/tmp/alpha",
+          title: "Fix login flow",
+          createdAt: NOW - MIN,
+          live: true,
+          endedAt: null,
+          players: [],
+          initialVisible: [],
+          turns: 1,
+          failed: false,
+        },
+      ],
+      views: { "s-live": view },
+    });
+    renderSurface();
+    const row = screen.getByTestId("now-session-me/alpha-spex");
+    expect(row.textContent).not.toContain("no playbook");
+    expect(row.textContent).toContain("running");
+    expect(row.textContent).not.toContain("idle");
+  });
+
+  test("Drop beside the served intent asks the inline confirm, then closes it dropped (dashboard-41)", async () => {
+    const view = initialSessionView([]);
+    view.turnActive = true;
+    view.frames = [{ playbookId: "code" } as never];
+    const current = ledgerMock({
+      intents: [
+        {
+          intent: info({
+            id: "w1",
+            projectId: "me/alpha-spex",
+            text: "Fix login flow\nmore detail",
+            dispatched: { sessionId: "s-live", turnId: 3, at: NOW - 10 * MIN },
+          }),
+          state: "working",
+          stats: { turns: 1 },
+        },
+      ],
+      attention: [],
+      badge: 0,
+    });
+    seed({
+      sessions: [
+        {
+          id: "s-live",
+          projectId: "me/alpha-spex",
+          projectPath: "/tmp/alpha",
+          createdAt: NOW - 45 * MIN,
+          live: true,
+          endedAt: null,
+          players: [],
+          initialVisible: [],
+          turns: 3,
+          failed: false,
+        },
+      ],
+      views: { "s-live": view },
+      ledger: current(),
+    });
+    renderSurface();
+
+    const row = screen.getByTestId("now-session-me/alpha-spex");
+    expect(row.getAttribute("data-intent-id")).toBe("w1");
+    const drop = screen.getByTestId("now-drop-me/alpha-spex");
+    expect(drop.textContent).toBe("Drop");
+    // Work is underway, so the act sits behind the inline confirm,
+    // its safe default focused; Keep backs out to the control.
+    fireEvent.click(drop);
+    const confirm = screen.getByTestId("now-drop-confirm-me/alpha-spex");
+    expect(confirm.textContent).toContain("Drop “Fix login flow”?");
+    const keep = within(confirm).getByRole("button", { name: "Keep" });
+    expect(document.activeElement).toBe(keep);
+    expect(callsOf("intent.close")).toEqual([]);
+    fireEvent.click(keep);
+    expect(screen.queryByTestId("now-drop-confirm-me/alpha-spex")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByTestId("now-drop-me/alpha-spex"));
+
+    fireEvent.click(screen.getByTestId("now-drop-me/alpha-spex"));
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByTestId("now-drop-confirm-me/alpha-spex")).getByRole("button", {
+          name: "Drop",
+        }),
+      );
+    });
+    expect(callsOf("intent.close")).toEqual([{ intentId: "w1", as: "dropped" }]);
+    // The fold re-derives without the intent: the control leaves with
+    // it, the outcome announces, and focus lands on the session row.
+    expect(screen.queryByTestId("now-drop-me/alpha-spex")).toBeNull();
+    expect(row.getAttribute("data-intent-id")).toBeNull();
+    const note = screen.getByTestId("now-note-me/alpha-spex");
+    expect(note.getAttribute("role")).toBe("status");
+    expect(note.textContent).toContain("Dropped “Fix login flow”");
+    expect(document.activeElement).toBe(row);
+  });
+
+  test("dashboard-66: serving no intent, both bands lead with the turn that opened the work, never the answer", () => {
+    const earlier = "/triage-inbox Sort this week's support mail";
+    const opening = "/release-notes Milestone M1 (internal alpha): the notes\nfor the client";
+    const answer = "Yes, send these notes to the client.";
+    const view = initialSessionView([]);
+    view.turnActive = true;
+    view.currentTurnId = 3;
+    view.frames = [{ playbookId: "release-notes" } as never];
+    view.captain.push(
+      { kind: "boss", text: earlier, turnId: 1, at: NOW - 30 * MIN },
+      { kind: "boss", text: opening, turnId: 2, at: NOW - 6 * MIN },
+      { kind: "question", text: "Send these notes to the client?", turnId: 2, at: NOW - 5 * MIN },
+      { kind: "boss", text: answer, turnId: 3, at: NOW - MIN },
+    );
+    // The summary as the core folds it: the session's first turn was
+    // earlier work, and the answer is a turn of the work that asked, so
+    // the work is still the opening turn's.
+    const session = {
+      id: "s-live", projectId: "me/alpha-spex", projectPath: "/tmp/alpha",
+      title: earlier, workTitle: opening, createdAt: NOW - 30 * MIN,
+      live: true, endedAt: null, players: [], initialVisible: [], turns: 3,
+      failed: false, turnActive: true,
+    };
+    seed({ sessions: [session], views: { "s-live": view } });
+    renderSurface();
+
+    const row = screen.getByTestId("now-session-me/alpha-spex");
+    const running = within(screen.getByTestId("running-band")).getByTestId(
+      "running-session-s-live",
+    );
+    // While the answer's turn runs, the Now row reads the opening
+    // turn's first line, never the answer nor the session's first turn
+    // (dashboard-28, DR-119).
+    expect(row.textContent).toContain("/release-notes Milestone M1 (internal alpha): the notes");
+    expect(row.textContent).not.toContain("for the client");
+    expect(row.textContent).not.toContain(answer);
+    expect(row.textContent).not.toContain("/triage-inbox");
+    expect(row.getAttribute("data-intent-id")).toBeNull();
+    // The Running row reads the same turn by the same rule, so the two
+    // bands agree (dashboard-50).
+    expect(running.textContent).toContain("/release-notes Milestone M1 (internal alpha): the notes");
+    expect(running.textContent).not.toContain("for the client");
+    expect(running.textContent).not.toContain(answer);
+    expect(running.textContent).not.toContain("/triage-inbox");
+
+    // A turn sent once no question stands is new work, leading both
+    // rows (dashboard-28, dashboard-50).
+    const later = initialSessionView([]);
+    later.turnActive = true;
+    later.currentTurnId = 4;
+    later.captain.push(...view.captain, {
+      kind: "boss", text: "Now tag the release", turnId: 4, at: NOW,
+    });
+    act(() => useAppStore.setState({
+      sessions: [{ ...session, workTitle: "Now tag the release", turns: 4 }],
+      views: { "s-live": later },
+    }));
+    expect(row.textContent).toContain("Now tag the release");
+    expect(row.textContent).not.toContain("/release-notes");
+    const next = screen.getByTestId("running-session-s-live");
+    expect(next.textContent).toContain("Now tag the release");
+    expect(next.textContent).not.toContain("/release-notes");
+    expect(next.textContent).not.toContain("/triage-inbox");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sources
+// ---------------------------------------------------------------------------
+
+const FORGE: ForgeState = {
+  adapter: "github",
+  authenticated: true,
+  repo: "x/y",
+  issues: [
+    {
+      number: 7,
+      title: "Fix the bug",
+      url: "https://github.com/x/y/issues/7",
+      labels: ["bug", "urgent"],
+    },
+  ],
+  prs: [
+    {
+      number: 8,
+      title: "Add tests",
+      url: "https://github.com/x/y/pull/8",
+      labels: ["ci"],
+    },
+  ],
+};
+
+const RECORD_TREE: SpecTreeState = {
+  ...EMPTY_TREE,
+  intents: [
+    {
+      id: "IR-2",
+      title: "Old finished",
+      path: "intents/002-old.md",
+      status: "Done (2026-01-05)",
+      finished: "done",
+      updatedAt: NOW - 180 * MIN,
+    },
+    { id: "IR-3", title: "Half done", path: "intents/003-half.md", status: "In review" },
+    {
+      id: "IR-4",
+      title: "Abandoned idea",
+      path: "intents/004-idea.md",
+      status: "Superseded by IR-3",
+      finished: "superseded",
+      updatedAt: NOW - 120 * MIN,
+    },
+  ],
+};
+
+function seedSources(over: Record<string, unknown> = {}) {
+  seed({
+    projectMeta: { "me/alpha-spex": { forge: FORGE }, "me/beta-spex": {} },
+    specTrees: { "me/alpha-spex": RECORD_TREE, "me/beta-spex": EMPTY_TREE },
+    ...over,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The Running band
+// ---------------------------------------------------------------------------
+
+describe("dashboard-50: the Running band lists what is working", () => {
+  const RUN_START = NOW - 12 * MIN;
+
+  function live(id: string, projectId: string, title: string) {
+    return {
+      id,
+      projectId,
+      projectPath: `/tmp/${projectId}`,
+      title,
+      createdAt: NOW - 20 * MIN,
+      live: true,
+      endedAt: null,
+      players: [],
+      initialVisible: [],
+      turns: 1,
+      failed: false,
+    };
+  }
+
+  /** A session with a turn in flight, its first line drawn at the
+   * turn's start so the row can read the span. */
+  function inFlight(player?: string) {
+    const view = initialSessionView(player ? [{ id: player }] : []);
+    view.turnActive = true;
+    view.currentTurnId = 1;
+    if (player) view.players[player].running = true;
+    view.captain.push({
+      kind: "boss",
+      text: "Add a README badge",
+      turnId: 1,
+      at: RUN_START,
+    });
+    return view;
+  }
+
+  test("a live turn with nothing to answer lists; a summoned session does not", () => {
+    const asking = inFlight();
+    asking.pendingQuestion = "which branch?";
+    seed({
+      sessions: [
+        live("s-run", "me/alpha-spex", "Add a README badge"),
+        live("s-ask", "me/beta-spex", "Migrate the DB"),
+      ],
+      views: { "s-run": inFlight("dev.coder"), "s-ask": asking },
+      ledger: {
+        intents: [],
+        attention: [
+          {
+            band: "interrupted",
+            kind: "question",
+            title: "Migrate the DB",
+            projectId: "me/beta-spex",
+            sessionId: "s-ask",
+            since: NOW - 3 * MIN,
+          },
+        ],
+        badge: 1,
+      },
+    });
+    const { onOpenSession } = renderSurface();
+
+    const band = screen.getByTestId("running-band");
+    const row = within(band).getByTestId("running-session-s-run");
+    // The project, the session's own title, and what it is doing in
+    // the Now band's vocabulary, the running player named beside it.
+    expect(row.textContent).toContain("alpha");
+    expect(row.textContent).toContain("Add a README badge");
+    expect(row.textContent).toContain("dev.coder");
+    expect(screen.getByTestId("running-state-s-run").textContent).toBe(
+      "running",
+    );
+    // The turn's span, with the moment it began in the tooltip.
+    expect(row.textContent).toContain("12m");
+    expect(
+      within(row).getByTitle(new Date(RUN_START).toLocaleString(currentLocale())),
+    ).toBeTruthy();
+
+    // A summoned session stands in the queue, never in both places.
+    expect(within(band).queryByTestId("running-session-s-ask")).toBeNull();
+    expect(screen.getByTestId("attention-s-ask-question")).toBeTruthy();
+
+    // The row opens its session.
+    fireEvent.click(row);
+    expect(onOpenSession).toHaveBeenCalledWith("s-run");
+  });
+
+  test("an earlier delivery keeps Confirm while later work runs, until that work needs attention", () => {
+    const view = inFlight("dev.coder");
+    view.currentTurnId = 2;
+    view.captain[0].turnId = 2;
+    const delivery: AttentionEntry = {
+      band: "finished",
+      kind: "finish",
+      intentId: "i-first",
+      title: "The first delivery",
+      projectId: "me/alpha-spex",
+      sessionId: "s-run",
+      turnId: 1,
+      since: NOW - MIN,
+    };
+    seed({
+      sessions: [live("s-run", "me/alpha-spex", "The shared conversation")],
+      views: { "s-run": view },
+      ledger: { intents: [], attention: [delivery], badge: 1 },
+    });
+    renderSurface();
+    expect(screen.getByTestId("running-session-s-run")).toBeTruthy();
+    expect((screen.getByTestId("attention-confirm-i-first") as HTMLButtonElement).disabled).toBe(false);
+
+    act(() => useAppStore.setState({
+      ledger: {
+        intents: [],
+        attention: [delivery, {
+          ...delivery,
+          intentId: "i-next",
+          title: "The later work",
+          band: "interrupted",
+          kind: "question",
+          turnId: 2,
+        }],
+        badge: 2,
+      },
+    }));
+    expect(screen.queryByTestId("running-session-s-run")).toBeNull();
+    expect(screen.getByTestId("attention-i-next-question")).toBeTruthy();
+    expect(screen.getByTestId("attention-confirm-i-first")).toBeTruthy();
+  });
+
+  test.each(
+    (["missing", "stale"] as const).flatMap((transcript) =>
+      (["question", "failure"] as const).map((kind) => ({ transcript, kind })),
+    ),
+  )("summary activity and a standing $kind override a $transcript transcript", ({ transcript, kind }) => {
+    const stale = inFlight();
+    stale.turnActive = false;
+    const delivery: AttentionEntry = {
+      band: "finished",
+      kind: "finish",
+      intentId: "i-first",
+      title: "The first delivery",
+      projectId: "me/alpha-spex",
+      sessionId: "s-run",
+      turnId: 1,
+      since: NOW - MIN,
+    };
+    seed({
+      sessions: [{ ...live("s-run", "me/alpha-spex", "The shared conversation"), turnActive: true }],
+      views: transcript === "missing" ? {} : { "s-run": stale },
+      ledger: { intents: [], attention: [delivery], badge: 1 },
+    });
+    renderSurface();
+    expect(screen.getByTestId("running-session-s-run")).toBeTruthy();
+    expect(screen.getByTestId("running-state-s-run").textContent).toBe("deciding");
+    expect((screen.getByTestId("attention-confirm-i-first") as HTMLButtonElement).disabled).toBe(false);
+
+    act(() => useAppStore.setState({
+      ledger: {
+        intents: [],
+        attention: [delivery, {
+          ...delivery,
+          intentId: "i-next",
+          title: "The later work",
+          band: "interrupted",
+          kind,
+          turnId: 2,
+        }],
+        badge: 2,
+      },
+    }));
+    expect(screen.queryByTestId("running-session-s-run")).toBeNull();
+    expect(screen.getByTestId(`attention-i-next-${kind}`)).toBeTruthy();
+    expect(screen.getByTestId("attention-confirm-i-first")).toBeTruthy();
+  });
+
+  test("an inactive session summary overrides a stale active transcript", () => {
+    seed({
+      sessions: [{ ...live("s-idle", "me/alpha-spex", "Settling finished"), turnActive: false }],
+      views: { "s-idle": inFlight() },
+    });
+    renderSurface();
+    expect(screen.queryByTestId("running-session-s-idle")).toBeNull();
+  });
+
+  test("rows read in sidebar order, and the filter hides the rest (dashboard-32)", () => {
+    seed({
+      // Served in the other order: the band reads by sidebar order.
+      sessions: [live("s-b", "me/beta-spex", "Tidy CI"), live("s-a", "me/alpha-spex", "Ship docs")],
+      views: { "s-a": inFlight("dev.coder"), "s-b": inFlight() },
+    });
+    renderSurface();
+    const ids = () =>
+      Array.from(
+        screen.getByTestId("running-band").querySelectorAll("[data-project-id]"),
+      ).map((row) => row.getAttribute("data-testid"));
+    expect(ids()).toEqual(["running-session-s-a", "running-session-s-b"]);
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Filter by project" }), {
+      target: { value: "me/beta-spex" },
+    });
+    expect(ids()).toEqual(["running-session-s-b"]);
+    // Visibility only: no ledger write rode the change.
+    expect(callsOf("intent.close")).toEqual([]);
+  });
+});
+
+describe("dashboard-19/20/24/25/30/37: the Sources band", () => {
+  test("the open band's summary line, tabs, labels, and queue seeds", async () => {
+    seedSources();
+    const { onOpenIntent } = renderSurface();
+
+    // The band opens expanded under its summary line: counts with the
+    // data age (dashboard-20/14).
+    const toggle = screen.getByTestId("sources-toggle-me/alpha-spex");
+    expect(toggle.textContent).toContain("1 issue · 1 PR · 1 open record");
+    expect(toggle.textContent).toContain("just now");
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+
+    // Issues tab first: number, title link, forge labels as tags.
+    const issue = screen.getByTestId("source-issue-me/alpha-spex-7");
+    expect(issue.textContent).toContain("#7");
+    expect(issue.textContent).toContain("Fix the bug");
+    expect(issue.textContent).toContain("bug");
+    expect(issue.textContent).toContain("urgent");
+    const link = issue.querySelector("a");
+    expect(link?.getAttribute("href")).toBe("https://github.com/x/y/issues/7");
+    // The page opens outside the app, without a referrer.
+    expect(link?.getAttribute("target")).toBe("_blank");
+    expect(link?.getAttribute("rel")).toBe("noreferrer");
+
+    // Queue seeds the spec table's text with the URL as provenance
+    // (dashboard-30/37).
+    await act(async () => {
+      fireEvent.click(
+        within(issue).getByRole("button", { name: /Queue issue #7/ }),
+      );
+    });
+    expect(callsOf("intent.queue")).toEqual([
+      {
+        projectId: "me/alpha-spex",
+        text: "/dev Address #7: Fix the bug\n\nhttps://github.com/x/y/issues/7",
+        source: {
+          kind: "issue",
+          ref: "7",
+          url: "https://github.com/x/y/issues/7",
+          labels: ["bug", "urgent"],
+        },
+      },
+    ]);
+
+    // PRs tab seeds the review text.
+    fireEvent.click(screen.getByTestId("sources-tab-prs-me/alpha-spex"));
+    const pr = screen.getByTestId("source-pr-me/alpha-spex-8");
+    expect(pr.textContent).toContain("ci");
+    await act(async () => {
+      fireEvent.click(
+        within(pr).getByRole("button", { name: /Queue PR #8/ }),
+      );
+    });
+    expect(callsOf("intent.queue")[1]).toEqual({
+      projectId: "me/alpha-spex",
+      text: "Review PR #8: Add tests\nhttps://github.com/x/y/pull/8",
+      source: {
+        kind: "pr",
+        ref: "8",
+        url: "https://github.com/x/y/pull/8",
+        labels: ["ci"],
+      },
+    });
+
+    // Records tab lists only records the core classifies open
+    // (dashboard-24/25, spec-view-14): the finished ones list in
+    // History instead.
+    fireEvent.click(screen.getByTestId("sources-tab-records-me/alpha-spex"));
+    expect(screen.queryByTestId("source-record-me/alpha-spex-IR-2")).toBeNull();
+    expect(screen.queryByTestId("source-record-me/alpha-spex-IR-4")).toBeNull();
+    const record = screen.getByTestId("source-record-me/alpha-spex-IR-3");
+    await act(async () => {
+      fireEvent.click(
+        within(record).getByRole("button", { name: /Queue record IR-3/ }),
+      );
+    });
+    expect(callsOf("intent.queue")[2]).toEqual({
+      projectId: "me/alpha-spex",
+      text: "Resume IR-3: Half done",
+      source: { kind: "record", ref: "IR-3" },
+    });
+    // The record row opens the records reader (dashboard-24): the one
+    // record row (dashboard-40) — chip, title, pointer, no brand link.
+    const row = within(record).getByRole("button", {
+      name: "Open IR-3: Half done",
+    });
+    expect(row.getAttribute("title")).toBe("Open IR-3");
+    expect(within(row).getByText("IR-3").className).toContain("font-mono");
+    expect(row.className).toContain("cursor-pointer");
+    expect(row.className).not.toContain("underline");
+    expect(row.className).not.toContain("brand");
+    fireEvent.click(row);
+    // The row leaves the surface with its activation, so the band's
+    // toggle — which stands open or folded — is the origin's control.
+    expect(onOpenIntent).toHaveBeenCalledWith(
+      "me/alpha-spex",
+      "intents/003-half.md",
+      "sources-toggle-me/alpha-spex",
+    );
+  });
+
+  test("a Source has one Queue gesture and reveals a queued-only tail row", async () => {
+    const existing = q("existing", "me/alpha-spex", "Already next", {
+      next: MANUAL_READY,
+    });
+    let current: LedgerState = {
+      intents: [existing],
+      attention: [],
+      badge: 0,
+    };
+    commandMock.mockImplementation(async (type: string, fields) => {
+      if (type === "intent.queue") {
+        const input = fields as {
+          projectId: string;
+          text: string;
+          source: IntentSource;
+        };
+        const intent = info({
+          id: "captured-issue",
+          projectId: input.projectId,
+          text: input.text,
+          source: input.source,
+        });
+        current = {
+          ...current,
+          intents: [...current.intents, { intent, state: "queued" }],
+        };
+        return intent;
+      }
+      if (type === "ledger.get") return current;
+      return {};
+    });
+    seedSources({ ledger: current });
+    renderSurface();
+
+    const issue = screen.getByTestId("source-issue-me/alpha-spex-7");
+    const queue = within(issue).getByRole("button", {
+      name: /Queue issue #7/,
+    });
+    expect(within(issue).queryByRole("button", { name: /Start/ })).toBeNull();
+    await act(async () => fireEvent.click(queue));
+
+    const captured = await screen.findByTestId("upnext-row-captured-issue");
+    expect(captured.getAttribute("data-highlight")).toBe("true");
+    expect(captured.getAttribute("data-next")).toBeNull();
+    expect(screen.getByTestId("upnext-queued-captured-issue").textContent).toBe(
+      "Queued",
+    );
+    expect(screen.queryByTestId("upnext-standing-captured-issue")).toBeNull();
+    expect(screen.queryByTestId("upnext-start-captured-issue")).toBeNull();
+    expect(screen.getByTestId("upnext-row-existing").getAttribute("data-next")).toBe(
+      "true",
+    );
+    const capturedSource = screen.getByTestId("source-issue-me/alpha-spex-7");
+    expect(
+      within(capturedSource).getByTestId("source-issue-me/alpha-spex-7-state").textContent,
+    ).toBe("queued");
+    expect(within(capturedSource).queryByRole("button", { name: /Queue/ })).toBeNull();
+    expect(callsOf("turn.submit")).toEqual([]);
+
+    // Once the captured intent closes, its artifact regains Queue.
+    current = { ...current, intents: [existing] };
+    act(() => useAppStore.setState({ ledger: current }));
+    expect(
+      within(screen.getByTestId("source-issue-me/alpha-spex-7")).getByRole("button", {
+        name: /Queue issue #7/,
+      }),
+    ).toBeTruthy();
+  });
+
+  test("a captured artifact swaps its Queue control for the intent's state and regains it on close", () => {
+    const captured: DerivedIntent = {
+      intent: info({
+        id: "c1",
+        projectId: "me/alpha-spex",
+        text: "Address #7: Fix the bug",
+        source: {
+          kind: "issue",
+          ref: "7",
+          url: "https://github.com/x/y/issues/7",
+        },
+        dispatched: { sessionId: "s1", turnId: 1, at: NOW - MIN },
+      }),
+      state: "working",
+    };
+    seedSources({
+      ledger: { intents: [captured], attention: [], badge: 0 },
+    });
+    renderSurface();
+
+    const issue = screen.getByTestId("source-issue-me/alpha-spex-7");
+    const state = within(issue).getByTestId("source-issue-me/alpha-spex-7-state");
+    expect(state.textContent).toBe("working");
+    expect(state.getAttribute("title")).toBe("working");
+    expect(within(issue).queryByRole("button", { name: /Queue/ })).toBeNull();
+
+    // The intent closes: the ledger no longer serves it, and the row
+    // regains its control (dashboard-30).
+    act(() => {
+      useAppStore.setState({ ledger: EMPTY_LEDGER });
+    });
+    expect(
+      within(screen.getByTestId("source-issue-me/alpha-spex-7")).getByRole("button", {
+        name: /Queue issue #7/,
+      }),
+    ).toBeTruthy();
+  });
+
+  test("pages of six with a quiet in-place pager; refresh re-fetches", async () => {
+    const many = Array.from({ length: 8 }, (_, index) => ({
+      number: index + 1,
+      title: `Issue ${index + 1}`,
+      url: `https://github.com/x/y/issues/${index + 1}`,
+    }));
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "forge.items") return { ...FORGE, issues: many };
+      if (type === "ledger.get") return useAppStore.getState().ledger;
+      if (type === "ledger.history") return { intents: [], more: false };
+      return {};
+    });
+    seedSources({
+      projectMeta: { "me/alpha-spex": { forge: { ...FORGE, issues: many } }, "me/beta-spex": {} },
+    });
+    renderSurface();
+
+    expect(screen.getByTestId("source-issue-me/alpha-spex-6")).toBeTruthy();
+    expect(screen.queryByTestId("source-issue-me/alpha-spex-7")).toBeNull();
+    expect(screen.getByText("1 / 2")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+    expect(screen.getByTestId("source-issue-me/alpha-spex-7")).toBeTruthy();
+    expect(screen.queryByTestId("source-issue-me/alpha-spex-1")).toBeNull();
+
+    // Manual refresh calls the adapter regardless of cache age
+    // (dashboard-14).
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("sources-refresh-me/alpha-spex"));
+    });
+    expect(callsOf("forge.items")).toEqual([
+      { projectId: "me/alpha-spex", refresh: true },
+    ]);
+  });
+
+  test("the summary's age is the served lists' own fetch moment; the read's only without one (dashboard-14)", () => {
+    seedSources({
+      projectMeta: {
+        "me/alpha-spex": { forge: { ...FORGE, at: NOW - 35 * MIN } },
+        "me/beta-spex": { forge: FORGE },
+      },
+    });
+    renderSurface();
+
+    // A client that first sees a cached list shows the data's own age
+    // (dashboard-14), the moment in the tooltip (dashboard-20) — never
+    // its own read's.
+    const served = screen.getByTestId("sources-toggle-me/alpha-spex");
+    expect(served.textContent).toContain("1 issue · 1 PR · 1 open record");
+    expect(served.textContent).toContain("35m ago");
+    expect(
+      within(served).getByTitle(
+        new Date(NOW - 35 * MIN).toLocaleString(currentLocale()),
+      ),
+    ).toBeTruthy();
+    // A core that carries no moment leaves the read's own.
+    expect(screen.getByTestId("sources-toggle-me/beta-spex").textContent).toContain(
+      "just now",
+    );
+  });
+
+  test("a list past the cache window is asked for again on the slow clock; a fresh one is not (dashboard-14)", async () => {
+    vi.useFakeTimers();
+    try {
+      commandMock.mockImplementation(async (type: string) => {
+        if (type === "forge.items") return { ...FORGE, at: Date.now() };
+        if (type === "ledger.get") return useAppStore.getState().ledger;
+        if (type === "ledger.history") return { intents: [], more: false };
+        return {};
+      });
+      seedSources({
+        projectMeta: {
+          "me/alpha-spex": { forge: { ...FORGE, at: Date.now() - 12 * MIN } },
+          "me/beta-spex": { forge: { ...FORGE, at: Date.now() - 2 * MIN } },
+        },
+      });
+      renderSurface();
+      // Served state loads nothing on its own.
+      expect(callsOf("forge.items")).toEqual([]);
+
+      // One minute on: the stale project's lists are asked for again,
+      // without the manual-refresh flag; the fresh project's are not.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(callsOf("forge.items")).toEqual([
+        { projectId: "me/alpha-spex", refresh: false },
+      ]);
+      expect(screen.getByTestId("sources-toggle-me/alpha-spex").textContent).toContain(
+        "just now",
+      );
+
+      // Re-served fresh, it stays quiet on the next tick.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(callsOf("forge.items")).toEqual([
+        { projectId: "me/alpha-spex", refresh: false },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a failed background read keeps the served lists and their moment (dashboard-14)", async () => {
+    vi.useFakeTimers();
+    try {
+      commandMock.mockImplementation(async (type: string) => {
+        if (type === "forge.items") throw new Error("gh: rate limited");
+        if (type === "ledger.get") return useAppStore.getState().ledger;
+        if (type === "ledger.history") return { intents: [], more: false };
+        return {};
+      });
+      const at = Date.now() - 12 * MIN;
+      seedSources({
+        projectMeta: {
+          "me/alpha-spex": { forge: { ...FORGE, at } },
+          "me/beta-spex": { forge: { ...FORGE, at: Date.now() } },
+        },
+      });
+      renderSurface();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(callsOf("forge.items")).toEqual([{ projectId: "me/alpha-spex", refresh: false }]);
+      const meta = useAppStore.getState().projectMeta["me/alpha-spex"];
+      expect(meta?.forge?.at).toBe(at);
+      expect(meta?.forgeError).toBe("gh: rate limited");
+      expect(screen.getByTestId("sources-toggle-me/alpha-spex").textContent).toContain(
+        "1 issue · 1 PR · 1 open record",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an adapter failure keeps the last lists and surfaces itself", () => {
+    seedSources({
+      projectMeta: {
+        "me/alpha-spex": { forge: FORGE, forgeError: "gh: network unreachable" },
+        "me/beta-spex": {},
+      },
+    });
+    renderSurface();
+    // Keep-last-good (dashboard-14): the failure rides beside the
+    // data, which stays served.
+    expect(screen.getByTestId("sources-error-me/alpha-spex").textContent).toContain(
+      "keeping the last data",
+    );
+    expect(screen.getByTestId("source-issue-me/alpha-spex-7")).toBeTruthy();
+  });
+
+  test("the band folds to its summary, per project, for the app's run (dashboard-20)", () => {
+    seedSources();
+    renderSurface();
+
+    const fold = (projectId: string) =>
+      fireEvent.click(screen.getByTestId(`sources-toggle-${projectId}`));
+    const shown = (projectId: string) =>
+      screen
+        .getByTestId(`sources-toggle-${projectId}`)
+        .getAttribute("aria-expanded");
+
+    // Both bands open; folding one leaves the other open.
+    expect(shown("me/alpha-spex")).toBe("true");
+    expect(shown("me/beta-spex")).toBe("true");
+    fold("me/alpha-spex");
+    expect(shown("me/alpha-spex")).toBe("false");
+    expect(screen.queryByTestId("source-issue-me/alpha-spex-7")).toBeNull();
+    expect(shown("me/beta-spex")).toBe("true");
+
+    // The fold is the project's, so the Overview's band — the same one
+    // (dashboard-26) — stands folded too, and its line opens it again
+    // for both surfaces.
+    cleanup();
+    renderOverview();
+    expect(shown("me/alpha-spex")).toBe("false");
+    fold("me/alpha-spex");
+    expect(shown("me/alpha-spex")).toBe("true");
+    expect(screen.getByTestId("source-issue-me/alpha-spex-7")).toBeTruthy();
+    cleanup();
+    renderSurface();
+    expect(shown("me/alpha-spex")).toBe("true");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// History
+// ---------------------------------------------------------------------------
+
+describe("dashboard-27/38: History is done work, one timeline newest first", () => {
+  const page1 = {
+    intents: [
+      {
+        intent: info({
+          id: "h1",
+          projectId: "me/alpha-spex",
+          text: "Newest done",
+          closedAt: NOW - 2 * MIN,
+          closedAs: "done",
+        }),
+      },
+      {
+        intent: info({
+          id: "hb",
+          projectId: "me/alpha-spex",
+          text: "Address #7: Fix the bug",
+          closedAt: NOW - 4 * MIN,
+          closedAs: "done",
+          source: {
+            kind: "issue",
+            ref: "7",
+            url: "https://github.com/x/y/issues/7",
+            labels: ["bug", "urgent"],
+          },
+        }),
+      },
+      {
+        intent: info({
+          id: "h2",
+          projectId: "me/alpha-spex",
+          text: "Dropped after work",
+          closedAt: NOW - 5 * MIN,
+          closedAs: "dropped",
+        }),
+      },
+      {
+        intent: info({
+          id: "hr",
+          projectId: "me/alpha-spex",
+          text: "Resume IR-2: Old finished",
+          closedAt: NOW - 6 * MIN,
+          closedAs: "done",
+          source: { kind: "record", ref: "IR-2" },
+        }),
+      },
+    ],
+    more: true,
+  };
+  const page2 = {
+    intents: [
+      {
+        intent: info({
+          id: "h3",
+          projectId: "me/alpha-spex",
+          text: "Older done",
+          closedAt: NOW - 60 * MIN,
+          closedAs: "done",
+        }),
+      },
+    ],
+    more: false,
+  };
+  const ids = () =>
+    screen
+      .getAllByTestId(/^history-row-/)
+      .map((el) => el.getAttribute("data-testid")!.replace("history-row-", ""));
+
+  test("checks, the bug strike, the quiet drop, records, and older pages", async () => {
+    commandMock.mockImplementation(async (type: string, fields) => {
+      if (type === "ledger.history") {
+        return (fields as { before?: unknown }).before ? page2 : page1;
+      }
+      if (type === "ledger.get") return useAppStore.getState().ledger;
+      return {};
+    });
+    // History absent for p1: the band loads its first page itself. The
+    // tree holds a done, an open, and a superseded record.
+    seed({
+      projects: [PROJECTS[0]],
+      projectMeta: { "me/alpha-spex": {} },
+      specTrees: { "me/alpha-spex": RECORD_TREE },
+      history: {},
+    });
+    const { onOpenIntent } = renderSurface();
+
+    // Until the first page answers the band loads: the tree's records
+    // already show, and the control says a page is in flight rather
+    // than offering more (dashboard-8/27).
+    expect(screen.getByTestId("history-older-me/alpha-spex").textContent).toBe("Loading…");
+    expect((screen.getByTestId("history-older-me/alpha-spex") as HTMLButtonElement).disabled).toBe(true);
+    await screen.findByTestId("history-row-h1");
+    // Newest first — intents by close time, records by last change;
+    // IR-2 lists once, as the intent naming it; open IR-3 never lists.
+    expect(ids()).toEqual(["h1", "hb", "h2", "hr", "IR-4"]);
+
+    const done = screen.getByTestId("history-row-h1");
+    expect(done.getAttribute("data-verdict")).toBe("done");
+    expect(done.textContent).toContain("✓");
+    expect(done.querySelector(".line-through")).toBeNull();
+    // Ages say "ago" and carry the absolute moment (DR-010 §2).
+    expect(done.textContent).toContain("2m ago");
+    expect(
+      within(done).getByTitle(new Date(NOW - 2 * MIN).toLocaleString(currentLocale())),
+    ).toBeTruthy();
+
+    // A fixed bug: struck through under the red tag, no check.
+    const bug = screen.getByTestId("history-row-hb");
+    expect(bug.getAttribute("data-verdict")).toBe("bug");
+    expect(bug.querySelector(".line-through")).toBeTruthy();
+    expect(within(bug).getByTestId("history-tag").textContent).toBe("bug");
+    expect(bug.textContent).not.toContain("✓");
+
+    // Dropped after work: a quiet tag, dimmed, never struck.
+    const dropped = screen.getByTestId("history-row-h2");
+    expect(dropped.getAttribute("data-verdict")).toBe("dropped");
+    expect(within(dropped).getByTestId("history-tag").textContent).toBe(
+      "dropped",
+    );
+    expect(dropped.querySelector(".line-through")).toBeNull();
+    expect(dropped.textContent).not.toContain("✓");
+    expect(dropped.textContent).not.toContain("✕");
+
+    // A superseded record wears that word as a trailing tag after its
+    // record row, dimmed, no check, and opens in the records reader.
+    const superseded = screen.getByTestId("history-row-IR-4");
+    expect(superseded.getAttribute("data-kind")).toBe("record");
+    expect(superseded.getAttribute("data-verdict")).toBe("superseded");
+    expect(
+      within(superseded).getByTestId("history-tag").textContent,
+    ).toBe("superseded");
+    expect(superseded.textContent).not.toContain("✓");
+    const supersededRow = within(superseded).getByRole("button", {
+      name: "Open IR-4: Abandoned idea",
+    });
+    expect(within(supersededRow).getByText("IR-4").className).toContain(
+      "font-mono",
+    );
+    fireEvent.click(supersededRow);
+    expect(onOpenIntent).toHaveBeenCalledWith(
+      "me/alpha-spex",
+      "intents/004-idea.md",
+      "record-row-IR-4",
+    );
+
+    // The accessible older control fetches the next intent page with
+    // the cursor of the last served row (dashboard-38); records keep
+    // their place in the one timeline.
+    expect(screen.getByTestId("history-older-me/alpha-spex").textContent).toBe("Older…");
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("history-older-me/alpha-spex"));
+    });
+    expect(callsOf("ledger.history")[1]).toEqual({
+      projectId: "me/alpha-spex",
+      before: { closedAt: NOW - 6 * MIN, intentId: "hr" },
+    });
+    expect(await screen.findByTestId("history-row-h3")).toBeTruthy();
+    expect(ids()).toEqual(["h1", "hb", "h2", "hr", "h3", "IR-4"]);
+    await waitFor(() =>
+      expect(screen.queryByTestId("history-older-me/alpha-spex")).toBeNull(),
+    );
+  });
+
+  test("an intent row leaves the record behind the inline confirm; a record row carries no control", async () => {
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "ledger.history") return { ...page1, more: false };
+      if (type === "ledger.get") return useAppStore.getState().ledger;
+      return {};
+    });
+    seed({
+      projects: [PROJECTS[0]],
+      projectMeta: { "me/alpha-spex": {} },
+      specTrees: { "me/alpha-spex": RECORD_TREE },
+      history: {},
+    });
+    renderSurface();
+    await screen.findByTestId("history-row-h1");
+
+    // Every intent row carries the control, named after its intent; a
+    // record row carries none — a file in the specs tree is not the
+    // ledger's to remove.
+    const control = screen.getByTestId("history-remove-h1");
+    expect(control.getAttribute("aria-label")).toBe(
+      "Remove Newest done from history",
+    );
+    expect(screen.getByTestId("history-remove-h2")).toBeTruthy();
+    expect(screen.queryByTestId("history-remove-IR-4")).toBeNull();
+
+    // The confirm opens in place, naming the act; Keep backs out and
+    // hands focus back to the control, and nothing was sent.
+    fireEvent.click(control);
+    const confirm = screen.getByTestId("history-remove-confirm-h1");
+    expect(confirm.textContent).toContain("Remove this intent from history?");
+    const keep = within(confirm).getByRole("button", { name: "Keep" });
+    expect(document.activeElement).toBe(keep);
+    await act(async () => {
+      fireEvent.click(keep);
+    });
+    expect(document.activeElement).toBe(screen.getByTestId("history-remove-h1"));
+    expect(callsOf("intent.remove")).toEqual([]);
+
+    // Confirming removes the intent over the protocol: the row leaves
+    // at once, and focus lands on the next row's control.
+    fireEvent.click(screen.getByTestId("history-remove-h1"));
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByTestId("history-remove-confirm-h1")).getByRole(
+          "button",
+          { name: "Remove" },
+        ),
+      );
+    });
+    expect(callsOf("intent.remove")).toEqual([{ intentId: "h1" }]);
+    expect(screen.queryByTestId("history-row-h1")).toBeNull();
+    expect(ids()).toEqual(["hb", "h2", "hr", "IR-4"]);
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByTestId("history-remove-hb"),
+      ),
+    );
+  });
+
+  test("an empty band reads Loading… until its first page answers", async () => {
+    let answer!: (page: { intents: never[]; more: boolean }) => void;
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "ledger.history") {
+        return new Promise((resolve) => {
+          answer = resolve;
+        });
+      }
+      if (type === "ledger.get") return useAppStore.getState().ledger;
+      return {};
+    });
+    seed({ projects: [PROJECTS[0]], history: {} });
+    renderSurface();
+    expect(screen.getByTestId("history-empty-me/alpha-spex").textContent).toBe("Loading…");
+    await act(async () => {
+      answer({ intents: [], more: false });
+    });
+    expect(screen.getByTestId("history-empty-me/alpha-spex").textContent).toBe(
+      "Nothing done here yet.",
+    );
+  });
+
+  const manyRows = (count: number, from = 0) =>
+    Array.from({ length: count }, (_, index) => ({
+      intent: info({
+        id: `m${from + index}`,
+        projectId: "me/alpha-spex",
+        text: `Done ${from + index}`,
+        closedAt: NOW - (from + index + 1) * MIN,
+        closedAs: "done",
+      }),
+    }));
+
+  // The frame measures whether content runs past it (dashboard-27),
+  // and jsdom reports every box as zero — so the frame's cap and its
+  // rows are given their real sizes here.
+  const FRAME_ID = "history:me/alpha-spex";
+  const ROW = 24;
+
+  describe("the frame the reader sets", () => {
+    let restore = () => {};
+
+    beforeEach(() => {
+      useAppStore.setState({ frameHeights: {} });
+      const prior = (["clientHeight", "scrollHeight"] as const).map(
+        (name) =>
+          [
+            name,
+            Object.getOwnPropertyDescriptor(HTMLElement.prototype, name),
+          ] as const,
+      );
+      Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+        configurable: true,
+        get(this: HTMLElement) {
+          return parseFloat(this.style.maxHeight) || 0;
+        },
+      });
+      Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+        configurable: true,
+        get(this: HTMLElement) {
+          return this.children.length * ROW;
+        },
+      });
+      restore = () => {
+        for (const [name, descriptor] of prior) {
+          if (descriptor) {
+            Object.defineProperty(HTMLElement.prototype, name, descriptor);
+          } else {
+            Reflect.deleteProperty(HTMLElement.prototype, name);
+          }
+        }
+      };
+    });
+
+    afterEach(() => {
+      restore();
+      useAppStore.setState({ frameHeights: {} });
+    });
+
+    test("every loaded row lists inside the frame, which scrolls past eight rows", async () => {
+      commandMock.mockImplementation(async (type: string) => {
+        if (type === "ledger.history") return { intents: manyRows(10), more: false };
+        if (type === "ledger.get") return useAppStore.getState().ledger;
+        return {};
+      });
+      seed({ projects: [PROJECTS[0]], history: {} });
+      renderSurface();
+      await screen.findByTestId("history-row-m0");
+      // Ten loaded rows, all in the frame: none held back for a control.
+      expect(ids()).toHaveLength(10);
+      const frame = screen.getByTestId("history-frame-me/alpha-spex");
+      // Every row is one frame unit tall, so the frame's cap counts in
+      // rows exactly: eight of them by default.
+      expect(frame.style.maxHeight).toBe(`${8 * ROW}px`);
+      // The overflowing frame draws its cut edges and takes focus.
+      expect(frame.getAttribute("data-overflowing")).toBe("true");
+      expect(frame.getAttribute("tabindex")).toBe("0");
+      // Nothing waits unfetched: no control, one fetch.
+      expect(screen.queryByTestId("history-older-me/alpha-spex")).toBeNull();
+      expect(callsOf("ledger.history")).toHaveLength(1);
+    });
+
+    test("a short history is a plain list; Older… at the frame's end fetches the next page", async () => {
+      commandMock.mockImplementation(async (type: string, fields) => {
+        if (type === "ledger.history") {
+          return (fields as { before?: unknown }).before
+            ? { intents: manyRows(20, 20), more: false }
+            : { intents: manyRows(20), more: true };
+        }
+        if (type === "ledger.get") return useAppStore.getState().ledger;
+        return {};
+      });
+      seed({ projects: [PROJECTS[0]], history: {} });
+      renderSurface();
+      await screen.findByTestId("history-row-m0");
+      expect(ids()).toHaveLength(20);
+      const frame = screen.getByTestId("history-frame-me/alpha-spex");
+      // The control is the frame's last item, reached by tabbing through
+      // the rows, and it fetches with the cursor of the last served row.
+      const older = screen.getByTestId("history-older-me/alpha-spex");
+      expect(older.textContent).toBe("Older…");
+      expect(frame.lastElementChild?.contains(older)).toBe(true);
+      await act(async () => {
+        fireEvent.click(older);
+      });
+      expect(callsOf("ledger.history")[1]).toEqual({
+        projectId: "me/alpha-spex",
+        before: { closedAt: NOW - 20 * MIN, intentId: "m19" },
+      });
+      expect(await screen.findByTestId("history-row-m39")).toBeTruthy();
+      expect(ids()).toHaveLength(40);
+      // Nothing left behind: the control leaves, the frame stays.
+      expect(screen.queryByTestId("history-older-me/alpha-spex")).toBeNull();
+      expect(frame.getAttribute("data-overflowing")).toBe("true");
+      expect(frame.style.maxHeight).toBe(`${8 * ROW}px`);
+    });
+
+    test("a history within eight rows draws no cut edges, takes no focus, and offers no grip", async () => {
+      commandMock.mockImplementation(async (type: string) => {
+        if (type === "ledger.history") return { intents: manyRows(8), more: false };
+        if (type === "ledger.get") return useAppStore.getState().ledger;
+        return {};
+      });
+      seed({ projects: [PROJECTS[0]], history: {} });
+      renderSurface();
+      await screen.findByTestId("history-row-m7");
+      const frame = screen.getByTestId("history-frame-me/alpha-spex");
+      expect(ids()).toHaveLength(8);
+      expect(frame.getAttribute("data-overflowing")).toBeNull();
+      expect(frame.getAttribute("tabindex")).toBeNull();
+      // Eight rows hold everything: nothing to page through, so no
+      // edge to pull (DR-030).
+      expect(screen.queryByTestId("history-frame-me/alpha-spex-grip")).toBeNull();
+    });
+
+    test("the grip sets the frame between four and twenty-four rows, and it is remembered", async () => {
+      commandMock.mockImplementation(async (type: string) => {
+        if (type === "ledger.history") return { intents: manyRows(30), more: false };
+        if (type === "ledger.get") return useAppStore.getState().ledger;
+        return {};
+      });
+      seed({ projects: [PROJECTS[0]], history: {} });
+      renderSurface();
+      await screen.findByTestId("history-row-m0");
+      const frame = screen.getByTestId("history-frame-me/alpha-spex");
+      const grip = screen.getByTestId("history-frame-me/alpha-spex-grip");
+      // The frame's bottom edge is a control that names itself and
+      // reports the height in the frame's own unit (DR-010 §7).
+      expect(grip.getAttribute("role")).toBe("separator");
+      expect(grip.getAttribute("aria-orientation")).toBe("horizontal");
+      expect(grip.getAttribute("aria-label")).toBe("Resize History");
+      expect(grip.getAttribute("aria-valuenow")).toBe("8");
+      expect(grip.getAttribute("aria-valuemin")).toBe("4");
+      expect(grip.getAttribute("aria-valuemax")).toBe("24");
+      expect(grip.getAttribute("tabindex")).toBe("0");
+
+      // Dragged, the edge follows the pointer a row at a time.
+      fireEvent.pointerDown(grip, { clientY: 200 });
+      fireEvent.pointerMove(grip, { clientY: 200 + 2 * ROW });
+      fireEvent.pointerUp(grip, { clientY: 200 + 2 * ROW });
+      expect(frame.style.maxHeight).toBe(`${10 * ROW}px`);
+      expect(grip.getAttribute("aria-valuenow")).toBe("10");
+
+      // Arrow keys move it a row at a time; neither bound is passed.
+      fireEvent.keyDown(grip, { key: "ArrowUp" });
+      expect(frame.style.maxHeight).toBe(`${9 * ROW}px`);
+      for (let nudge = 0; nudge < 20; nudge += 1) {
+        fireEvent.keyDown(grip, { key: "ArrowUp" });
+      }
+      expect(frame.style.maxHeight).toBe(`${4 * ROW}px`);
+      for (let nudge = 0; nudge < 40; nudge += 1) {
+        fireEvent.keyDown(grip, { key: "ArrowDown" });
+      }
+      expect(frame.style.maxHeight).toBe(`${24 * ROW}px`);
+
+      // A double-click restores the eight.
+      fireEvent.doubleClick(grip);
+      expect(frame.style.maxHeight).toBe(`${8 * ROW}px`);
+
+      // Chrome state is preference, not project state: the height set
+      // here survives a remount (DR-030).
+      fireEvent.keyDown(grip, { key: "ArrowDown" });
+      fireEvent.keyDown(grip, { key: "ArrowDown" });
+      expect(useAppStore.getState().frameHeights[FRAME_ID]).toBe(10);
+      cleanup();
+      renderSurface();
+      await screen.findByTestId("history-row-m0");
+      expect(screen.getByTestId("history-frame-me/alpha-spex").style.maxHeight).toBe(
+        `${10 * ROW}px`,
+      );
+      expect(
+        screen.getByTestId("history-frame-me/alpha-spex-grip").getAttribute("aria-valuenow"),
+      ).toBe("10");
+    });
+  });
+
+  test("a record orders by the date its status line carries, else file time", () => {
+    const tree: SpecTreeState = {
+      ...RECORD_TREE,
+      intents: [
+        {
+          id: "IR-9",
+          title: "Dated late, filed early",
+          path: "intents/009-dated.md",
+          status: "Done (2026-03-01)",
+          finished: "done",
+          updatedAt: Date.parse("2026-01-01"),
+        },
+        {
+          id: "IR-8",
+          title: "Undated, filed later",
+          path: "intents/008-undated.md",
+          status: "Done",
+          finished: "done",
+          updatedAt: Date.parse("2026-02-01"),
+        },
+      ],
+    };
+    seed({
+      projects: [PROJECTS[0]],
+      specTrees: { "me/alpha-spex": tree },
+      history: { "me/alpha-spex": { intents: [], more: false } },
+    });
+    renderSurface();
+    expect(ids()).toEqual(["IR-9", "IR-8"]);
+    expect(
+      within(screen.getByTestId("history-row-IR-9")).getByTitle(
+        new Date(Date.parse("2026-03-01")).toLocaleString(currentLocale()),
+      ),
+    ).toBeTruthy();
+  });
+
+  test("a finished record lists with a check before its record row", () => {
+    seed({
+      projects: [PROJECTS[0]],
+      projectMeta: { "me/alpha-spex": {} },
+      specTrees: { "me/alpha-spex": RECORD_TREE },
+      history: { "me/alpha-spex": { intents: [], more: false } },
+    });
+    const { onOpenIntent } = renderSurface();
+    expect(screen.queryByTestId("history-row-IR-3")).toBeNull();
+    const record = screen.getByTestId("history-row-IR-2");
+    expect(record.getAttribute("data-verdict")).toBe("done");
+    expect(record.textContent).toContain("✓");
+    // The one record row (dashboard-40): the identifier chip, the
+    // title, hover and pointer, named as an opener — never the brand
+    // link, which is for what leaves the app.
+    const row = within(record).getByRole("button", {
+      name: "Open IR-2: Old finished",
+    });
+    expect(row.getAttribute("title")).toBe("Open IR-2");
+    expect(within(row).getByText("IR-2").className).toContain("font-mono");
+    expect(row.className).toContain("cursor-pointer");
+    expect(row.className).toContain("hover:bg-");
+    expect(row.className).not.toContain("underline");
+    expect(within(record).queryByTestId("history-tag")).toBeNull();
+    fireEvent.click(row);
+    // The row itself is the origin's control (dashboard-40).
+    expect(onOpenIntent).toHaveBeenCalledWith(
+      "me/alpha-spex",
+      "intents/002-old.md",
+      "record-row-IR-2",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ledger reads in request order
+// ---------------------------------------------------------------------------
+
+describe("dashboard-42: ledger reads apply in request order", () => {
+  test("an older reply landing last never overwrites the newer fold", async () => {
+    const stale: LedgerState = {
+      intents: [q("old", "me/alpha-spex", "Stale queue")],
+      attention: [],
+      badge: 0,
+    };
+    const fresh: LedgerState = {
+      intents: [q("new", "me/alpha-spex", "Fresh queue")],
+      attention: [],
+      badge: 0,
+    };
+    let settleFirst!: () => void;
+    let reads = 0;
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "ledger.get") {
+        reads += 1;
+        if (reads === 1) {
+          return new Promise((resolve) => {
+            settleFirst = () => resolve(stale);
+          });
+        }
+        return fresh;
+      }
+      if (type === "ledger.history") return { intents: [], more: false };
+      return {};
+    });
+    seed({ ledger: undefined });
+    const first = useAppStore.getState().loadLedger();
+    const second = useAppStore.getState().loadLedger();
+    await second;
+    expect(useAppStore.getState().ledger).toEqual(fresh);
+    // The older read lands last: discarded, never applied.
+    await act(async () => {
+      settleFirst();
+      await first;
+    });
+    expect(useAppStore.getState().ledger).toEqual(fresh);
+    renderSurface();
+    expect(screen.getByTestId("upnext-row-new").textContent).toContain(
+      "Fresh queue",
+    );
+    expect(screen.queryByTestId("upnext-row-old")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Empty states, no takeover, filter
+// ---------------------------------------------------------------------------
+
+describe("dashboard-8/21/22/32: empty states, no takeover, the filter", () => {
+  test("no registered project: guidance with Projects navigation, no takeover", () => {
+    seed({
+      projects: [],
+      projectMeta: {},
+      specTrees: {},
+      history: {},
+      ledger: EMPTY_LEDGER,
+    });
+    const { onNavigate } = renderSurface();
+    // The attention queue still renders (dashboard-21): no takeover.
+    expect(screen.getByTestId("attention-all-clear")).toBeTruthy();
+    const empty = screen.getByTestId("projects-empty");
+    expect(empty.textContent).toBe("No projects yet · Add a project");
+    fireEvent.click(within(empty).getByRole("button", { name: "Add a project" }));
+    // This computer's place, whose projects the band lists (run-view-168).
+    expect(onNavigate).toHaveBeenCalledWith("Workspace", useAppStore);
+  });
+
+  test("a registered project with an empty ledger keeps every band instructive", () => {
+    seed({ projects: [PROJECTS[0]] });
+    renderSurface();
+    expect(screen.getByTestId("history-me/alpha-spex").textContent).toContain(
+      "Nothing done here yet.",
+    );
+    expect(screen.getByTestId("now-me/alpha-spex").textContent).toContain(
+      "Idle — no conversation yet.",
+    );
+    // The add row stays as the capture path (dashboard-8/29).
+    expect(screen.getByTestId("add-intent-me/alpha-spex")).toBeTruthy();
+    expect(screen.getByTestId("upnext-me/alpha-spex").textContent).toContain(
+      "Nothing queued",
+    );
+    // No forge binding: the summary line still counts, and the band
+    // guides to Projects.
+    expect(screen.getByTestId("sources-me/alpha-spex").textContent).toContain(
+      "No GitHub connection yet",
+    );
+  });
+
+  test("History with no done work points at the sidebar where a finished conversation served no intent", () => {
+    const CHAT_NOTE =
+      "Nothing done here yet · finished conversations are in the sidebar; work queued as an intent lands here";
+    const session = (
+      id: string,
+      projectId: string,
+      over: Record<string, unknown> = {},
+    ) => ({
+      id, projectId, projectPath: `/tmp/${projectId}`, title: `/code ${id}`,
+      createdAt: NOW - 20 * MIN, live: false, endedAt: NOW - 10 * MIN,
+      players: [], initialVisible: [], turns: 2, failed: false,
+      turnActive: false, ...over,
+    });
+    seed({
+      sessions: [
+        // alpha: work sent as chat turns, its last turn ended.
+        session("s-chat", "me/alpha-spex"),
+        // beta: one conversation still in its turn, and one finished
+        // conversation serving an open intent awaiting its verdict.
+        session("s-busy", "me/beta-spex", { live: true, endedAt: null, turnActive: true }),
+        session("s-served", "me/beta-spex"),
+      ],
+      ledger: {
+        intents: [{
+          intent: info({
+            id: "i-served", projectId: "me/beta-spex", text: "Ship docs",
+            dispatched: { sessionId: "s-served", turnId: 1, at: NOW - 20 * MIN },
+          }),
+          state: "finished",
+        }],
+        attention: [],
+        badge: 0,
+      },
+    });
+    renderSurface();
+    // A finished conversation serving no intent: the note says where
+    // that work is, and what lands here (dashboard-8).
+    expect(screen.getByTestId("history-empty-me/alpha-spex").textContent).toBe(CHAT_NOTE);
+    // A conversation in its turn, or one serving an open intent, leaves
+    // the note as it is (dashboard-8).
+    expect(screen.getByTestId("history-empty-me/beta-spex").textContent).toBe(
+      "Nothing done here yet.",
+    );
+  });
+
+  test("a forge state not yet read is loading, never not connected (dashboard-20)", () => {
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "forge.items" || type === "project.status") {
+        return new Promise(() => {});
+      }
+      if (type === "ledger.get") return useAppStore.getState().ledger;
+      return {};
+    });
+    seed({ projects: [PROJECTS[0]], projectMeta: {} });
+    renderSurface();
+    const line = screen.getByTestId("sources-toggle-me/alpha-spex");
+    expect(line.textContent).toContain("Loading GitHub…");
+    expect(line.textContent).not.toContain("GitHub not connected");
+    expect(screen.getByTestId("sources-guidance-me/alpha-spex").textContent).toContain(
+      "Loading GitHub state…",
+    );
+  });
+
+  test("the project filter is visibility only (dashboard-32)", () => {
+    seed({ ledger: { intents: [], attention: ATTENTION, badge: 6 } });
+    renderSurface();
+    fireEvent.change(screen.getByRole("combobox", { name: "Filter by project" }), {
+      target: { value: "me/beta-spex" },
+    });
+    // Only beta's entries and group stay visible.
+    expect(screen.queryByTestId("attention-iq-question")).toBeNull();
+    expect(screen.getByTestId("attention-if-failure")).toBeTruthy();
+    expect(screen.queryByTestId("project-group-me/alpha-spex")).toBeNull();
+    expect(screen.getByTestId("project-group-me/beta-spex")).toBeTruthy();
+    // No ledger write rode the filter change.
+    expect(callsOf("intent.move")).toEqual([]);
+    expect(callsOf("intent.close")).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Overview tab: header over the shared group (projects-4/6/7)
+// ---------------------------------------------------------------------------
+
+function renderOverview(onOpenIntent = vi.fn()) {
+  render(
+    <OverviewTab
+      projectId="me/alpha-spex"
+      onRemoved={() => {}}
+      onOpenSession={vi.fn()}
+      onOpenIntent={onOpenIntent}
+      onStartIntent={vi.fn()}
+    />,
+  );
+  return { onOpenIntent, overview: screen.getByTestId("overview-tab") };
+}
+
+describe("projects-4/6/9, forge-work-lists-1: the Overview tab", () => {
+  test("the shared project group carries the published standing in Overview", () => {
+    seed({
+      projects: [PROJECTS[0]],
+      ledger: {
+        intents: [
+          q("overview-next", "me/alpha-spex", "Answer before continuing", {
+            next: { standing: "question-park", manualStart: false },
+          }),
+        ],
+        attention: [],
+        badge: 0,
+      },
+    });
+    const { overview } = renderOverview();
+
+    expect(
+      within(overview).getByTestId("upnext-queued-overview-next").textContent,
+    ).toBe("Queued");
+    expect(
+      within(overview).getByTestId("upnext-standing-overview-next").textContent,
+    ).toBe("waiting — your reply");
+    expect(
+      within(overview).queryByTestId("upnext-start-overview-next"),
+    ).toBeNull();
+  });
+
+  test("the repository header over the project's own group, sharing the rows", async () => {
+    seedSources({
+      projectMeta: {
+        "me/alpha-spex": {
+          forge: FORGE,
+          status: { branch: "main", dirty: true, ahead: 2, behind: 1 },
+        },
+        "me/beta-spex": {},
+      },
+    });
+    const { overview } = renderOverview();
+
+    // The header (projects-4): name, path, branch, dirty, ahead/behind,
+    // and the GitHub slug.
+    expect(overview.textContent).toContain("alpha");
+    expect(overview.textContent).toContain("/tmp/alpha");
+    expect(overview.textContent).toContain("main");
+    expect(within(overview).getByTitle("uncommitted changes")).toBeTruthy();
+    expect(within(overview).getByTitle("ahead of upstream").textContent).toBe("↑2");
+    expect(within(overview).getByTitle("behind upstream").textContent).toBe("↓1");
+    expect(overview.textContent).toContain("x/y");
+    // Removal keeps its one confirm (projects-9): a project is not a row.
+    fireEvent.click(within(overview).getByRole("button", { name: "Remove project" }));
+    expect(overview.textContent).toContain("Remove from Spex?");
+    fireEvent.click(within(overview).getByRole("button", { name: "Keep" }));
+    expect(callsOf("project.remove")).toEqual([]);
+    // Keep hands focus back to the control it replaced (DR-010 §6).
+    expect(document.activeElement).toBe(
+      within(overview).getByRole("button", { name: "Remove project" }),
+    );
+
+    // The project's group as the Dashboard draws it, no project filter
+    // (dashboard-26, DR-038).
+    expect(within(overview).getByTestId("project-group-me/alpha-spex")).toBeTruthy();
+    expect(
+      within(overview).queryByRole("combobox", { name: "Filter by project" }),
+    ).toBeNull();
+    expect(within(overview).getByTestId("history-me/alpha-spex")).toBeTruthy();
+    expect(within(overview).getByTestId("now-me/alpha-spex")).toBeTruthy();
+    expect(within(overview).getByTestId("upnext-me/alpha-spex")).toBeTruthy();
+
+    // The Sources band carries the one row representation
+    // (forge-work-lists-1): labels, Queue with the same seed and the
+    // labels kept as provenance.
+    const issue = within(overview).getByTestId("source-issue-me/alpha-spex-7");
+    expect(issue.textContent).toContain("#7");
+    expect(issue.textContent).toContain("bug");
+    expect(
+      issue.querySelector("a")?.getAttribute("href"),
+    ).toBe("https://github.com/x/y/issues/7");
+    await act(async () => {
+      fireEvent.click(
+        within(issue).getByRole("button", { name: /Queue issue #7/ }),
+      );
+    });
+    expect(callsOf("intent.queue")).toEqual([
+      {
+        projectId: "me/alpha-spex",
+        text: "/dev Address #7: Fix the bug\n\nhttps://github.com/x/y/issues/7",
+        source: {
+          kind: "issue",
+          ref: "7",
+          url: "https://github.com/x/y/issues/7",
+          labels: ["bug", "urgent"],
+        },
+      },
+    ]);
+
+    // The captured artifact shows its intent's state here too.
+    act(() => {
+      useAppStore.setState({
+        ledger: {
+          intents: [
+            {
+              intent: info({
+                id: "c1",
+                projectId: "me/alpha-spex",
+                text: "Review PR #8: Add tests",
+                source: { kind: "pr", ref: "8" },
+              }),
+              state: "queued",
+            },
+          ],
+          attention: [],
+          badge: 0,
+        },
+      });
+    });
+    fireEvent.click(within(overview).getByTestId("sources-tab-prs-me/alpha-spex"));
+    const pr = within(overview).getByTestId("source-pr-me/alpha-spex-8");
+    expect(
+      within(pr).getByTestId("source-pr-me/alpha-spex-8-state").textContent,
+    ).toBe("queued");
+    expect(within(pr).queryByRole("button", { name: /Queue/ })).toBeNull();
+  });
+
+  test("Remove forgets the project and hands focus to the sidebar's Dashboard entry (projects-9)", async () => {
+    commandMock.mockImplementation(async (type: string) => {
+      if (type === "project.list") return [PROJECTS[1]];
+      if (type === "ledger.get") return useAppStore.getState().ledger;
+      if (type === "ledger.history") return { intents: [], more: false };
+      return {};
+    });
+    seed();
+    const onRemoved = vi.fn();
+    render(
+      <>
+        {/* The rail and its Dashboard entry as the real one marks
+            them: focus follows what they are, never what they say
+            (localization-4). */}
+        <nav data-testid="sidebar" aria-label="Spex navigation">
+          <button
+            type="button"
+            data-surface="Dashboard"
+            aria-label="Dashboard — 2 need your attention"
+          >
+            Dashboard
+          </button>
+        </nav>
+        <OverviewTab
+          projectId="me/alpha-spex"
+          onRemoved={onRemoved}
+          onOpenSession={vi.fn()}
+          onOpenIntent={vi.fn()}
+          onStartIntent={vi.fn()}
+        />
+      </>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove project" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    });
+    expect(callsOf("project.remove")).toEqual([{ projectId: "me/alpha-spex" }]);
+    expect(onRemoved).toHaveBeenCalled();
+    // The Overview went with the project; focus lands on the sidebar's
+    // Dashboard entry, found by its accessible name — never on body.
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: /^Dashboard/ }),
+    );
+  });
+
+  test("a clone holding what has not reached the host asks a second confirmation naming the count (projects-9)", async () => {
+    const unsent = "3 local changes have not reached the host.";
+    commandMock.mockImplementation(async (type: string, fields?: { confirm?: boolean }) => {
+      if (type === "project.remove") {
+        if (!fields?.confirm) throw new SpexCommandError("conflict", unsent);
+        return null;
+      }
+      if (type === "project.list") return [PROJECTS[1]];
+      if (type === "ledger.get") return useAppStore.getState().ledger;
+      if (type === "ledger.history") return { intents: [], more: false };
+      return {};
+    });
+    seed();
+    const onRemoved = vi.fn();
+    render(
+      <OverviewTab
+        projectId="me/alpha-spex"
+        onRemoved={onRemoved}
+        onOpenSession={vi.fn()}
+        onOpenIntent={vi.fn()}
+        onStartIntent={vi.fn()}
+      />,
+    );
+
+    // The first confirm asks the core without confirm: it refuses with
+    // the count, and the second confirm carries its words.
+    fireEvent.click(screen.getByRole("button", { name: "Remove project" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    });
+    expect(callsOf("project.remove")).toEqual([{ projectId: "me/alpha-spex" }]);
+    expect(onRemoved).not.toHaveBeenCalled();
+    const second = screen.getByTestId("remove-project-unsent");
+    expect(second.textContent).toContain(unsent);
+    expect(second.textContent).toContain("Remove anyway?");
+    // Keep backs out of the second confirm with nothing removed, focus
+    // back on the control (DR-010 §6).
+    fireEvent.click(within(second).getByRole("button", { name: "Keep" }));
+    expect(screen.queryByTestId("remove-project-unsent")).toBeNull();
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Remove project" }),
+    );
+    expect(callsOf("project.remove")).toHaveLength(1);
+
+    // Asked again and confirmed twice, the removal goes through with
+    // confirm set.
+    fireEvent.click(screen.getByRole("button", { name: "Remove project" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    });
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByTestId("remove-project-unsent")).getByRole("button", { name: "Remove" }),
+      );
+    });
+    expect(callsOf("project.remove")).toEqual([
+      { projectId: "me/alpha-spex" },
+      { projectId: "me/alpha-spex" },
+      { projectId: "me/alpha-spex", confirm: true },
+    ]);
+    expect(onRemoved).toHaveBeenCalledTimes(1);
+  });
+
+  test("GitHub setup guidance names the unmet condition inside the Sources band (projects-7)", () => {
+    seed({
+      projectMeta: {
+        "me/alpha-spex": {
+          status: { branch: "main", dirty: false, ahead: 0, behind: 0 },
+          forge: {
+            adapter: "github",
+            authenticated: null,
+            issues: [],
+            prs: [],
+            guidance:
+              "gh is not installed — install the GitHub CLI to list issues and PRs.",
+          },
+        },
+        "me/beta-spex": {},
+      },
+    });
+    const { overview } = renderOverview();
+    // Repo state and removal stay functional beside the guidance.
+    expect(overview.textContent).toContain("main");
+    expect(
+      (
+        within(overview).getByRole("button", {
+          name: "Remove project",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+    expect(
+      within(overview).getByTestId("sources-guidance-me/alpha-spex").textContent,
+    ).toContain("gh is not installed");
+    // The band is the one place for the lists: no second list in the
+    // header, and no link away from the Overview itself.
+    expect(within(overview).queryByText("Issues to do")).toBeNull();
+    expect(
+      within(overview).queryByRole("button", { name: /Open the project/ }),
+    ).toBeNull();
+  });
+
+  test("projects-29: the header names the GitHub state only while the Sources band is folded (projects-7)", () => {
+    const guidance = "No GitHub remote — run git remote add origin … to see issues and PRs";
+    seed({
+      projectMeta: {
+        "me/alpha-spex": {
+          status: { branch: "main", dirty: false, ahead: 0, behind: 0 },
+          forge: { adapter: "github", authenticated: null, issues: [], prs: [], guidance },
+        },
+        "me/beta-spex": {},
+      },
+    });
+    const { overview } = renderOverview();
+    // The open band carries the guidance itself; the header repeats
+    // nothing.
+    expect(within(overview).getByTestId("sources-guidance-me/alpha-spex").textContent).toContain(guidance);
+    expect(within(overview).queryByTestId("overview-github")).toBeNull();
+
+    // Folded, the band's guidance goes and the header names it beside
+    // the repository state.
+    fireEvent.click(within(overview).getByTestId("sources-toggle-me/alpha-spex"));
+    expect(within(overview).queryByTestId("sources-guidance-me/alpha-spex")).toBeNull();
+    expect(within(overview).getByTestId("overview-github").textContent).toBe(`GitHub: ${guidance}`);
+    expect(overview.textContent).toContain("main");
+
+    // Opened again, the header's line leaves.
+    fireEvent.click(within(overview).getByTestId("sources-toggle-me/alpha-spex"));
+    expect(within(overview).queryByTestId("overview-github")).toBeNull();
+    expect(within(overview).getByTestId("sources-guidance-me/alpha-spex").textContent).toContain(guidance);
+  });
+});
+
+
+test("dashboard-36: file-only queue titles, editing and Undo retain selected assets", async () => {
+  const asset = { assetId: `sha256:${"d".repeat(64)}` as const, name: "chart.png", mimeType: "image/png", byteLength: 4 };
+  const intent = info({ id: "files", projectId: "me/alpha-spex", text: "", attachments: [asset] });
+  seed({ attachmentDrafts: {}, ledger: { intents: [{ intent, state: "queued", next: MANUAL_READY }], attention: [], badge: 0 } });
+  renderSurface();
+  expect(screen.getByTestId("upnext-row-files").textContent).toContain("chart.png");
+  expect(screen.getByTestId("attention-all-clear").textContent).toContain("chart.png");
+  fireEvent.click(screen.getByTestId("upnext-menu-files"));
+  fireEvent.click(screen.getByTestId("upnext-edit-action-files"));
+  expect(screen.getByRole("button", { name: "Remove chart.png" })).toBeTruthy();
+  await act(async () => fireEvent.keyDown(screen.getByTestId("upnext-edit-files"), { key: "Enter" }));
+  expect(callsOf("intent.edit")).toEqual([{ intentId: "files", text: "", attachments: [asset] }]);
+  fireEvent.click(screen.getByTestId("upnext-menu-files"));
+  await act(async () => fireEvent.click(screen.getByTestId("upnext-remove-action-files")));
+  await act(async () => fireEvent.click(within(screen.getByTestId("upnext-removed-me/alpha-spex")).getByRole("button", { name: "Undo" })));
+  expect(callsOf("intent.queue")).toEqual([{ projectId: "me/alpha-spex", text: "", attachments: [asset] }]);
+});

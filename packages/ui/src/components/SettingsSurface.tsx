@@ -1,0 +1,1422 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// Settings surface (SET-1..10): a validated editor over the shared
+// playbook config. Every save round-trips through the core, which
+// refuses launcher-invalid states and preserves file comments.
+// DR-019: agents are inline blocks. DR-032 forks the editors: the
+// Captain and the session-player roster are identities and live here,
+// while which player answers a role is a binding and lives with its
+// playbook in the Library. The Captain and every player are rows of
+// one shape — a chip, opened by one edit control into the shared
+// editor with Save and Cancel, one row open at a time (settings-1,
+// settings-26). The Agents panel shows per-adapter readiness. Every
+// edit acknowledges in place — disabled while it is in flight, a
+// transient "Saved ✓" on the row once it landed (DR-010 §3). On a team
+// server's seat a Credentials section takes the member's own code-host
+// tokens and agent credentials, kept on that server (settings-48).
+
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
+import {
+  PROTOCOL_VERSION,
+  type AdapterName,
+  type AgentBlockInput,
+  type ConfigEditOpInput,
+  type CredentialList,
+  type ReadinessEntry,
+  type SessionPlayerSummary,
+  type MissingPlayer,
+} from "@sublang/spex-core/protocol";
+
+import { usePlaceStore } from "../state/place-context.js";
+import { isLocalPlace } from "../state/store.js";
+import { i18n, type Language } from "../i18n.js";
+import { allRepositories } from "../lib/instances.js";
+import { patchPlayer, setCaptain } from "../lib/config-ops.js";
+import { NOTIFICATION_LABELS } from "../lib/labels.js";
+import {
+  PLAIN_SHORTCUTS,
+  SHORTCUTS,
+  keyLabel,
+  modKey,
+} from "../lib/shortcuts.js";
+import { AgentChip, noCheckNote, readinessWord } from "./AgentChip.js";
+import { AgentEditor } from "./AgentEditor.js";
+import { Icon } from "./Icon.js";
+import { InlineConfirm } from "./InlineConfirm.js";
+import { Rich } from "./Rich.js";
+import { appVersion } from "../lib/version.js";
+import { PlayerName } from "./AgentMark.js";
+import { playerNamer } from "../lib/player-names.js";
+
+const NOTIFICATION_EVENTS = [
+  "player_finished",
+  "turn_finished",
+  "turn_aborted",
+] as const;
+const SINKS = ["off", "bell", "desktop"] as const;
+
+/** The one acknowledgment a landed edit gets (settings-6). A function,
+ * never a constant: a text read at module load would freeze the
+ * language the module was imported in (localization-4). */
+function savedWord(): string {
+  return i18n._({ id: "Saved ✓", comment: "an edit landed; the tick is part of the word" });
+}
+
+/** How long a landed edit's tick stands (settings-6). */
+const SAVED_MS = 1500;
+
+/** Transient text that clears itself — the saved tick — with the
+ * timer dying alongside the component. */
+function useTransient(
+  ms: number,
+): [string | undefined, (value: string) => void] {
+  const [value, setValue] = useState<string>();
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const set = useCallback(
+    (next: string) => {
+      setValue(next);
+      if (timer.current) clearTimeout(timer.current);
+      timer.current = setTimeout(() => setValue(undefined), ms);
+    },
+    [ms],
+  );
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current);
+    },
+    [],
+  );
+  return [value, set];
+}
+
+function SavedTick({ testId }: { testId: string }) {
+  return (
+    <span
+      role="status"
+      data-testid={testId}
+      className="text-xs text-emerald-700 dark:text-emerald-300"
+    >
+      {savedWord()}
+    </span>
+  );
+}
+
+/** The interface language (settings-37, localization-3): one choice
+ * per home, written through the core, which broadcasts it to every
+ * page. The two languages stand in their own words — a language name
+ * is not translated — while System is a text like any other. */
+const LANGUAGE_CHOICES: readonly { value: string; label: () => string }[] = [
+  { value: "system", label: () => i18n._("System") },
+  { value: "en", label: () => "English" },
+  { value: "zh", label: () => "简体中文" },
+];
+
+function LanguageSection({ onError }: { onError: (message?: string) => void }) {
+  const store = usePlaceStore();
+  const choice = store((state) => state.language.choice);
+  const savedAt = store((state) => state.language.savedAt);
+  const setLanguage = store((state) => state.setLanguage);
+  const [pending, setPending] = useState(false);
+  const [saved, setSaved] = useTransient(SAVED_MS);
+  // A landed write re-renders the whole app in the chosen language
+  // (localization-3), so this section is a new one by the time it
+  // acknowledges: the mark is the store's, and it ticks on the mount
+  // that finds it fresh as it does where the language stays
+  // (settings-37).
+  useEffect(() => {
+    if (savedAt === undefined || Date.now() - savedAt >= SAVED_MS) return;
+    setSaved("language");
+  }, [savedAt, setSaved]);
+
+  return (
+    <section data-testid="language-section" className="flex flex-col gap-2">
+      <h2 className="text-sm font-semibold text-neutral-500">
+        {i18n._("Language")}
+      </h2>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+        <select
+          data-testid="language-select"
+          aria-label={i18n._("Interface language")}
+          value={choice ?? "system"}
+          disabled={pending}
+          onChange={(event) => {
+            const next = event.target.value;
+            onError(undefined);
+            setPending(true);
+            setLanguage(next === "system" ? (null as Language | null) : (next as Language))
+              .catch((cause: Error) => onError(cause.message))
+              .finally(() => setPending(false));
+          }}
+          className="rounded border border-neutral-300 bg-white px-2 py-1 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-900"
+        >
+          {LANGUAGE_CHOICES.map((entry) => (
+            <option key={entry.value} value={entry.value}>
+              {entry.label()}
+            </option>
+          ))}
+        </select>
+        {saved === "language" ? <SavedTick testId="language-saved" /> : null}
+        {/* The effect is a phrase where it applies, never a sentence
+            (DR-069). */}
+        <span className="text-xs text-neutral-500">
+          {i18n._("System follows your device")}
+        </span>
+      </div>
+    </section>
+  );
+}
+
+/** Which agent row's editor stands open — the Captain's or one
+ * player's — and how a row hands focus back to its own edit control
+ * when its editor closes (DR-010 §6): one editor at a time, so a
+ * second row opening closes the first. */
+interface RowEditing {
+  editing?: string;
+  open: (key: string) => void;
+  close: (key: string) => void;
+  toggleRef: (key: string) => (element: HTMLButtonElement | null) => void;
+}
+
+function useRowEditing(): RowEditing {
+  const [editing, setEditing] = useState<string>();
+  const toggles = useRef(new Map<string, HTMLButtonElement>());
+  const open = useCallback(
+    (key: string) =>
+      setEditing((current) => (current === key ? undefined : key)),
+    [],
+  );
+  const close = useCallback((key: string) => {
+    setEditing((current) => (current === key ? undefined : current));
+    // The editor's own controls leave with it; the edit control that
+    // opened it is where the keyboard lands next.
+    toggles.current.get(key)?.focus();
+  }, []);
+  const toggleRef = useCallback(
+    (key: string) => (element: HTMLButtonElement | null) => {
+      if (element) toggles.current.set(key, element);
+      else toggles.current.delete(key);
+    },
+    [],
+  );
+  return { editing, open, close, toggleRef };
+}
+
+/** The pencil that opens a row's editor in place (DR-010 §7: a named
+ * 24px target that says whether its editor stands open). */
+function EditToggle({
+  rows,
+  rowKey,
+  label,
+  title,
+  testId,
+}: {
+  rows: RowEditing;
+  rowKey: string;
+  label: string;
+  title: string;
+  testId: string;
+}) {
+  const open = rows.editing === rowKey;
+  return (
+    <button
+      ref={rows.toggleRef(rowKey)}
+      type="button"
+      data-testid={testId}
+      aria-label={label}
+      aria-expanded={open}
+      title={title}
+      onClick={() => rows.open(rowKey)}
+      className={`flex h-6 w-6 items-center justify-center rounded hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800 dark:hover:text-neutral-200 ${
+        open ? "text-brand-600 dark:text-brand-300" : "text-neutral-500"
+      }`}
+    >
+      <Icon name="edit" />
+    </button>
+  );
+}
+
+/** An open row editor: Escape cancels it the way Cancel does. */
+function RowEditor({
+  onCancel,
+  children,
+}: {
+  onCancel: () => void;
+  children: ReactNode;
+}) {
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Escape") return;
+    event.stopPropagation();
+    onCancel();
+  };
+  return <div onKeyDown={onKeyDown}>{children}</div>;
+}
+
+function ReadinessBadge({ entry }: { entry?: ReadinessEntry }) {
+  if (!entry) return null;
+  if (entry.ready === true) {
+    return (
+      <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">
+        {readinessWord(true)}
+      </span>
+    );
+  }
+  if (entry.ready === false) {
+    // What the adapter requires is the core's own sentence.
+    return (
+      <span
+        className="rounded-full bg-red-100 px-2 py-0.5 text-xs text-red-700 dark:bg-red-950 dark:text-red-300"
+        title={entry.requirement}
+      >
+        {readinessWord(false)}
+      </span>
+    );
+  }
+  return (
+    <span
+      className="rounded-full bg-neutral-100 px-2 py-0.5 text-xs text-neutral-500 dark:bg-neutral-800"
+      title={entry.requirement ?? noCheckNote()}
+    >
+      {i18n._({ id: "unverified", comment: "readiness badge: no automatic check exists for this adapter" })}
+    </span>
+  );
+}
+
+/** "captain", or a player id trailing the roles it answers, as
+ * `dev.coder (code.coder, fix.coder)` → chip copy (DR-010 §2). The
+ * chip shows the lane; the whole string stays in its title. */
+function positionLabel(position: string): string {
+  if (position === "captain") {
+    return i18n._({ id: "Captain", comment: "the session's controlling agent, by name" });
+  }
+  const paren = position.indexOf(" (");
+  return paren === -1 ? position : position.slice(0, paren);
+}
+
+function ThemeInput({
+  value,
+  disabled,
+  onCommit,
+}: {
+  value: string;
+  disabled?: boolean;
+  onCommit: (value: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  const commit = () => {
+    if (draft.trim() !== value) onCommit(draft.trim());
+  };
+  return (
+    <input
+      aria-label={i18n._("Terminal pane theme")}
+      title={i18n._(
+        "The tmux pane theme of sessions run from the playbook CLI — e.g. a catppuccin flavor, or auto",
+      )}
+      value={draft}
+      // `auto` is the value the field takes when left empty, not a word.
+      placeholder="auto"
+      disabled={disabled}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") commit();
+      }}
+      className="w-48 rounded border border-neutral-300 bg-white px-2 py-1 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-900"
+    />
+  );
+}
+
+/** The sheet's keys the platform way: glyphs on a Mac, words
+ * elsewhere, so "Ctrl+Shift+S" never reads "Ctrl+⇧S". */
+function sheetKeys(keys: string): string {
+  return keyLabel(modKey() === "⌘" ? keys : keys.replace(/⇧/g, "Shift+"));
+}
+
+/** The starting block for a lane the user is adding: a deliberate,
+ * visible choice rather than a blank the launcher would refuse. */
+const NEW_PLAYER_BLOCK: AgentBlockInput = {
+  adapter: "claude",
+  model: "claude-opus-5-5",
+  effort: "high",
+  permissions: { mode: "auto" },
+};
+
+/** A player a project's config names for a role and your own group's
+ * roster lacks (settings-46): named by its project, with Add creating
+ * it from the neutral block, so each person picks their own models. */
+function MissingPlayerRow({ entry }: { entry: MissingPlayer }) {
+  const store = usePlaceStore();
+  const project = store((state) => state.projects.find((item) => item.id === entry.repository));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const positions = entry.roles.map((item) => `${item.playbook}.${item.role}`).join(", ");
+  return (
+    <div
+      data-testid={`player-missing-${entry.player}`}
+      className="flex flex-col gap-1 rounded-lg border border-dashed border-amber-300 bg-white px-3 py-2 text-sm dark:border-amber-800 dark:bg-neutral-900"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-mono font-medium">{entry.player}</span>
+        <span
+          data-testid={`player-missing-note-${entry.player}`}
+          title={positions ? i18n._("Answers {positions}", { positions }) : undefined}
+          className="min-w-0 flex-1 truncate text-xs text-amber-800 dark:text-amber-200"
+        >
+          {i18n._("Named by {project}, not set up here", { project: project?.name ?? entry.repository })}
+        </span>
+        <button
+          type="button"
+          data-testid={`player-missing-add-${entry.player}`}
+          disabled={busy}
+          title={i18n._("Add {id} with the neutral agent, then tune it here", { id: entry.player })}
+          onClick={() => {
+            setBusy(true);
+            setError(undefined);
+            void patchPlayer(entry.player, NEW_PLAYER_BLOCK, store.getClient())
+              .catch((cause: Error) => setError(cause.message))
+              .finally(() => setBusy(false));
+          }}
+          className="rounded-md border border-brand-300 px-2 py-0.5 text-xs font-medium text-brand-600 hover:bg-brand-50 disabled:opacity-40 dark:border-brand-800 dark:text-brand-300 dark:hover:bg-brand-950"
+        >
+          {busy ? i18n._({ id: "Adding…", comment: "the request is being written" }) : i18n._({ id: "Add", comment: "create this player in your own roster" })}
+        </button>
+      </div>
+      {error ? (
+        <p data-testid={`player-missing-error-${entry.player}`} className="text-xs text-red-600 dark:text-red-400">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/** Each agent's forms a member may set on a seat (settings-49), in the
+ * table's order: the names are the agents' own environment names. */
+const AGENT_CREDENTIAL_FORMS: readonly { agent: AdapterName; names: readonly string[] }[] = [
+  { agent: "claude", names: ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] },
+  { agent: "codex", names: ["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY"] },
+  { agent: "opencode", names: ["OPENCODE_AUTH_CONTENT"] },
+  { agent: "gemini", names: ["GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_API_KEY"] },
+  { agent: "kimi", names: ["KIMI_MODEL_API_KEY", "KIMI_MODEL_NAME", "KIMI_MODEL_BASE_URL", "KIMI_MODEL_PROVIDER_TYPE"] },
+];
+
+/** The forms that only accompany a key, or name a file, rather than hold
+ * a secret: typed in the clear (settings-49). */
+const PLAIN_FORMS: ReadonlySet<string> = new Set([
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "KIMI_MODEL_NAME",
+  "KIMI_MODEL_BASE_URL",
+  "KIMI_MODEL_PROVIDER_TYPE",
+]);
+
+const FIELD =
+  "min-w-0 rounded border border-neutral-300 bg-white px-2 py-1 text-xs disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-900";
+const BUTTON =
+  "rounded border border-neutral-300 px-2 py-0.5 text-xs hover:bg-neutral-100 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-800";
+
+/** The Credentials section of a seat's Settings (settings-48): a code
+ * host's token — the host name and the token — and, per agent, a
+ * credential of the member's own by the agent's forms (settings-49),
+ * each sent as `credential.set`, removed with `credential.remove` and
+ * listed by `credential.list` with no secret echoed; the section names
+ * each host whose code clone failed for want of one (space-103), and
+ * opens at the host a Groups row asked for. */
+function CredentialsSection({
+  ask,
+  onAskShown,
+}: {
+  /** The code host a Groups row asked to take a credential for. */
+  ask?: string;
+  onAskShown?: () => void;
+}) {
+  const store = usePlaceStore();
+  const connected = store((state) => state.connection === "open");
+  const space = store((state) => state.space);
+  const loadSpace = store((state) => state.loadSpace);
+  const [list, setList] = useState<CredentialList>();
+  const [host, setHost] = useState(ask ?? "");
+  const [token, setToken] = useState("");
+  const [agent, setAgent] = useState<AdapterName>("claude");
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [pending, setPending] = useState<string>();
+  const [error, setError] = useState<string>();
+  const [saved, setSaved] = useTransient(SAVED_MS);
+  const sectionRef = useRef<HTMLElement>(null);
+  const tokenRef = useRef<HTMLInputElement>(null);
+
+  // What is set, read as the section opens and each time the core is
+  // reached again; a write's reply is the list after it.
+  useEffect(() => {
+    if (!connected) return;
+    let live = true;
+    store
+      .getClient()
+      .command("credential.list", {})
+      .then((next) => {
+        if (live) setList(next);
+      })
+      .catch((cause: Error) => {
+        if (live) setError(cause.message);
+      });
+    return () => {
+      live = false;
+    };
+  }, [connected, store]);
+
+  // The failed clones the section names are the seat's Groups rows,
+  // read here where nothing has read them yet.
+  useEffect(() => {
+    if (connected && !store.getState().space) void loadSpace().catch(() => {});
+  }, [connected, loadSpace, store]);
+
+  // Opened at a host a Groups row named: the section comes into view
+  // with that host in the field, and the token is what is asked.
+  useEffect(() => {
+    if (ask === undefined) return;
+    sectionRef.current?.scrollIntoView?.({ block: "start" });
+    tokenRef.current?.focus();
+    onAskShown?.();
+    // The ask is taken once, as the section opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const placed = new Set((list?.hosts ?? []).map((entry) => entry.name.toLowerCase()));
+  const needed = [
+    ...new Set(
+      (space ? allRepositories(space) : []).flatMap((repo) =>
+        repo.sync.phase === "stopped" && repo.sync.credential !== undefined ? [repo.sync.credential] : [],
+      ),
+    ),
+  ].filter((name) => !placed.has(name.toLowerCase()));
+
+  const forms = AGENT_CREDENTIAL_FORMS.find((entry) => entry.agent === agent)?.names ?? [];
+  const filled = Object.fromEntries(
+    forms.flatMap((name) => (values[name]?.trim() ? [[name, values[name]!.trim()]] : [])),
+  );
+
+  /** One write, its reply the list after it (settings-48); a placed
+   * credential ticks its form, a removed one leaves the list. */
+  function write(key: string, run: () => Promise<CredentialList>, done?: () => void): void {
+    setError(undefined);
+    setPending(key);
+    run()
+      .then((next) => {
+        setList(next);
+        done?.();
+        if (done) setSaved(key);
+      })
+      .catch((cause: Error) => setError(cause.message))
+      .finally(() => setPending((current) => (current === key ? undefined : current)));
+  }
+
+  const saveHost = () => {
+    const name = host.trim();
+    if (!name || !token.trim()) return;
+    write(
+      "host",
+      () => store.getClient().command("credential.set", { kind: "host", name, values: { token: token.trim() } }),
+      () => {
+        setHost("");
+        setToken("");
+      },
+    );
+  };
+
+  const saveAgent = () => {
+    if (Object.keys(filled).length === 0) return;
+    write(
+      "agent",
+      () => store.getClient().command("credential.set", { kind: "agent", name: agent, values: filled }),
+      () => setValues({}),
+    );
+  };
+
+  const remove = (kind: "host" | "agent", name: string) =>
+    write(`remove:${kind}:${name}`, () => store.getClient().command("credential.remove", { kind, name }));
+
+  const removeLabel = (name: string) =>
+    i18n._({
+      id: "Remove the credential for {name}",
+      values: { name },
+      comment: "accessible name of the control taking the member's credential for a code host or an agent off the team server",
+    });
+  const removeWord = () =>
+    i18n._({ id: "Remove", comment: "take the member's credential for a code host or an agent off the team server" });
+  const none = () =>
+    i18n._({ id: "None placed yet", comment: "a list of the member's credentials on a team server, while it holds none" });
+
+  return (
+    <section
+      ref={sectionRef}
+      data-testid="credentials-section"
+      aria-labelledby="credentials-heading"
+      className="flex flex-col gap-2"
+    >
+      <h2 id="credentials-heading" className="text-sm font-semibold text-neutral-500">
+        {i18n._({
+          id: "Credentials",
+          comment: "Settings section on a team server: the member's own code-host tokens and agent credentials",
+        })}
+      </h2>
+      <p data-testid="credentials-note" className="text-xs text-neutral-500">
+        {i18n._("A credential you place here stays on this server until you remove it.")}
+      </p>
+      {needed.map((name) => (
+        <p
+          key={name}
+          data-testid={`credentials-needed-${name}`}
+          className="rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200"
+        >
+          {i18n._({
+            id: "{host} needs a credential of yours to clone a project's code",
+            values: { host: name },
+            comment: "Credentials section on a team server: a project's code could not be cloned from {host}, a code host, for want of the member's credential",
+          })}
+        </p>
+      ))}
+      <div className="flex flex-col gap-1.5 rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-900">
+        <h3 className="text-xs font-semibold text-neutral-500">
+          {i18n._({ id: "Code hosts", comment: "Credentials section: the code hosts the member placed a token for" })}
+        </h3>
+        <ul data-testid="credential-hosts" className="flex flex-col gap-1">
+          {(list?.hosts ?? []).map((entry) => (
+            <li
+              key={entry.name}
+              data-testid={`credential-host-${entry.name}`}
+              className="flex flex-wrap items-center gap-2"
+            >
+              <span className="font-mono">{entry.name}</span>
+              {entry.username ? <span className="text-xs text-neutral-500">{entry.username}</span> : null}
+              <span className="ml-auto flex items-center gap-1">
+                <button
+                  type="button"
+                  data-testid={`credential-host-remove-${entry.name}`}
+                  aria-label={removeLabel(entry.name)}
+                  disabled={!connected || pending !== undefined}
+                  onClick={() => remove("host", entry.name)}
+                  className={BUTTON}
+                >
+                  {removeWord()}
+                </button>
+              </span>
+            </li>
+          ))}
+          {list && list.hosts.length === 0 ? <li className="text-xs text-neutral-500">{none()}</li> : null}
+        </ul>
+        <form
+          data-testid="credential-host-form"
+          className="flex flex-wrap items-center gap-1.5"
+          onSubmit={(event) => {
+            event.preventDefault();
+            saveHost();
+          }}
+        >
+          <input
+            data-testid="credential-host-name"
+            aria-label={i18n._({ id: "Host name", comment: "Credentials section: the code host a token is for, such as git.example.com" })}
+            placeholder="git.example.com"
+            value={host}
+            spellCheck={false}
+            autoComplete="off"
+            disabled={pending === "host"}
+            onChange={(event) => setHost(event.target.value)}
+            className={`${FIELD} flex-1 basis-40 font-mono`}
+          />
+          <input
+            ref={tokenRef}
+            data-testid="credential-host-token"
+            type="password"
+            aria-label={i18n._({ id: "Token", comment: "Credentials section: the member's access token for a code host" })}
+            value={token}
+            autoComplete="off"
+            disabled={pending === "host"}
+            onChange={(event) => setToken(event.target.value)}
+            className={`${FIELD} flex-1 basis-40`}
+          />
+          <button
+            type="submit"
+            data-testid="credential-host-save"
+            disabled={!connected || !host.trim() || !token.trim() || pending !== undefined}
+            className={BUTTON}
+          >
+            {i18n._({ id: "Save", comment: "Credentials section: place the credential on the team server" })}
+          </button>
+          {saved === "host" ? <SavedTick testId="credential-host-saved" /> : null}
+        </form>
+      </div>
+      <div className="flex flex-col gap-1.5 rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-900">
+        <h3 className="text-xs font-semibold text-neutral-500">{i18n._("Agents")}</h3>
+        <ul data-testid="credential-agents" className="flex flex-col gap-1">
+          {(list?.agents ?? []).map((entry) => (
+            <li
+              key={entry.name}
+              data-testid={`credential-agent-${entry.name}`}
+              className="flex flex-wrap items-center gap-2"
+            >
+              <span className="font-mono font-medium">{entry.name}</span>
+              <span className="font-mono text-xs text-neutral-500">{entry.names.join(", ")}</span>
+              <span className="ml-auto flex items-center gap-1">
+                <button
+                  type="button"
+                  data-testid={`credential-agent-remove-${entry.name}`}
+                  aria-label={removeLabel(entry.name)}
+                  disabled={!connected || pending !== undefined}
+                  onClick={() => remove("agent", entry.name)}
+                  className={BUTTON}
+                >
+                  {removeWord()}
+                </button>
+              </span>
+            </li>
+          ))}
+          {list && list.agents.length === 0 ? <li className="text-xs text-neutral-500">{none()}</li> : null}
+        </ul>
+        <form
+          data-testid="credential-agent-form"
+          className="flex flex-col gap-1.5"
+          onSubmit={(event) => {
+            event.preventDefault();
+            saveAgent();
+          }}
+        >
+          <select
+            data-testid="credential-agent"
+            aria-label={i18n._({ id: "Agent", comment: "Credentials section: the agent a credential of the member's is for" })}
+            value={agent}
+            disabled={pending === "agent"}
+            onChange={(event) => {
+              setAgent(event.target.value as AdapterName);
+              setValues({});
+            }}
+            className={`${FIELD} self-start font-mono`}
+          >
+            {AGENT_CREDENTIAL_FORMS.map((entry) => (
+              <option key={entry.agent} value={entry.agent}>
+                {entry.agent}
+              </option>
+            ))}
+          </select>
+          {forms.map((name) => (
+            <label key={name} className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+              <span className="min-w-0 basis-56 font-mono text-xs">{name}</span>
+              <input
+                data-testid={`credential-agent-value-${name}`}
+                type={PLAIN_FORMS.has(name) ? "text" : "password"}
+                value={values[name] ?? ""}
+                spellCheck={false}
+                autoComplete="off"
+                disabled={pending === "agent"}
+                onChange={(event) => setValues((current) => ({ ...current, [name]: event.target.value }))}
+                className={`${FIELD} flex-1 basis-40`}
+              />
+            </label>
+          ))}
+          <span className="flex items-center gap-2">
+            <button
+              type="submit"
+              data-testid="credential-agent-save"
+              disabled={!connected || Object.keys(filled).length === 0 || pending !== undefined}
+              className={BUTTON}
+            >
+              {i18n._({ id: "Save", comment: "Credentials section: place the credential on the team server" })}
+            </button>
+            {saved === "agent" ? <SavedTick testId="credential-agent-saved" /> : null}
+          </span>
+        </form>
+      </div>
+      {error ? (
+        <p role="alert" data-testid="credentials-error" className="text-xs text-red-600 dark:text-red-400">
+          {error}
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+/** The session-player roster (DR-032): each lane is one identity and
+ * one provider conversation, edited here whole. Removal is refused by
+ * the core while a binding still names the lane, and that refusal is
+ * what the user reads. */
+function PlayerRoster({
+  players,
+  missing,
+  readiness,
+  captain,
+  rows,
+}: {
+  players: SessionPlayerSummary[];
+  /** Players a project's config names that this roster lacks
+   * (settings-46). */
+  missing: MissingPlayer[];
+  readiness: ReadinessEntry[];
+  captain: AgentBlockInput;
+  rows: RowEditing;
+}) {
+  const store = usePlaceStore();
+  const [adding, setAdding] = useState(false);
+  const [newId, setNewId] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState<string>();
+  const [error, setError] = useState<{ playerId: string; message: string }>();
+  // The editor closes on save, so the tick lives on the row.
+  const [saved, setSaved] = useTransient(SAVED_MS);
+  const readinessByAdapter = new Map(
+    readiness.map((entry) => [entry.adapter, entry]),
+  );
+
+  function remove(playerId: string): void {
+    setError(undefined);
+    void store.getClient()
+      .command("config.edit", { op: { kind: "player.delete", playerId } })
+      .then(() => setConfirmDelete(undefined))
+      .catch((cause: Error) =>
+        setError({ playerId, message: cause.message }),
+      );
+  }
+
+  // Each player's name over this roster (run-view-177).
+  const names = playerNamer(players.map((player) => player.id));
+  return (
+    <section data-testid="players-section" className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <h2 className="text-sm font-semibold text-neutral-500">
+          {i18n._("Session players")}
+        </h2>
+      </div>
+      {players.map((player) => (
+        <div
+          key={player.id}
+          data-testid={`player-row-${player.id}`}
+          className="flex flex-col gap-2 rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-900"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <PlayerName id={player.id} name={names(player.id)} nameClassName="font-medium" testId={`player-name-${player.id}`} />
+            <AgentChip
+              agent={player.agent}
+              readiness={readinessByAdapter.get(player.agent.adapter)}
+              label={player.id}
+            />
+            {player.boundBy.length > 0 ? (
+              <span
+                data-testid={`player-bound-${player.id}`}
+                title={i18n._("Answers {positions}", { positions: player.boundBy.join(", ") })}
+                className="flex flex-wrap gap-1"
+              >
+                {player.boundBy.map((position) => (
+                  <span
+                    key={position}
+                    className="rounded bg-neutral-100 px-1.5 py-0.5 text-xs text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
+                  >
+                    {position}
+                  </span>
+                ))}
+              </span>
+            ) : (
+              <span className="text-xs text-neutral-500">
+                {i18n._("bound to no role yet")}
+              </span>
+            )}
+            <span className="ml-auto flex items-center gap-1">
+              {saved === player.id ? (
+                <SavedTick testId={`player-saved-${player.id}`} />
+              ) : null}
+              <EditToggle
+                rows={rows}
+                rowKey={player.id}
+                label={i18n._("Edit {id}", { id: player.id })}
+                title={i18n._("Edit this player's agent")}
+                testId={`player-edit-${player.id}`}
+              />
+              {confirmDelete === player.id ? (
+                <InlineConfirm
+                  question={i18n._("Remove {id}?", { id: player.id })}
+                  confirmLabel={i18n._({ id: "Remove", comment: "confirm: take this player out of the roster" })}
+                  cancelLabel={i18n._({ id: "Keep", comment: "cancel a removal: leave it as it is" })}
+                  onConfirm={() => remove(player.id)}
+                  onCancel={() => setConfirmDelete(undefined)}
+                />
+              ) : (
+                <button
+                  type="button"
+                  data-testid={`player-delete-${player.id}`}
+                  aria-label={i18n._("Remove {id}", { id: player.id })}
+                  title={i18n._("Remove this player from the roster")}
+                  onClick={() => setConfirmDelete(player.id)}
+                  className="flex h-6 w-6 items-center justify-center rounded text-neutral-500 hover:bg-neutral-100 hover:text-red-500 dark:hover:bg-neutral-800"
+                >
+                  <Icon name="close" />
+                </button>
+              )}
+            </span>
+          </div>
+          {error?.playerId === player.id ? (
+            <p
+              data-testid={`player-error-${player.id}`}
+              className="text-xs text-red-600 dark:text-red-400"
+            >
+              {error.message}
+            </p>
+          ) : null}
+          {rows.editing === player.id ? (
+            <RowEditor onCancel={() => rows.close(player.id)}>
+              <AgentEditor
+                key={JSON.stringify(player.agent)}
+                initial={player.agent}
+                readiness={readiness}
+                captain={captain}
+                onSave={(patch) =>
+                  patchPlayer(player.id, patch, store.getClient()).then((result) => {
+                    rows.close(player.id);
+                    setSaved(player.id);
+                    return result;
+                  })
+                }
+                onCancel={() => rows.close(player.id)}
+              />
+            </RowEditor>
+          ) : null}
+        </div>
+      ))}
+      {missing
+        .filter((entry) => !players.some((player) => player.id === entry.player))
+        .map((entry) => (
+          <MissingPlayerRow key={`${entry.repository}:${entry.player}`} entry={entry} />
+        ))}
+      {players.length === 0 && missing.length === 0 ? (
+        <p
+          data-testid="players-empty"
+          title={i18n._({
+            id: "Enabling a playbook on a project's Playbooks tab adds the players its roles need",
+            comment: "tooltip of Settings' empty players list: where players come from",
+          })}
+          className="rounded-lg border border-dashed border-neutral-300 px-4 py-3 text-xs text-neutral-500 dark:border-neutral-700"
+        >
+          {i18n._({ id: "No players yet", comment: "Settings' players list while it holds none" })}
+        </p>
+      ) : null}
+      {adding ? (
+        <div
+          data-testid="player-add-form"
+          className="flex flex-col gap-2 rounded-lg border border-neutral-200 bg-white px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900"
+        >
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-neutral-500 dark:text-neutral-400">
+              {i18n._("Player id — lowercase, dots to group (e.g. dev.coder)")}
+            </span>
+            <input
+              data-testid="player-add-id"
+              value={newId}
+              onChange={(event) => setNewId(event.target.value)}
+              className="rounded border border-neutral-300 bg-white px-2 py-1 font-mono text-sm dark:border-neutral-700 dark:bg-neutral-950"
+            />
+          </label>
+          {error?.playerId === "" ? (
+            <p
+              data-testid="player-add-error"
+              className="text-xs text-red-600 dark:text-red-400"
+            >
+              {error.message}
+            </p>
+          ) : null}
+          <AgentEditor
+            initial={NEW_PLAYER_BLOCK}
+            readiness={readiness}
+            captain={captain}
+            saveLabel={i18n._("Add player")}
+            allowUnchanged
+            onSave={(patch) => {
+              // Adding never overwrites: an id already in the roster
+              // is turned back to its own editor (settings-27).
+              const id = newId.trim();
+              if (!id) {
+                setError({ playerId: "", message: i18n._("Give the player an id first.") });
+                // The rejection never reaches the page; the line above does.
+                return Promise.reject(new Error("no id"));
+              }
+              if (players.some((player) => player.id === id)) {
+                setError({
+                  playerId: "",
+                  message: i18n._("A player named {id} already exists — edit it above instead.", { id }),
+                });
+                return Promise.reject(new Error("duplicate id"));
+              }
+              return patchPlayer(id, patch, store.getClient()).then(
+                (result) => {
+                  setAdding(false);
+                  setNewId("");
+                  setError(undefined);
+                  setSaved(id);
+                  return result;
+                },
+                (cause: Error) => {
+                  setError({ playerId: "", message: cause.message });
+                  throw cause;
+                },
+              );
+            }}
+            onCancel={() => {
+              setAdding(false);
+              setError(undefined);
+            }}
+          />
+        </div>
+      ) : (
+        <button
+          type="button"
+          data-testid="player-add"
+          onClick={() => setAdding(true)}
+          className="self-start rounded-md border border-neutral-300 px-2 py-1 text-xs text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+        >
+          {i18n._("Add a player")}
+        </button>
+      )}
+    </section>
+  );
+}
+
+export function SettingsSurface({
+  credentialHost,
+  onCredentialHostShown,
+  agentRow,
+  onAgentRowShown,
+}: {
+  /** On a seat, the code host its Groups row asked to take a credential
+   * for: the Credentials section opens at it (settings-48). */
+  credentialHost?: string;
+  onCredentialHostShown?: () => void;
+  /** The agent a failure asked for — `captain` or a player id: its row
+   * editor opens in view (settings-52). */
+  agentRow?: string;
+  onAgentRowShown?: () => void;
+} = {}) {
+  const store = usePlaceStore();
+  // A seat's Settings carry its Credentials section (settings-48).
+  const seat = !isLocalPlace(store.place);
+  const configState = store((state) => state.configState);
+  const readiness = store((state) => state.readiness);
+  const refreshReadiness = store((state) => state.refreshReadiness);
+  const refresh = store((state) => state.refresh);
+  const [error, setError] = useState<string>();
+  const [copied, setCopied] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  // Which preference edit is in flight, and which one just landed.
+  const [pending, setPending] = useState<string>();
+  const [saved, setSaved] = useTransient(SAVED_MS);
+  // The one open agent-row editor, the Captain's or a player's.
+  const rows = useRowEditing();
+  // Asked for an agent's row (settings-52): its editor opens and comes
+  // into view once the config is read, and the ask is taken once.
+  const asked = useRef(agentRow);
+  const summaryForAsk = configState?.status === "valid" ? configState.summary : undefined;
+  useEffect(() => {
+    const agent = asked.current;
+    if (agent === undefined || !summaryForAsk) return;
+    asked.current = undefined;
+    onAgentRowShown?.();
+    const known = agent === "captain" || summaryForAsk.players.some((player) => player.id === agent);
+    if (!known) return;
+    rows.open(agent);
+    const testId = agent === "captain" ? "captain-row" : `player-row-${agent}`;
+    Array.from(document.querySelectorAll<HTMLElement>("[data-testid]"))
+      .find((element) => element.dataset.testid === testId)
+      ?.scrollIntoView?.({ block: "center" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [summaryForAsk]);
+
+  if (!configState) {
+    return (
+      <div className="m-auto text-sm text-neutral-500">{i18n._("loading config…")}</div>
+    );
+  }
+  if (configState.status !== "valid") {
+    const missing = configState.status === "missing";
+    return (
+      <div className="relative mx-auto min-h-0 w-full max-w-2xl flex-1 overflow-y-auto p-6">
+        <div
+          data-testid="config-broken"
+          className="rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+        >
+          <div className="font-semibold">
+            {missing ? i18n._("No config file") : i18n._("Config file invalid")}
+          </div>
+          {missing ? (
+            <p className="mt-1 text-xs">
+              <Rich
+                text={i18n._(
+                  "Spex could not create a starter config at <0>{path}</0> — check the folder is writable, then retry.",
+                  { path: configState.path },
+                )}
+                components={[<span className="font-mono" key="path" />]}
+              />
+            </p>
+          ) : null}
+          <div className="mt-1 flex flex-wrap items-center gap-2">
+            {missing ? null : (
+              <span className="font-mono text-xs">{configState.path}</span>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard.writeText(configState.path);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              }}
+              className="rounded border border-red-300 px-1.5 py-0.5 text-xs hover:bg-red-100 dark:border-red-800 dark:hover:bg-red-900"
+            >
+              {copied ? i18n._({ id: "Copied", comment: "the path went to the clipboard" }) : i18n._("Copy path")}
+            </button>
+            {missing ? (
+              <button
+                type="button"
+                data-testid="config-retry"
+                disabled={retrying}
+                onClick={() => {
+                  setRetrying(true);
+                  setError(undefined);
+                  refresh()
+                    .catch((cause: Error) => setError(cause.message))
+                    .finally(() => setRetrying(false));
+                }}
+                className="rounded border border-red-300 px-1.5 py-0.5 text-xs font-medium hover:bg-red-100 disabled:opacity-50 dark:border-red-800 dark:hover:bg-red-900"
+              >
+                {retrying ? i18n._({ id: "Retrying…", comment: "a retry is in flight" }) : i18n._({ id: "Retry", comment: "try creating the config file again" })}
+              </button>
+            ) : null}
+          </div>
+          {configState.status === "invalid" ? (
+            <>
+              {/* Each line is the core's own reading of the file. */}
+              <ul className="mt-2 list-disc pl-5">
+                {configState.errors.map((entry) => (
+                  <li key={entry}>{entry}</li>
+                ))}
+              </ul>
+              <div className="mt-2 text-xs">
+                {i18n._("Fix the file in your editor; Spex reloads it live.")}
+              </div>
+            </>
+          ) : null}
+          {error ? <p className="mt-2 text-xs">{error}</p> : null}
+        </div>
+      </div>
+    );
+  }
+
+  const summary = configState.summary;
+  const readinessByAdapter = new Map(
+    readiness.map((entry) => [entry.adapter, entry]),
+  );
+
+  /** A preference edit: disabled in flight, ticked once landed. */
+  function edit(op: ConfigEditOpInput, key: string) {
+    setError(undefined);
+    setPending(key);
+    store.getClient()
+      .command("config.edit", { op })
+      .then(() => setSaved(key))
+      .catch((cause: Error) => setError(cause.message))
+      .finally(() =>
+        setPending((current) => (current === key ? undefined : current)),
+      );
+  }
+
+  return (
+    // The surface root is the box Settings scrolls in (DR-041 §9):
+    // height-constrained, and the containing block for its own
+    // positioned content — the shortcut table's screen-reader caption
+    // included — so the page itself never scrolls.
+    <div className="relative mx-auto flex w-full min-h-0 max-w-3xl flex-1 flex-col gap-5 overflow-y-auto p-6">
+      <div>
+        <h1 className="text-lg font-semibold">{i18n._("Settings")}</h1>
+        {/* The file written here, by its path alone: no spex
+            repository named, and no project's file offered as editable
+            here — a project's playbooks and role bindings are its
+            Playbooks tab's (settings-46). */}
+        <p className="mt-0.5 text-xs text-neutral-500">
+          <span className="font-mono break-all" title={i18n._("Shared with the playbook CLI — edits made outside appear here")}>{summary.path}</span>
+        </p>
+        {configState.seeded || configState.reseeded ? (
+          <p
+            data-testid="config-seeded"
+            className="mt-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200"
+          >
+            <Rich
+              text={configState.reseeded
+                // An untouched seed rewritten for the current sign-ins is
+                // an update, never a creation (settings-9, DR-156).
+                ? i18n._("Updated the starter config at <0>{path}</0> for the current sign-ins", {
+                  path: summary.path,
+                })
+                : i18n._("Created a starter config at <0>{path}</0>", {
+                  path: summary.path,
+                })}
+              components={[<span className="font-mono" key="path" />]}
+            />
+          </p>
+        ) : null}
+        <p className="mt-0.5 text-xs text-neutral-500">
+          {i18n._("Spex {version} · protocol {protocol}", {
+            version: appVersion(),
+            protocol: PROTOCOL_VERSION,
+          })}
+        </p>
+      </div>
+      {error ? (
+        <div className="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
+          {error}
+        </div>
+      ) : null}
+
+      <section data-testid="captain-section" className="flex flex-col gap-2">
+        <h2 className="text-sm font-semibold text-neutral-500">{i18n._({ id: "Captain", comment: "the session's controlling agent, by name" })}</h2>
+        {/* The Captain is a row of the players' shape (settings-1): its
+            chip, opened by the pencil into the shared editor, which
+            closes on Save or Cancel — no removal, since a session has
+            exactly one Captain. */}
+        <div
+          data-testid="captain-row"
+          className="flex flex-col gap-2 rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-900"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            {/* The row's own word is the config's key, not a name. */}
+            <span className="font-mono font-medium">captain</span>
+            <AgentChip
+              agent={summary.captain}
+              readiness={readinessByAdapter.get(summary.captain.adapter)}
+              label={i18n._({ id: "Captain", comment: "the session's controlling agent, by name" })}
+            />
+            <span className="ml-auto flex items-center gap-1">
+              {saved === "captain" ? <SavedTick testId="captain-saved" /> : null}
+              <EditToggle
+                rows={rows}
+                rowKey="captain"
+                label={i18n._("Edit the Captain")}
+                title={i18n._("Edit the Captain's agent")}
+                testId="captain-edit"
+              />
+            </span>
+          </div>
+          {rows.editing === "captain" ? (
+            <RowEditor onCancel={() => rows.close("captain")}>
+              <AgentEditor
+                key={JSON.stringify(summary.captain)}
+                initial={summary.captain}
+                readiness={readiness}
+                onSave={(patch) =>
+                  setCaptain(patch, store.getClient()).then((result) => {
+                    rows.close("captain");
+                    setSaved("captain");
+                    return result;
+                  })
+                }
+                onCancel={() => rows.close("captain")}
+              />
+            </RowEditor>
+          ) : null}
+        </div>
+      </section>
+
+      <PlayerRoster
+        players={summary.players}
+        missing={configState.missingPlayers ?? []}
+        readiness={readiness}
+        captain={summary.captain}
+        rows={rows}
+      />
+
+      <section data-testid="agents-section" className="flex flex-col gap-2">
+        <div className="flex items-center gap-2">
+          <h2 className="text-sm font-semibold text-neutral-500">{i18n._("Agents")}</h2>
+          <button
+            type="button"
+            title={i18n._("Re-run adapter readiness checks (e.g. after signing in)")}
+            onClick={() => void refreshReadiness()}
+            className="rounded-md border border-neutral-300 px-2 py-0.5 text-xs text-neutral-500 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-800"
+          >
+            {i18n._("Re-check readiness")}
+          </button>
+        </div>
+        {readiness.map((entry) => (
+          <div
+            key={entry.adapter}
+            data-testid={`agent-row-${entry.adapter}`}
+            className="flex flex-wrap items-center gap-2 rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-900"
+          >
+            <span className="font-mono font-medium">{entry.adapter}</span>
+            <ReadinessBadge entry={entry} />
+            {entry.ready === false && entry.requirement ? (
+              <span className="min-w-0 flex-1 text-xs text-neutral-500">
+                {entry.requirement}
+              </span>
+            ) : null}
+            <span className="ml-auto flex flex-wrap gap-1">
+              {entry.usedBy.map((position) => (
+                <span
+                  key={position}
+                  title={position}
+                  className="rounded bg-neutral-100 px-1.5 py-0.5 text-xs text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
+                >
+                  {positionLabel(position)}
+                </span>
+              ))}
+            </span>
+          </div>
+        ))}
+        {readiness.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-neutral-300 px-4 py-3 text-xs text-neutral-500 dark:border-neutral-700">
+            {i18n._("No adapters in use yet — assign agents to the Captain or a playbook role and their readiness shows here.")}
+          </div>
+        ) : null}
+      </section>
+
+      {seat ? <CredentialsSection ask={credentialHost} onAskShown={onCredentialHostShown} /> : null}
+
+      <section
+        data-testid="notifications-section"
+        className="flex flex-col gap-2"
+      >
+        <h2 className="text-sm font-semibold text-neutral-500">
+          {i18n._("Notifications")}
+        </h2>
+        <div className="flex flex-col gap-1.5">
+          {NOTIFICATION_EVENTS.map((event) => {
+            const key = `notifications:${event}`;
+            return (
+              <div
+                key={event}
+                // The select wraps under its label in a narrow pane
+                // (settings-22, DR-041).
+                className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm"
+              >
+                <span className="min-w-0 shrink basis-56 text-xs" title={event}>
+                  {NOTIFICATION_LABELS[event]?.() ?? event}
+                </span>
+                <select
+                  aria-label={i18n._("{label} — where to notify", {
+                    label: NOTIFICATION_LABELS[event]?.() ?? event,
+                  })}
+                  value={summary.notifications?.[event] ?? "off"}
+                  disabled={pending === key}
+                  onChange={(changeEvent) =>
+                    edit(
+                      {
+                        kind: "notifications.set",
+                        prefs: {
+                          ...(summary.notifications ?? {}),
+                          [event]: changeEvent.target.value,
+                        },
+                      },
+                      key,
+                    )
+                  }
+                  className="rounded border border-neutral-300 bg-white px-2 py-1 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-900"
+                >
+                  {/* The sink's own id is what the config carries, so
+                      the option states it and reads its own word. */}
+                  {SINKS.map((sink) => (
+                    <option key={sink} value={sink}>
+                      {sink === "off"
+                        ? i18n._({ id: "off", comment: "notification sink: notify nowhere" })
+                        : sink === "bell"
+                          ? i18n._({ id: "bell", comment: "notification sink: the terminal bell" })
+                          : i18n._({ id: "desktop", comment: "notification sink: an OS notification" })}
+                    </option>
+                  ))}
+                </select>
+                {saved === key ? (
+                  <SavedTick testId={`notification-saved-${event}`} />
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      <LanguageSection onError={setError} />
+
+      <section data-testid="shortcuts-section" className="flex flex-col gap-2">
+        <h2 className="text-sm font-semibold text-neutral-500">
+          {i18n._("Keyboard shortcuts")}
+        </h2>
+        <div
+          data-testid="shortcuts-sheet"
+          // At a phone's width the sheet scrolls sideways and holds
+          // nothing focusable of its own, so the box itself takes the
+          // keyboard stop and says what it holds (run-view-50).
+          tabIndex={0}
+          role="group"
+          aria-label={i18n._("Keyboard shortcuts")}
+          className="relative overflow-x-auto rounded-lg border border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900"
+        >
+          <table className="w-full text-left text-sm">
+            <caption className="sr-only">{i18n._("Keyboard shortcuts")}</caption>
+            <thead>
+              <tr className="text-xs text-neutral-500">
+                <th scope="col" className="px-3 py-1.5 font-medium">
+                  {i18n._({ id: "Keys", comment: "shortcut table column: the keys to press" })}
+                </th>
+                <th scope="col" className="px-3 py-1.5 font-medium">
+                  {i18n._({ id: "Does", comment: "shortcut table column: what the keys do" })}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {SHORTCUTS.map((shortcut) => (
+                <tr
+                  key={shortcut.keys}
+                  className="border-t border-neutral-100 dark:border-neutral-800"
+                >
+                  <td className="whitespace-nowrap px-3 py-1.5">
+                    <kbd className="rounded border border-neutral-300 bg-neutral-50 px-1.5 py-0.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-950">
+                      {sheetKeys(shortcut.keys)}
+                    </kbd>
+                  </td>
+                  <td className="px-3 py-1.5">{shortcut.does}</td>
+                </tr>
+              ))}
+              {PLAIN_SHORTCUTS.map((shortcut) => (
+                <tr
+                  key={shortcut.keys}
+                  className="border-t border-neutral-100 dark:border-neutral-800"
+                >
+                  <td className="whitespace-nowrap px-3 py-1.5">
+                    <kbd className="rounded border border-neutral-300 bg-neutral-50 px-1.5 py-0.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-950">
+                      {shortcut.keys}
+                    </kbd>
+                  </td>
+                  <td className="px-3 py-1.5">{shortcut.does}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section data-testid="theme-section" className="flex flex-col gap-2">
+        <h2 className="text-sm font-semibold text-neutral-500">
+          {i18n._("Terminal pane theme (CLI only)")}
+        </h2>
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <ThemeInput
+            value={summary.theme ?? ""}
+            disabled={pending === "theme"}
+            onCommit={(value) =>
+              edit({ kind: "theme.set", theme: value || null }, "theme")
+            }
+          />
+          {saved === "theme" ? <SavedTick testId="theme-saved" /> : null}
+          <span className="text-xs text-neutral-500">
+            {i18n._("Spex itself follows your OS theme.")}
+          </span>
+        </div>
+      </section>
+    </div>
+  );
+}

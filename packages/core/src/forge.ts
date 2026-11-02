@@ -1,0 +1,525 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// Git-aware project support and the forge adapter seam (DR-006):
+// repo state comes from local git commands only; forge data flows
+// through one adapter interface, with the gh-CLI GitHub adapter as
+// the v1 implementation. No credentials are ever stored.
+
+import { execFile } from "node:child_process";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import type { ToolchainRuntime } from "./compile.js";
+import { i18n } from "./i18n.js";
+import type { Language } from "./language.js";
+import type { ForgeItem, ForgeState, RepoStatusInfo } from "./protocol.js";
+import { remoteHost } from "./space-git.js";
+
+export type { ForgeItem, ForgeState };
+export type RepoStatus = RepoStatusInfo;
+
+export type RunCommand = (
+  command: string,
+  args: string[],
+  cwd?: string,
+  /** Variables added to this process's environment for the command. */
+  env?: Record<string, string>,
+) => Promise<{ code: number; stdout: string; stderr: string }>;
+
+export const defaultRunCommand: RunCommand = (command, args, cwd, env) =>
+  new Promise((resolve) => {
+    execFile(
+      command,
+      args,
+      {
+        cwd,
+        timeout: 15_000,
+        maxBuffer: 4 * 1024 * 1024,
+        ...(env ? { env: { ...process.env, ...env } } : {}),
+      },
+      (error, stdout, stderr) => {
+        const code =
+          error && typeof (error as { code?: unknown }).code === "number"
+            ? ((error as { code?: number }).code ?? 1)
+            : error
+              ? 1
+              : 0;
+        resolve({ code, stdout: String(stdout), stderr: String(stderr) });
+      },
+    );
+  });
+
+// ---------------------------------------------------------------------------
+// Local git state (PROJ-3, PROJ-11)
+// ---------------------------------------------------------------------------
+
+export async function isWorkTreeRoot(
+  path: string,
+  run: RunCommand = defaultRunCommand,
+): Promise<boolean> {
+  const result = await run("git", ["rev-parse", "--show-toplevel"], path);
+  if (result.code !== 0) return false;
+  const top = result.stdout.trim();
+  if (!top || !existsSync(path) || !existsSync(top)) return false;
+  // git prints forward-slash paths and Windows temp dirs may surface
+  // as 8.3 short names; canonicalize both sides before comparing.
+  const canonical = (p: string): string => {
+    const real = resolvePath(realpathSync.native(p));
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  };
+  try {
+    return canonical(top) === canonical(path);
+  } catch {
+    return false;
+  }
+}
+
+export async function repoStatus(
+  path: string,
+  run: RunCommand = defaultRunCommand,
+): Promise<RepoStatus> {
+  // `branch --show-current` names even an unborn branch (fresh repo,
+  // no commits), where rev-parse fails; it prints nothing on a
+  // detached HEAD, so rev-parse remains the fallback for that case.
+  const branch = await run("git", ["branch", "--show-current"], path);
+  let branchName = branch.code === 0 ? branch.stdout.trim() : "";
+  if (!branchName) {
+    const revParse = await run(
+      "git",
+      ["rev-parse", "--abbrev-ref", "HEAD"],
+      path,
+    );
+    if (revParse.code === 0) branchName = revParse.stdout.trim();
+  }
+  const porcelain = await run("git", ["status", "--porcelain"], path);
+  const counts = await run(
+    "git",
+    ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+    path,
+  );
+  const origin = await run("git", ["remote", "get-url", "origin"], path);
+
+  let ahead = 0;
+  let behind = 0;
+  if (counts.code === 0) {
+    const [behindText, aheadText] = counts.stdout.trim().split(/\s+/);
+    behind = Number(behindText) || 0;
+    ahead = Number(aheadText) || 0;
+  }
+  return {
+    branch: branchName || i18n._({
+      id: "(unknown)",
+      comment: "Stands in the branch's place where git names none",
+    }),
+    dirty: porcelain.code === 0 && porcelain.stdout.trim().length > 0,
+    ahead,
+    behind,
+    ...(origin.code === 0 && origin.stdout.trim()
+      ? { originUrl: origin.stdout.trim() }
+      : {}),
+  };
+}
+
+/** The registry's scaffold CLI: what runs when no shell supplied the
+ * app's own (projects-31). */
+const REGISTRY_SCAFFOLD = ["npx", "--yes", "@sublang/spex"];
+
+/** The scaffold command a shell supplies (projects-31). */
+export interface SuppliedScaffold {
+  /** The app's own scaffold CLI on the app's own executable. */
+  scaffoldCommand: string[];
+  /** What the executable needs to run as Node: Electron's variable. */
+  scaffoldEnv?: Record<string, string>;
+}
+
+/** The app-supplied scaffold CLI (projects-31): `@sublang/spex` in the
+ * first of the given module directories holding it with its bin — the
+ * checkout's own `packages/cli` — run on the runtime's executable,
+ * Electron's as Node. Undefined when no tree holds a built copy, so
+ * the create flow falls back to the registry's and says so. */
+export function suppliedScaffold(
+  runtime: ToolchainRuntime,
+): SuppliedScaffold | undefined {
+  for (const dir of runtime.modulePaths ?? []) {
+    const linked = resolvePath(dir, "@sublang", "spex");
+    const manifest = resolvePath(linked, "package.json");
+    if (!existsSync(manifest)) continue;
+    const { bin } = JSON.parse(readFileSync(manifest, "utf8")) as {
+      bin?: string | { spex?: string };
+    };
+    const relative = typeof bin === "string" ? bin : bin?.spex;
+    if (!relative) continue;
+    // The real file, not the workspace link: a failure names where
+    // the CLI lives.
+    const cli = resolvePath(realpathSync(linked), relative);
+    if (!existsSync(cli)) continue;
+    return {
+      scaffoldCommand: [runtime.execPath, cli],
+      ...(runtime.electron ? { scaffoldEnv: { ELECTRON_RUN_AS_NODE: "1" } } : {}),
+    };
+  }
+  return undefined;
+}
+
+/** The create flow's refusal at its initial commit (projects-34): the
+ * core's own words, and Git's output carried whole beside them, which
+ * the reply sends as its `output` detail. */
+export class InitialCommitRefusal extends Error {
+  constructor(
+    message: string,
+    readonly output: string,
+  ) {
+    super(message);
+    this.name = "InitialCommitRefusal";
+  }
+}
+
+/** What a refused initial commit reads as (projects-34): one whole
+ * sentence per case Git's output names, each carrying the way on, so
+ * no language is handed a frame around a fragment (DR-079). Git's
+ * words are matched as Git prints them; a case not recognized keeps
+ * the plain sentence, and Git's output says the rest. */
+function initialCommitRefusal(output: string): string {
+  if (/user\.signingkey[^\n]*needs to be configured/i.test(output)) {
+    return i18n._({
+      id: "Git could not make the first commit: commit signing is on, but no key is configured. The generated files stay in the folder: finish the initial commit in your terminal, then use Add.",
+      comment: "Project creation refusal: Git signs commits and has no signing key; Git's own output is shown beneath, and Add is the palette action",
+    });
+  }
+  if (/failed to sign/i.test(output)) {
+    return i18n._({
+      id: "Git could not make the first commit: commit signing is on, but signing failed. The generated files stay in the folder: finish the initial commit in your terminal, then use Add.",
+      comment: "Project creation refusal: Git signs commits and its signing program failed; Git's own output is shown beneath, and Add is the palette action",
+    });
+  }
+  if (/Please tell me who you are|Author identity unknown|Committer identity unknown|no email was given|empty ident name/i.test(output)) {
+    return i18n._({
+      id: "Git could not make the first commit: no Git name and email are configured. The generated files stay in the folder: finish the initial commit in your terminal, then use Add.",
+      comment: "Project creation refusal: Git has no user name and email to commit with; Git's own output is shown beneath, and Add is the palette action",
+    });
+  }
+  return i18n._({
+    id: "Git could not make the first commit. The generated files stay in the folder: finish the initial commit in your terminal, then use Add.",
+    comment: "Project creation refusal at the initial commit for a cause the app does not recognize; Git's own output is shown beneath, and Add is the palette action",
+  });
+}
+
+export interface CreateProjectOptions {
+  path: string;
+  scaffold?: boolean;
+  scaffoldLanguage?: Language;
+  /** The scaffold command a shell supplied (projects-31); the
+   * registry's `npx --yes @sublang/spex` when none. */
+  scaffoldCommand?: string[];
+  /** Variables the supplied command runs under. */
+  scaffoldEnv?: Record<string, string>;
+  run?: RunCommand;
+}
+
+export async function createProjectRepo(
+  options: CreateProjectOptions,
+): Promise<{ scaffolded: boolean }> {
+  const run = options.run ?? defaultRunCommand;
+  if (existsSync(resolvePath(options.path, ".git"))) {
+    const head = await run("git", ["rev-parse", "--verify", "HEAD"], options.path);
+    throw new Error(head.code === 0
+      ? i18n._({
+          id: "This folder already contains a Git repository. Use Add to register it.",
+          comment: "Create refuses to change an existing repository; Add is the palette action",
+        })
+      : i18n._({
+          id: "This folder already contains a Git repository without an initial commit. Finish the initial commit in your terminal, then use Add.",
+          comment: "Create recovery for an existing unborn repository; Add is the palette action",
+        }));
+  }
+  const checkedGit = async (args: string[], cwd?: string): Promise<void> => {
+    const result = await run("git", args, cwd);
+    if (result.code !== 0) {
+      throw new Error(i18n._({
+        id: "{command} failed: {output}",
+        values: {
+          command: `git ${args[0]}`,
+          output: result.stderr.trim() || result.stdout.trim() || String(result.code),
+        },
+        comment: "Project creation refusal; command and its output are verbatim",
+      }));
+    }
+  };
+  // The initial commit is the one step whose failure leaves a repository
+  // the person must finish by hand (projects-3): the refusal says so, in
+  // the app's words, and keeps Git's beside them (projects-34).
+  const initialCommit = async (args: string[]): Promise<void> => {
+    const result = await run("git", ["commit", ...args], options.path);
+    if (result.code !== 0) {
+      const output = result.stderr.trim() || result.stdout.trim() || String(result.code);
+      throw new InitialCommitRefusal(initialCommitRefusal(output), output);
+    }
+  };
+  const agentInstructionFiles = ["CLAUDE.md", "AGENTS.md", "GEMINI.md"];
+  await checkedGit(["init", options.path]);
+  let scaffolded = false;
+  if (options.scaffold) {
+    const preexistingAgentFiles = new Set(
+      agentInstructionFiles.filter((path) =>
+        existsSync(resolvePath(options.path, path)),
+      ),
+    );
+    const [command, ...args] = options.scaffoldCommand ?? REGISTRY_SCAFFOLD;
+    const scaffoldRun = await run(
+      command,
+      [...args, "scaffold", ...(options.scaffoldLanguage ? ["--lang", options.scaffoldLanguage] : []), options.path],
+      options.path,
+      options.scaffoldCommand ? options.scaffoldEnv : undefined,
+    );
+    scaffolded = scaffoldRun.code === 0;
+    if (!scaffolded) {
+      // The failure names what ran (projects-31): the shell's own CLI,
+      // or the registry's when no shell supplied one.
+      const ran = [command, ...args, "scaffold"].join(" ");
+      const output = scaffoldRun.stderr.trim() || scaffoldRun.stdout.trim();
+      throw new Error(
+        options.scaffoldCommand
+          ? i18n._({
+              id: "scaffold failed running {command}: {output}",
+              values: { command: ran, output },
+              comment: "Refusal when the app's own scaffold CLI exits non-zero; command and output are verbatim",
+            })
+          : i18n._({
+              id: "scaffold failed running {command} (the app's own scaffold CLI was not supplied, so the registry's ran): {output}",
+              values: { command: ran, output },
+              comment: "Refusal when the registry's scaffold CLI exits non-zero because the app supplied none; command and output are verbatim",
+            }),
+      );
+    }
+    // Commit the generated scaffold without pulling a pre-existing
+    // agent-instruction file into the initial commit.
+    const createdAgentFiles = agentInstructionFiles.filter(
+      (path) =>
+        !preexistingAgentFiles.has(path) &&
+        existsSync(resolvePath(options.path, path)),
+    );
+    for (const path of ["specs", ...createdAgentFiles, "LICENSE"]) {
+      await checkedGit(["add", "--", path], options.path);
+    }
+    await initialCommit(["-m", "chore: scaffold specs"]);
+  } else {
+    await initialCommit(["--allow-empty", "-m", "chore: initialize project"]);
+  }
+  return { scaffolded };
+}
+
+export interface SeedExampleOptions {
+  path: string;
+  run?: RunCommand;
+  /** Corpus dir override for tests; defaults to the staged Academy. */
+  corpusDir?: string;
+}
+
+/** The staged Academy corpus (DR-015): built from the repo demo/. */
+export function academyCorpusDir(): string {
+  const corpus = fileURLToPath(new URL("../assets/academy", import.meta.url));
+  // Recursive copy uses the native filesystem, so packaged assets must be
+  // addressed through their physical asar-unpacked directory (app-shell-13).
+  const unpacked = corpus.replace(/\.asar(?=[\\/]|$)/, ".asar.unpacked");
+  return unpacked !== corpus && existsSync(unpacked) ? unpacked : corpus;
+}
+
+const ACADEMY_SEED_COMMIT = "chore: seed the Academy example";
+
+/** Recognize a previously seeded Academy without relying on its current
+ * files, which the reader may have edited after removing the project. */
+export async function isSeededAcademyProject(
+  path: string,
+  run: RunCommand = defaultRunCommand,
+): Promise<boolean> {
+  if (!(await isWorkTreeRoot(path, run))) return false;
+  const roots = await run("git", ["log", "--all", "--max-parents=0", "--format=%s"], path);
+  return roots.code === 0 && roots.stdout.split(/\r?\n/).includes(ACADEMY_SEED_COMMIT);
+}
+
+/**
+ * Materialize the Academy example (DR-015): empty or absent target
+ * only, copy the corpus, git init, add everything, one seed commit.
+ * The commit tolerates failure (e.g. an unusable signing setup) —
+ * the project still registers with the files in place.
+ */
+export async function seedExampleProject(
+  options: SeedExampleOptions,
+): Promise<void> {
+  const run = options.run ?? defaultRunCommand;
+  const target = resolvePath(options.path);
+  if (existsSync(target) && readdirSync(target).length > 0) {
+    throw new Error(
+      i18n._({
+        id: "{target} is not empty; the example seeds only a new or empty directory",
+        values: { target },
+        comment: "Refusal where the folder chosen for the example already holds files",
+      }),
+    );
+  }
+  const corpus = options.corpusDir ?? academyCorpusDir();
+  if (!existsSync(corpus)) {
+    throw new Error(`example corpus missing at ${corpus}`);
+  }
+  mkdirSync(target, { recursive: true });
+  cpSync(corpus, target, { recursive: true });
+  const init = await run("git", ["init", target]);
+  if (init.code !== 0) {
+    throw new Error(`git init failed: ${init.stderr.trim() || init.stdout.trim()}`);
+  }
+  await run("git", ["add", "-A"], target);
+  const message = ACADEMY_SEED_COMMIT;
+  const commit = await run("git", ["commit", "-m", message], target);
+  if (commit.code !== 0) {
+    // A signing policy without a usable key, or a machine with no git
+    // identity, must not strand the seed: retry unsigned with a
+    // neutral fallback identity. Normal setups keep the signed,
+    // user-authored commit from the first attempt.
+    await run(
+      "git",
+      [
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "user.name=Spex",
+        "-c",
+        "user.email=spex@sublang.ai",
+        "commit",
+        "-m",
+        message,
+      ],
+      target,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Forge adapter interface (DR-006) and the gh GitHub adapter
+// ---------------------------------------------------------------------------
+
+export interface ForgeAdapter {
+  state(projectPath: string, originUrl?: string): Promise<ForgeState>;
+}
+
+export function parseGitHubRepo(originUrl: string): string | undefined {
+  const match =
+    /(?:github\.com[/:])([^/\s]+)\/([^/\s]+?)(?:\.git)?$/.exec(originUrl);
+  return match ? `${match[1]}/${match[2]}` : undefined;
+}
+
+const GH_ITEM_FIELDS = "number,title,url,author,updatedAt,labels";
+
+interface GhItem {
+  number: number;
+  title: string;
+  url: string;
+  author?: { login?: string };
+  updatedAt?: string;
+  labels?: { name?: string }[];
+}
+
+function toForgeItems(json: string): ForgeItem[] {
+  try {
+    const items = JSON.parse(json) as GhItem[];
+    return items.map((item) => ({
+      number: item.number,
+      title: item.title,
+      url: item.url,
+      ...(item.author?.login ? { author: item.author.login } : {}),
+      ...(item.updatedAt ? { updatedAt: item.updatedAt } : {}),
+      ...(item.labels?.length
+        ? {
+            labels: item.labels
+              .map((label) => label.name)
+              .filter((name): name is string => Boolean(name)),
+          }
+        : {}),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export class GitHubForgeAdapter implements ForgeAdapter {
+  constructor(private readonly run: RunCommand = defaultRunCommand) {}
+
+  async state(projectPath: string, originUrl?: string): Promise<ForgeState> {
+    const repo = originUrl ? parseGitHubRepo(originUrl) : undefined;
+    if (!repo) {
+      // No binding reads as one of two conditions (projects-7): no
+      // origin at all, or an origin elsewhere, named by its host alone
+      // and never by a credential its URL carries.
+      return {
+        adapter: "github",
+        authenticated: null,
+        issues: [],
+        prs: [],
+        guidance: originUrl
+          ? i18n._({
+              id: "Issues and PRs come from GitHub · Code: {host}",
+              values: { host: remoteHost(originUrl) },
+              comment: "Forge guidance where the project's code remote is not on GitHub; {host} is that remote's host name, such as gitlab.com, or a local remote as written",
+            })
+          : i18n._({
+              id: "No GitHub remote — run {command} to see issues and PRs",
+              values: { command: "git remote add origin …" },
+              comment: "Forge guidance where the project has no code remote; {command} is the Git command that adds one, which stays as it is",
+            }),
+      };
+    }
+    const auth = await this.run("gh", ["auth", "status"], projectPath);
+    if (auth.code === 127 || /not found|ENOENT/i.test(auth.stderr)) {
+      return {
+        adapter: "github",
+        authenticated: null,
+        repo,
+        issues: [],
+        prs: [],
+        guidance: i18n._({
+          id: "GitHub CLI (gh) is not installed. Install it and run `gh auth login`.",
+          comment: "Forge guidance where the gh command is absent; the command stays as it is",
+        }),
+      };
+    }
+    if (auth.code !== 0) {
+      return {
+        adapter: "github",
+        authenticated: false,
+        repo,
+        issues: [],
+        prs: [],
+        guidance: i18n._({
+          id: "GitHub CLI is not authenticated. Run `gh auth login`.",
+          comment: "Forge guidance where gh is installed but signed in to nothing; the command stays as it is",
+        }),
+      };
+    }
+    const [issues, prs] = await Promise.all([
+      this.run(
+        "gh",
+        ["issue", "list", "--json", GH_ITEM_FIELDS, "-R", repo, "--limit", "30"],
+        projectPath,
+      ),
+      this.run(
+        "gh",
+        ["pr", "list", "--json", GH_ITEM_FIELDS, "-R", repo, "--limit", "30"],
+        projectPath,
+      ),
+    ]);
+    return {
+      adapter: "github",
+      authenticated: true,
+      repo,
+      issues: issues.code === 0 ? toForgeItems(issues.stdout) : [],
+      prs: prs.code === 0 ? toForgeItems(prs.stdout) : [],
+      ...(issues.code !== 0 || prs.code !== 0
+        ? { guidance: i18n._({
+            id: "Some forge data could not be loaded from gh.",
+            comment: "Forge guidance where a gh listing failed; gh is the command's own name",
+          }) }
+        : {}),
+    };
+  }
+}

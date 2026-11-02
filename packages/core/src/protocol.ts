@@ -1,0 +1,2726 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// The Spex WebSocket protocol: every message between core and UI is
+// defined here and nowhere else (core-service-12). This module must
+// stay free of Node-only imports so the UI can consume it directly:
+// the record type is imported type-only from cligent and erased at
+// build time, and the one runtime value it takes from Playbook is a
+// pure-data module that imports nothing of its own.
+
+import { z } from "zod";
+import type { AgentCapabilities, ApprovalDecision, ApprovalRequest, BrowserSetupProgress, BrowserSetupResult } from "@sublang/cligent";
+import type { SessionRecord as RuntimeRecord } from "@sublang/playbook/session-assets";
+import { LANGUAGES, type Language } from "./language.js";
+
+export const PROTOCOL_VERSION = 31;
+
+/** The compile pipeline's phases and their human names, shared so the
+ * core's thread lines and the UI's band name a phase alike. */
+export { PIPELINE_PHASES, phaseLabel } from "./phases.js";
+
+/** An offered interface language (localization-1, DR-078). The
+ * resolution both shells share lives in the `language` entry point,
+ * which the UI imports as it imports this one. */
+export type { Language, ApprovalDecision, ApprovalRequest, AgentCapabilities, BrowserSetupProgress, BrowserSetupResult };
+
+export type TmuxPlayRecord = RuntimeRecord & {contextSeq?: number};
+
+/** The v1 stream also carries opaque objects. This header gates only
+ * presentation, never whether a stored envelope is valid. */
+export function hasPresentationHeader(record: TmuxPlayRecord): boolean {
+  return typeof record.type === "string" && Number.isFinite(record.timestamp);
+}
+
+/** App transfer limits; selected providers may impose lower limits. */
+export const MEDIA_MAX_FILE_BYTES = 100 * 1024 * 1024;
+export const MEDIA_CHUNK_BYTES = 64 * 1024;
+export const MEDIA_MAX_TURN_FILES = 16;
+export const MEDIA_MAX_TURN_BYTES = 256 * 1024 * 1024;
+export const mediaAssetSchema = z.object({
+  assetId: z.string().regex(/^sha256:[0-9a-f]{64}$/).transform((value) => value as `sha256:${string}`),
+  byteLength: z.number().int().nonnegative().max(MEDIA_MAX_FILE_BYTES),
+  mimeType: z.string().max(127).regex(/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/),
+  name: z.string().min(1).max(1024).refine((value) => value.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(value)).optional(),
+}).strict();
+/** Wire-validated form of Playbook's SessionAssetRef. */
+export type MediaAsset = z.infer<typeof mediaAssetSchema>;
+const KEY_SEGMENT = "[A-Za-z0-9_][A-Za-z0-9._-]*";
+/** A DNS label in lowercase: letters, digits and `-`, neither first nor
+ * last a hyphen. */
+const HOST_LABEL = "[a-z0-9](?:[a-z0-9-]*[a-z0-9])?";
+/** A host name: labels joined by single dots, none leading or trailing. */
+const HOST_NAME = `${HOST_LABEL}(?:\\.${HOST_LABEL})*`;
+/** A port from 1 to 65535, written without a leading zero. */
+const PORT = "(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])";
+const INSTANCE_SEGMENT = `@${HOST_NAME}(?:_${PORT})?`;
+/** An instance's folder under `workspace/` (DR-127): `@`, its host in
+ * lowercase, and `_<port>` where its origin names a port or its scheme
+ * is `http` — `@spex.sublang.ai`, `@127.0.0.1_4100`. */
+export const INSTANCE_FOLDER_PATTERN = new RegExp(`^${INSTANCE_SEGMENT}$`);
+/** A spex repository's key: its clone's path under `workspace/`, the
+ * name ending in `-spex` (storage-1, projects-10). A clone at an
+ * instance lies under that instance's folder, its key's first segment,
+ * with at least its group's or its namespace's segment before its name
+ * (`@spex.sublang.ai/acme/a-spex`, DR-127); every other segment is spelled as
+ * the Git host spells its paths — letters, digits, `.`, `_` and `-`,
+ * never starting with a dot or a hyphen — so a host's group or
+ * repository name stands as a segment unchanged, and only an instance's
+ * folder begins with `@`. A project is named by its spex repository's
+ * key. */
+export const REPOSITORY_KEY_PATTERN = new RegExp(`^(?:${INSTANCE_SEGMENT}/${KEY_SEGMENT}/)?(?:${KEY_SEGMENT}/)*${KEY_SEGMENT}-spex$`);
+export const repositoryKeySchema = z.string().regex(REPOSITORY_KEY_PATTERN);
+/** An instance a command names, by its origin as the Space state
+ * carries it (space-29, DR-127): the core reads it in any spelling and
+ * refuses one the home does not list. */
+const instanceOriginSchema = z.string().min(1);
+/** What a pick or a Place chooses at an instance (space-29): a spex
+ * repository it lists, to join, or a group there by its host id — your
+ * namespace there by none — to create `<name>-spex` in, `name` given
+ * without its `-spex` suffix. */
+const groupChoiceSchema = z.union([
+  z.object({ kind: z.literal("join"), instance: instanceOriginSchema, hostId: z.string().min(1) }).strict(),
+  z.object({ kind: z.literal("create"), instance: instanceOriginSchema, groupId: z.string().min(1).nullable(), name: z.string().min(1) }).strict(),
+]);
+
+/** A request in `spex.yaml` (environments-2): exactly one source. */
+export const environmentRequestSchema = z.union([
+  z.object({ kind: z.literal("registry"), version: z.string().min(1) }),
+  z.object({ kind: z.literal("path"), path: z.string().min(1) }),
+  z.object({ kind: z.literal("git"), git: z.string().min(1), rev: z.string().min(1), path: z.string().min(1).optional() }),
+]).and(z.object({
+  select: z.array(z.object({ artifact: z.string().min(1), language: z.string().min(1).optional() }).strict()).optional(),
+  alias: z.record(z.string(), z.string()).optional(),
+}));
+/** A canonical lowercase UUID, the identity of an intent (storage-4). */
+export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** The owners of application media (media-4): a spex repository's
+ * staging owner, an intent's own directory beside its file, an
+ * authoring session's beside its file — named by its instance
+ * (storage-23) — and a Playbook session. */
+export const mediaOwnerSchema = z.discriminatedUnion("kind", [
+  z.object({kind: z.literal("project"), id: repositoryKeySchema}).strict(),
+  z.object({kind: z.literal("intent"), projectId: repositoryKeySchema, intentId: z.string().regex(UUID_PATTERN)}).strict(),
+  z.object({kind: z.literal("draft"), projectId: repositoryKeySchema, id: z.string().regex(/^[a-z][a-z0-9_-]*$/), instance: z.string().regex(UUID_PATTERN)}).strict(),
+  z.object({kind: z.literal("session"), id: z.string().min(1)}).strict(),
+]);
+export type MediaOwner = z.infer<typeof mediaOwnerSchema>;
+export type MediaUploadOwner = Exclude<MediaOwner, {kind: "session"}>;
+/** One string naming an owner, for maps and gates. */
+export function mediaOwnerKey(owner: MediaOwner): string {
+  switch (owner.kind) {
+    case "project": return `project:${owner.id}`;
+    case "intent": return `intent:${owner.projectId}:${owner.intentId}`;
+    case "draft": return `draft:${owner.projectId}:${owner.id}`;
+    case "session": return `session:${owner.id}`;
+  }
+}
+/** The spex repository an application owner lives in. */
+export function mediaOwnerRepository(owner: MediaOwner): string | undefined {
+  return owner.kind === "project" ? owner.id : owner.kind === "session" ? undefined : owner.projectId;
+}
+export const mediaAttachmentsSchema = z.array(mediaAssetSchema).max(MEDIA_MAX_TURN_FILES)
+  .refine((files) => files.reduce((total, file) => total + file.byteLength, 0) <= MEDIA_MAX_TURN_BYTES);
+export interface MessageContent { text: string; attachments?: readonly MediaAsset[] }
+export interface MediaUploadState { uploadId: string; offset: number; asset?: MediaAsset }
+
+/** Live native authority, never reconstructed from the record stream. */
+export const approvalOwnerSchema = z.discriminatedUnion("kind", [
+  z.object({kind: z.literal("session"), id: z.string().min(1)}).strict(),
+  // A draft's call is its session instance's: a session made again
+  // under the id never shows or answers it (core-service-96).
+  z.object({kind: z.literal("draft"), id: z.string().regex(/^[a-z][a-z0-9_-]*$/), instance: z.string().regex(UUID_PATTERN)}).strict(),
+]);
+export type ApprovalOwner = z.infer<typeof approvalOwnerSchema>;
+export interface PendingApproval {
+  id: string;
+  owner: ApprovalOwner;
+  ownerLabel: string;
+  projectName?: string;
+  turnId: number;
+  actorId: string;
+  invocationId: string;
+  request: ApprovalRequest;
+}
+export interface ApprovalState {
+  generation: string;
+  revision: number;
+  pending: readonly PendingApproval[];
+}
+export interface ApprovalAcknowledgement {decision: ApprovalDecision}
+export interface ApprovalStateMessage {type: "approval.state"; state: ApprovalState}
+
+// ---------------------------------------------------------------------------
+// Shared shapes
+// ---------------------------------------------------------------------------
+
+export const adapterNameSchema = z.enum([
+  "claude",
+  "codex",
+  "gemini",
+  "kimi",
+  "opencode",
+]);
+export type AdapterName = z.infer<typeof adapterNameSchema>;
+
+export interface AgentPermissionsSummary {
+  mode?: string;
+  fileWrite?: string;
+  shellExecute?: string;
+  networkAccess?: string;
+  writablePaths?: string[];
+}
+
+/** One agent's inline settings (DR-019). Hand-written fields the UI
+ * does not surface (instruction, granular permissions) round-trip
+ * through merge-patch edits. */
+export interface AgentSummary {
+  adapter: AdapterName;
+  model?: string;
+  /** Adapter-scoped vocabulary; composition validates. */
+  effort?: string;
+  /** Adapter-scoped fast mode; the chip wears a lightning mark (DR-038). */
+  fastMode?: boolean;
+  /** The model the agent's subagents run on — a model, `inherit` for
+   * the agent's own, or `false` for none; absent, the delegation default
+   * (DR-093, DR-095). The chip never reads it. */
+  subagentModel?: string | false;
+  /** The effort every subagent runs at; absent, the agent chooses
+   * (DR-095). The chip never reads it. */
+  subagentEffort?: string;
+  instruction?: string;
+  permissions?: AgentPermissionsSummary;
+  /** Isolated browser on the execution host; omission is off. */
+  browser?: boolean;
+}
+
+/** A session player: an identity-bearing lane, with the roles that
+ * bind to it across every enabled playbook (DR-032). */
+export interface SessionPlayerSummary {
+  id: string;
+  agent: AgentSummary;
+  /** Human-readable identity: pinned model, else adapter. */
+  display: string;
+  /** `<playbook>.<role>` for every binding naming this player — the
+   * evidence that a lane is shared, and by whom. */
+  boundBy: string[];
+}
+
+/** One role's binding: which player answers it, and that role's own
+ * tuning. `false` means the provider's current default; absent means
+ * the player's own (DR-032). */
+export interface RoleBindingSummary {
+  playerId: string;
+  model?: string | false;
+  effort?: string | false;
+  fastMode?: boolean;
+  subagentModel?: string | false;
+  subagentEffort?: string | false;
+  /** What this role effectively runs, after inheritance. */
+  display: string;
+}
+
+/** One agent's settings for one session, above everything the config
+ * resolves (DR-067). Encoded as a role binding's tuning is: a string
+ * pins, `false` takes the provider's current default, and an absent
+ * key leaves the configured value in place. */
+export interface SessionAgentSettings {
+  model?: string | false;
+  /** The model the agent's subagents run on (DR-093). */
+  subagentModel?: string | false;
+  effort?: string | false;
+  /** The effort every subagent runs at; `false`, the agent chooses
+   * (DR-095). */
+  subagentEffort?: string | false;
+  fastMode?: boolean;
+  /** Explicit browser capability for the next turn; omission inherits configuration. */
+  browser?: boolean;
+}
+
+/** A session's own agent settings, keyed by agent id — the reserved
+ * `captain`, or one of the session's bound players (DR-067). */
+export type SessionAgentSettingsMap = Record<string, SessionAgentSettings>;
+
+/** The reserved agent id naming the Captain wherever an id addresses
+ * either kind of agent; composition refuses it as a player id. */
+export const CAPTAIN_AGENT_ID = "captain";
+
+export interface PlaybookSummary {
+  id: string;
+  from: string;
+  command: string;
+  intent: string;
+  roles: Record<string, RoleBindingSummary>;
+}
+
+export interface PlaybookArtifacts {
+  /** The workflow markdown the playbook was compiled from. */
+  source: string | null;
+  /** The GEARS spec items. */
+  gears: string | null;
+  /** The gears markdown parsed into the item shape the spec outline's
+   * rows read (playbook-library-24); absent when the parse yields no
+   * item. */
+  gearsItems?: SpecFileInfo;
+  /** The compiled XState FSM module code. */
+  fsm: string | null;
+  /** Every state id of the FSM, when derivable. */
+  stateIds: string[] | null;
+  /** The drawable machine graph (playbook-library-36, DR-028), null
+   * when the machine cannot be loaded. */
+  machine: MachineGraph | null;
+  /** Stage names that could not be located. */
+  missing: string[];
+}
+
+/** The machine graph the run view draws (DR-028): nodes and stable
+ * edges derived from the hosted machine's own config. */
+export interface MachineGraphNode {
+  id: string;
+  parent?: string;
+  kind: "state" | "final";
+  /** The player role the state invokes, as the machine names it. */
+  role?: string;
+  /** The state's own description, for human tooltips (DR-010 §2). */
+  description?: string;
+  tags: string[];
+}
+
+export interface MachineGraphEdge {
+  /** owner::event::branch::target — guarded siblings stay distinct. */
+  id: string;
+  from: string;
+  to: string;
+  /** Event name; "" names the always transition. */
+  event: string;
+}
+
+export interface MachineGraph {
+  initial: string;
+  nodes: MachineGraphNode[];
+  edges: MachineGraphEdge[];
+}
+
+export interface ConfigSummary {
+  path: string;
+  captain: AgentSummary;
+  /** The session roster, in first-reference order (DR-032). */
+  players: SessionPlayerSummary[];
+  playbooks: PlaybookSummary[];
+  notifications?: Record<string, string>;
+  theme?: string;
+}
+
+export type ConfigState =
+  | { status: "valid"; summary: ConfigSummary; seeded: boolean; reseeded?: boolean; missingPlayers?: MissingPlayer[] }
+  | { status: "invalid"; path: string; errors: string[] }
+  | { status: "missing"; path: string };
+
+/** A player a project's config names for a role that your own group's
+ * roster lacks (core-service-2, settings-46): reported before a session
+ * of that project starts, and offered to add in Settings. */
+export interface MissingPlayer {
+  player: string;
+  /** The spex repository whose config names it. */
+  repository: string;
+  roles: { playbook: string; role: string }[];
+}
+
+// ---------------------------------------------------------------------------
+// Environments (environments-14, environments-17, DR-104)
+// ---------------------------------------------------------------------------
+
+/** Registry account state contains no credential or collaboration metadata. */
+export interface RegistryState {
+  origin: string;
+  displayName: string;
+  account: { id: string; login: string } | null;
+  signIn: { phase: "idle" } | { phase: "running"; flow: "browser"; url: string } | { phase: "running"; flow: "device"; userCode: string; verificationUri: string };
+  error: string | null;
+}
+
+/** One spex repository's environment as the Playbooks surface lists it. */
+export interface EnvironmentState {
+  repository: string;
+  language: string | null;
+  requests: Record<string, EnvironmentRequestSummary>;
+  packages: EnvironmentPackage[];
+  /** The lock is stale: what changed, phrased for the reader; null when current. */
+  stale: string[] | null;
+  /** Resolution failed: the requirements in conflict, by package; null otherwise. */
+  conflicts: { name: string; requirements: { by: string; requirement: string }[] }[] | null;
+  busy: "resolving" | "installing" | "publishing" | null;
+  /** The last operation's failure, phrased for the reader; null when none. */
+  error: string | null;
+  /** The registry packages that failure's registry refused — answering
+   * not found, unauthenticated or forbidden, as for want of a grant
+   * (environments-12) — present only while that failure stands. */
+  refused?: string[];
+  /** The last publish from this spex repository's working folder that
+   * succeeded: what the registry now holds and its page there
+   * (playbook-library-93). */
+  published?: { name: string; version: string; url: string } | null;
+  /** The folder a request by path is relative to on this device
+   * (environments-2): the paired working folder, or your own group's
+   * clone; null where none is paired. */
+  pathRoot: string | null;
+  /** Collaboration and Git-source brokerage origin, independent of packages. */
+  instance?: string | null;
+  /** Package destination; legacy manifests preserve their previous routing. */
+  registry?: { origin: string; legacy: boolean };
+  /** For a project, whether its `spex.yaml` and `spex.lock` are both in
+   * the code's `HEAD` in its working folder, false while either is not —
+   * untracked, added but uncommitted, or no repository or commit at all —
+   * so the environment is this device's alone; null for your own
+   * group's, which syncs with its clone, and for a project whose working
+   * folder this device does not hold (environments-14,
+   * environments-26). */
+  committed?: boolean | null;
+  /** The built-in spec package this app ships, where the lock selects an
+   * older release and the requirement `spex.yaml` requests it at admits
+   * the shipped one; absent otherwise. The lock stays until the reader
+   * resolves again (environments-11). */
+  builtinUpdate?: { shipped: string; locked: string };
+  /** What the core's last export of this environment left out, where
+   * that export went into the working folder now paired; absent where it
+   * wrote everything or went into another folder (environments-14): each skill a folder
+   * the reader placed under its name kept out of an agent folder, that
+   * folder as the agent table names it, and each spec package an
+   * exported artifact of which it did not find on this device. */
+  unexported?: { skipped: { name: string; folder: string }[]; missing: string[] };
+}
+export type EnvironmentRequest = (
+  | { kind: "registry"; version: string }
+  | { kind: "path"; path: string }
+  | { kind: "git"; git: string; rev: string; path?: string }
+) & { select?: { artifact: string; language?: string }[]; alias?: Record<string, string> };
+/** Display-only sources: a Git label is never accepted as a command locator. */
+export type EnvironmentRequestSummary = Readonly<(
+  | { kind: "registry"; version: string }
+  | { kind: "path"; path: string }
+  | { kind: "git"; repository: string; rev: string; path?: string }
+) & { select?: readonly { artifact: string; language?: string }[]; alias?: Readonly<Record<string, string>> }>;
+export interface EnvironmentPackage {
+  name: string;
+  version: string | null;
+  source: { kind: "registry" | "path" | "git" | "builtin"; detail: string };
+  direct: boolean;
+  requiredBy: string[];
+  artifacts: {
+    id: string;
+    kind: "source" | "spec" | "skill" | "playbook" | "applet";
+    language: string | null;
+    fallback: boolean;
+    /** The release provides it — its `provides` absent or listing its
+     * kind, no sibling naming it in `from` and no sibling of another kind
+     * naming it in `requires` (environments-1); one not provided is its
+     * sibling's support, installed and placed nowhere (environments-6).
+     * True for every artifact while the package's manifest is not here
+     * to read. */
+    provided: boolean;
+  }[];
+  exports: { name: string; artifact: string }[];
+  installed: boolean;
+  /** A path source absent on this device: its path, else null. */
+  missingPath: string | null;
+  /** Where the package's provided spec stands in a project's environment
+   * (environments-14); absent where it provides no spec, where its files
+   * are not here as the lock locks them, where no copy is written under
+   * `specs/` yet — the next install writes it — and in your own group's
+   * environment, whose spec is placed as a skill named in `exports`
+   * (environments-8). */
+  placement?: {
+    /** The provided spec's placement under `specs/` (environments-41). */
+    spec?: {
+      /** "placed": the package's copy stands at `path`; "edited": the
+       * file at `path` is neither the derivation nor the copy last
+       * recorded, so it is left standing as the reader's; "blocked": a
+       * file of its basename under `specs/` that is not this package's
+       * copy — or the copy of an earlier `<org>` placing the same `<pkg>`
+       * — holds the place; "no-specs": the root holds no `specs/`, so
+       * nothing is placed until it is scaffolded (environments-41). */
+      state: "placed" | "edited" | "blocked" | "no-specs";
+      /** Relative to the environment's root: the copy's
+       * `specs/packages/<pkg>.md` while placed or edited, the blocking
+       * file while blocked, and the path it would take while the root
+       * holds no `specs/` (environments-41). */
+      path: string;
+      /** Each package, `<org>/<pkg>`, whose spec the derivation's removed
+       * links wait for, with the count of links waiting for it; empty
+       * where none wait (environments-41). */
+      waiting: { name: string; count: number }[];
+      /** While edited, the version of the newer release waiting under
+       * `.spex/` to be merged; absent where none waits (environments-14). */
+      waitingVersion?: string;
+    };
+  };
+}
+
+/** A playbook an environment exports, as the Playbooks surface lists it
+ * (playbook-library-1). */
+export interface PlaybookAvailability {
+  /** The exported name: the playbook's id or its alias. */
+  name: string;
+  id: string;
+  command: string | null;
+  intent: string | null;
+  roles: string[];
+  package: string;
+  version: string;
+  source: "registry" | "path" | "git" | "builtin";
+  /** The spex repository whose environment exports it. */
+  repository: string;
+  /** Where it is enabled: the project's config, your own group's, or neither. */
+  enabled: ("project" | "own")[];
+  /** The module is present on this device (a path source may be missing). */
+  present: boolean;
+  /** Each enabling config's role bindings: a project's names players
+   * alone, your own group's may carry tuning; `display` says what the
+   * binding effectively runs (playbook-library-1). */
+  bindings?: { project?: Record<string, RoleBindingSummary>; own?: Record<string, RoleBindingSummary> };
+  /** The installed playbook artifact's folder on this device, or the
+   * path source's (playbook-library-29). */
+  folder?: string;
+}
+
+/** A configured entry failing validation (playbook-library-2): an
+ * unresolved required role, a duplicate command, or a playbook no
+ * environment of the session exports. */
+export interface InvalidPlaybookEntry {
+  config: "project" | "own";
+  playbook: string;
+  /** The specific failure, phrased for the reader. */
+  reason: string;
+}
+
+/** What `environment.publish` would upload (playbook-library-93). */
+export interface PublishDestination { origin: string; name: string }
+export interface PublishedPackage { instance: PublishDestination; name: string; version: string; url: string }
+export type EnvironmentMutationResult = { accepted: true } | { completed: true };
+/** What a dry run of `environment.request` replies (environments-15):
+ * the name the request takes — the one sent, else the one its folder's
+ * `meta.yaml` gives — and the version that `meta.yaml` gives, each null
+ * where none reads. */
+export interface RequestPreview { name: string | null; version: string | null }
+
+export interface PublishPreview {
+  instance: PublishDestination;
+  name: string;
+  version: string;
+  /** Release paths, in upload order. */
+  files: string[];
+}
+
+/** A project: a working folder paired with a spex repository
+ * (storage-6, projects-10). */
+export interface ProjectInfo {
+  /** The spex repository's key, e.g. `alice/a-spex`. */
+  id: string;
+  /** The working folder on this device. */
+  path: string;
+  name: string;
+  registeredAt: number;
+  /** The spex repository holding the project's records: its key, its
+   * name (`<name>-spex`), its group's path, and whether that group is
+   * your own. */
+  repository: { key: string; name: string; group: string; own: boolean };
+}
+
+/** Playbook's closed failure-code list, re-exported here unchanged
+ * rather than copied into a client (core-service-12, DR-076): the
+ * runtime owns the list, so a code it adds reaches the phrase
+ * catalogue as a failing test rather than as silence. */
+export { PLAYBOOK_FAILURE_CODES, type PlaybookFailureCode } from "@sublang/playbook/runtime";
+
+/** The structured cause the runtime attaches to a failure it decides
+ * (core-service-49, DR-075): `code` from Playbook's closed list and
+ * `evidence` the bounded JSON object that code carries. The core
+ * neither interprets nor completes it — it validates the shape and
+ * passes it on, so a client's phrase catalogue is the only place a
+ * code becomes words. A code outside the list still reads, since a
+ * stored record outlives the runtime that wrote it. */
+export interface FailureCause {
+  code: string;
+  evidence?: Record<string, unknown>;
+}
+
+/** One control a parked run advertises (core-service-32, DR-074): its
+ * id names it to `session.control`, its label is the Boss-facing text
+ * the turn would carry, and its standing is what the runtime says
+ * activating it would do — absent while the runtime reports none. */
+export interface ParkedRunAction {
+  id: string;
+  label: string;
+  standing?: "ready" | "no-op" | "blocked";
+  reason?: string;
+}
+
+/** A run standing parked on the Boss, with the controls read while the
+ * shell was still held at settlement (core-service-32, DR-074). */
+export interface ParkedRun {
+  reason: "failure" | "question";
+  actions: ParkedRunAction[];
+  ending?: { id: string; label: string };
+}
+
+/** The topic of the record a restore leaves in the session's stream
+ * (core-service-82, DR-088). Playbook's report moves no traced state,
+ * so the core writes the position the restore settled, and the run
+ * view and the ledger read the restored park from it. */
+export const RESTORED_TOPIC = "spex.session.restored";
+
+/** The topic of the record a restore leaves before it runs
+ * (core-service-82, DR-088), carrying the saved input: it marks the
+ * turn that follows with that input as the restore's report, so the
+ * report reads as one even where the core stopped before recording
+ * its position, and the run view draws the saved message once. */
+export const RESTORING_TOPIC = "spex.session.restoring";
+
+/** One run engaged at the restored position, root to leaf. */
+export interface RestoredRun {
+  sessionId: string;
+  playbookId: string;
+  depth: number;
+  parentSessionId?: string;
+  /** The run's state, shaped as a trace reports one:
+   * `{value, stateId, tags, status, …}`. */
+  state: unknown;
+  pendingBossQuestions: unknown[];
+  /** The structured cause the run's failure state carries, where its
+   * checkpoint records one (DR-075). */
+  cause?: FailureCause;
+}
+
+/** The restored position: every engaged run, root to leaf; none is the
+ * Captain back in chat. */
+export interface RestoredPosition {
+  runs: RestoredRun[];
+}
+
+export interface SessionInfo {
+  id: string;
+  projectId: string;
+  projectPath: string;
+  createdAt: number;
+  /** The runtime is held: a turn is in flight or settling (DR-051). */
+  live: boolean;
+  /** Includes checkpoint settlement after the runtime finishes. */
+  turnActive?: boolean;
+  /** Another CLI/host owns this session, or its ownership is unprovable. */
+  externalWriter?: "active" | "unknown";
+  /** Last activity — the checkpoint's last settlement — null while live. */
+  endedAt: number | null;
+  /** The session's bound player roster, in config order (DR-032). */
+  players: { id: string; adapter: AdapterName; model?: string; fastMode?: boolean }[];
+  /** Panes visible at session start, before any player_view_changed record. */
+  initialVisible: string[];
+  /** Legacy host label retained for older history; never recovery authority. */
+  foreign?: true;
+  /** The checkpoint and current path/config permit continuation; admission checks again. */
+  continuable?: boolean;
+  continuationReason?: string;
+  /** The label of the runtime the session is assigned to, where that is
+   * another runtime (core-service-32, DR-134): the session is then not
+   * continuable here, its reason "Runs on <label>", and it carries no
+   * `recovery`. Absent where it runs here or names no runtime. */
+  runsOn?: string;
+  /** Interrupted work awaiting the Boss (core-service-32): the saved
+   * input, and whether Playbook's shared discard predicate allows
+   * Discard — nothing recorded, no abandonment, unchanged repository
+   * evidence (DR-088). The client never guesses it. */
+  recovery?: { state: "uncertain"; input: string; discardable: boolean };
+  /** The session's own words: its first Boss turn, absent when the
+   * session held no turn (core-service-32). */
+  title?: string;
+  /** The text of the Boss turn that opened the work the session is
+   * doing — its latest turn, traced back past every answer sent while a
+   * question stood, as its stand-in entries are titled (core-service-32,
+   * DR-119) — absent when the session held no turn. */
+  workTitle?: string;
+  /** Turns this session held. */
+  turns: number;
+  /** Whether a failure still stands (core-service-32, DR-061): a run
+   * remains parked on a failure, or a failure was recorded in a turn
+   * no later-started turn has since settled without one. An earlier
+   * turn's failure stops standing once a later turn settles clean. */
+  failed: boolean;
+  /** Recorded cost, when any usage carried one. */
+  costUsd?: number;
+  /** Completed prompt-to-finish time per measured agent. Absent when
+   * the stored stream is incomplete or holds no completed call. */
+  agentActiveMs?: Record<string, number>;
+  /** The model each agent's runtime reported for its latest call to
+   * report one, with the settings that call began under
+   * (core-service-115, DR-091). Absent when the stored stream is
+   * incomplete or no agent's report can be read. */
+  agentReportedModels?: Record<string, AgentReportedModel>;
+  /** This session's own agent settings, absent when it holds none. */
+  agentSettings?: SessionAgentSettingsMap;
+  /** The controls of a run standing parked on the Boss, absent when
+   * none stands (core-service-32). */
+  parked?: ParkedRun;
+  /** Set when a record could not be durably appended: the persisted
+   * stream is complete only up to this sequence, so served history is
+   * never presented as complete when it is not (DR-036). */
+  streamIncompleteAfterSeq?: number;
+}
+
+/** What an agent's runtime named for a call, and what the agent was
+ * set to run when that call began (core-service-115, DR-091). */
+export interface AgentReportedModel {
+  /** The runtime's own words for the model, as it sent them. */
+  model: string;
+  /** The adapter and model setting that call began under, read from the
+   * execution context the stream recorded for it: a string pins, `false`
+   * takes the provider's default. Effort and fast mode are not kept:
+   * neither changes which model the runtime runs. */
+  settings: { adapter: string; model: string | false };
+}
+
+/** One row of the runtime's model catalog. Every word in it — the
+ * name, the ids, the description — is the runtime's own (DR-091). */
+export interface AgentModelOption {
+  id: string;
+  name: string;
+  resolvedModel?: string;
+  /** The runtime's own description of the model, where it gives one. */
+  description?: string;
+  effortValues?: readonly string[];
+  defaultEffort?: string;
+  fastModeSupported?: boolean;
+}
+
+export interface AgentOptions {
+  adapter: AdapterName;
+  effortValues: readonly string[];
+  fastModeSupported: boolean;
+  /** Whether cligent serves a subagent model for this adapter (DR-093). */
+  subagentModelSupported: boolean;
+  /** The efforts a subagent may run at: the adapter's effort values less
+   * its orchestration values, empty where it serves no subagent model
+   * (DR-095). */
+  subagentEffortValues: readonly string[];
+  discovery: {
+    status: "available";
+    models: readonly AgentModelOption[];
+    unreportedEffortValues?: readonly string[];
+    /** The model the runtime runs when none is configured, from its
+     * own effective configuration; it may be absent from `models`. */
+    defaultModel?: string;
+  }
+    | { status: "unavailable"; reason: string };
+}
+
+export interface ReadinessEntry {
+  adapter: AdapterName;
+  /** true = ready, false = not ready, null = no preflight rule for
+   * this adapter (verify sign-in yourself). */
+  ready: boolean | null;
+  /** Unmet requirement, present when ready is false. */
+  requirement?: string;
+  /** Positions using this adapter: "captain" or `<playbook>.<role>`. */
+  usedBy: string[];
+  /** Whether the embedded runtime declares fast mode for this adapter
+   * (DR-038); the editor offers the switch only then. */
+  fastModeSupported: boolean;
+  /** Whether cligent serves a subagent model for this adapter (DR-093). */
+  subagentModelSupported: boolean;
+  /** On a team server's seat alone (settings-49): the adapter's
+   * credential class and its phrase. */
+  credential?: AdapterCredential;
+}
+
+/** A seat's credential classes (settings-49): the member's own, the
+ * administrator's shared sign-in, a shared file that cannot be read, a
+ * credential the agent's status command reports expired or refused, or
+ * no form set. */
+export type CredentialClass = "own" | "shared" | "unreadable" | "expired" | "none";
+
+export interface AdapterCredential {
+  class: CredentialClass;
+  /** The class in the reader's words; for `none`, how to set one. */
+  phrase: string;
+}
+
+/** The credentials a seat's member placed (settings-48), no secret
+ * among them: each code host with its username, if any, and each agent
+ * with the names of the forms set. */
+export interface CredentialList {
+  hosts: { name: string; username?: string }[];
+  agents: { name: AdapterName; names: string[] }[];
+}
+
+/** What a run reported spending. `costSources` names every provenance
+ * the summed cost came from — a cost is only as trustworthy as its
+ * weakest source, so the label travels with the number (DR-032). */
+export interface UsageRollup {
+  inputTokens: number;
+  outputTokens: number;
+  toolUses: number;
+  totalCostUsd: number;
+  costSources: string[];
+}
+
+export interface StoredRecord {
+  seq: number;
+  record: TmuxPlayRecord;
+  /** For a player record inside a resolved call, the role that call
+   * served (DR-032). One lane answers several roles over a session,
+   * so without this a shared player reads as one voice talking to
+   * itself. Absent where the trace named no resolved player. */
+  role?: string;
+}
+
+export interface RepoStatusInfo {
+  branch: string;
+  dirty: boolean;
+  ahead: number;
+  behind: number;
+  /** Client replies omit a remote before the instance's Git origin is
+   * known and at that origin; an external HTTP(S) URL has no user. */
+  originUrl?: string;
+}
+
+export interface ForgeItem {
+  number: number;
+  title: string;
+  url: string;
+  author?: string;
+  updatedAt?: string;
+  labels?: string[];
+}
+
+export interface ForgeState {
+  adapter: "github";
+  /** null: adapter tool missing/unbound; false: not authenticated. */
+  authenticated: boolean | null;
+  /** owner/name when the origin remote maps to the forge. */
+  repo?: string;
+  issues: ForgeItem[];
+  prs: ForgeItem[];
+  /** Setup guidance when data cannot be served. */
+  guidance?: string;
+  /** Epoch milliseconds when the lists were fetched from the forge, so
+   * every reader shows the data's age rather than its own read's
+   * (dashboard-14); absent until a fetch happened. */
+  at?: number;
+}
+
+// ---------------------------------------------------------------------------
+// The intent ledger (DR-035)
+// ---------------------------------------------------------------------------
+
+export type IntentSourceKind = "issue" | "pr" | "record" | "chat";
+
+/** Where an intent came from — provenance, never mirrored state. */
+export interface IntentSource {
+  kind: IntentSourceKind;
+  /** Issue/PR number as text, a record id like "IR-21", or a session
+   * id for chat capture. */
+  ref: string;
+  url?: string;
+  /** The forge labels the source carried at capture — provenance, so a
+   * fixed bug is known as one without a later forge read (DR-038). */
+  labels?: string[];
+}
+
+/** The signed-in account that captured an intent (storage-4). */
+export interface IntentAuthor {
+  login: string;
+  displayName: string | null;
+}
+
+/** The runtime a record is assigned to (DR-134): one core on one home,
+ * named by the home's `device`, with a label for display alone — the
+ * server's name on a seat, the host name elsewhere. */
+export interface AssignedRuntime {
+  device: string;
+  label: string;
+}
+
+/** One stored intent: a staged Boss turn, one file of its project's
+ * spex repository (DR-035, DR-103). There is no stored state, no rank
+ * and no link — everything visible derives, and the queue is ordered
+ * by age. */
+export interface IntentInfo {
+  id: string;
+  projectId: string;
+  /** The future Boss turn; its first line is the display title. */
+  text: string;
+  attachments?: readonly MediaAsset[];
+  source?: IntentSource;
+  /** The account that captured it at its project's instance; none where
+   * the project has no instance or the home is not signed in there
+   * (core-service-42, core-service-52). */
+  author?: IntentAuthor;
+  /** The runtime that captured it and alone runs it; absent in a file
+   * written before runtimes were recorded (core-service-42,
+   * core-service-52). */
+  runtime?: AssignedRuntime;
+  /** The capture time, which orders the queue (core-service-107). */
+  createdAt: number;
+  /** Stamped when the dispatched turn starts; re-written by a later
+   * dispatch. An aborted dispatch releases by derivation — the stamp
+   * stays as history. */
+  dispatched?: { sessionId: string; turnId: number; at: number };
+  closedAt?: number;
+  closedAs?: "done" | "dropped";
+}
+
+export type IntentState =
+  | "queued"
+  | "working"
+  | "interrupted"
+  | "finished"
+  | "done"
+  | "dropped";
+
+/** Basic run stats folded from the intent's turn range (DR-035). */
+export interface IntentStats {
+  /** Reviewer-role player calls the range held; absent when zero. */
+  reviewRounds?: number;
+  turns: number;
+  elapsedMs?: number;
+}
+
+/** Why a project's next queued intent is or is not manually startable
+ * (DR-077). Presence on a derived row also identifies that row as the
+ * project's oldest queued intent (core-service-107). */
+export type QueueStanding =
+  | "after-current-work"
+  | "failure-park"
+  | "question-park"
+  | "failed"
+  | "stopped"
+  | "manual-ready";
+
+export interface QueueSchedule {
+  standing: QueueStanding;
+  manualStart: boolean;
+  /** The runtime's structured cause for a failure standing, if known. */
+  cause?: FailureCause;
+}
+
+/** An open intent with its derived state (DR-035). */
+export interface DerivedIntent {
+  intent: IntentInfo;
+  state: IntentState;
+  /** Present once dispatched (working/interrupted/finished). */
+  stats?: IntentStats;
+  /** Why an interrupted intent stands stopped on the Boss. */
+  reason?: "question" | "failure";
+  /** The label of another runtime its work runs on (core-service-107,
+   * DR-134): the runtime the intent is assigned to, or — for one naming
+   * none — the runtime of the session holding its dispatch, whose stop
+   * or abort is that runtime's to read. Such a row keeps its place by
+   * age, is never next here and offers no manual start. */
+  runsOn?: string;
+  /** Present on exactly the project's oldest queued row this runtime
+   * may run (core-service-107). */
+  next?: QueueSchedule;
+}
+
+/** One attention entry: an interrupted or finished intent, or a
+ * session standing in where no intent is bound (DR-035). */
+export interface AttentionEntry {
+  band: "interrupted" | "finished";
+  /** Interruption reason, or "finish" / "review" for band two —
+   * "review" names the un-ledgered turn the reader has not read yet.
+   * Every kind here has an act that ends it (DR-066). */
+  kind: "question" | "failure" | "finish" | "review";
+  /** Set on a failure whose run stands parked in its failure state:
+   * the conversation carries Retry and Drop, so the row can name the
+   * reader's next step honestly (dashboard-53, DR-062). */
+  parked?: true;
+  /** The parked failure's own cause, where the runtime attached one
+   * (core-service-49, DR-075): the row phrases it rather than saying
+   * only that something failed. */
+  cause?: FailureCause;
+  /** Absent for session stand-in entries. */
+  intentId?: string;
+  /** The intent's title, or, for a session stand-in, the text of the
+   * Boss turn that opened the work the entry stands for — never an
+   * answer sent while a question stood (DR-119). */
+  title: string;
+  projectId: string;
+  sessionId: string;
+  /** The turn the entry points at, when one is known. */
+  turnId?: number;
+  /** When the condition began, ms epoch — longest waiting first. */
+  since: number;
+  stats?: IntentStats;
+}
+
+/** The one cross-project ledger fold (DR-035): every open intent with
+ * its derived state, the two-band attention queue, and the badge. */
+export interface LedgerState {
+  intents: DerivedIntent[];
+  attention: AttentionEntry[];
+  badge: number;
+}
+
+/** One closed intent, as History pages serve it (DR-035). */
+export interface ClosedIntent {
+  intent: IntentInfo;
+  stats?: IntentStats;
+}
+
+// ---------------------------------------------------------------------------
+// Client → core commands (validated per CORE-13)
+// ---------------------------------------------------------------------------
+
+const id = z.string().min(1);
+
+/** One agent's inline settings as written to the config (DR-019).
+ * Full-block writes carry every field so nothing hand-written drops;
+ * merge patches change only the provided keys. */
+export const agentBlockSchema = z.object({
+  adapter: z.string().min(1),
+  model: z.string().optional(),
+  // A model, `inherit`, or `false` to send none (DR-095).
+  subagentModel: z.union([z.string(), z.literal(false)]).optional(),
+  subagentEffort: z.string().optional(),
+  effort: z.string().optional(),
+  instruction: z.string().optional(),
+  browser: z.boolean().optional(),
+  fastMode: z.boolean().optional(),
+  permissions: z
+    .object({
+      mode: z.string().optional(),
+      fileWrite: z.string().optional(),
+      shellExecute: z.string().optional(),
+      networkAccess: z.string().optional(),
+      writablePaths: z.array(z.string()).optional(),
+    })
+    .optional(),
+});
+export type AgentBlockInput = z.infer<typeof agentBlockSchema>;
+
+/** A merge patch over an existing agent block: provided keys change,
+ * absent keys survive (adapter may change; retired keys never pass).
+ * An explicit null unsets that key, so a pinned model or effort can
+ * return to the adapter's default (DR-019). */
+export const agentPatchSchema = z.object({
+  adapter: z.string().min(1).optional(),
+  model: z.string().nullable().optional(),
+  subagentModel: z.union([z.string(), z.literal(false)]).nullable().optional(),
+  subagentEffort: z.string().nullable().optional(),
+  effort: z.string().nullable().optional(),
+  fastMode: z.boolean().nullable().optional(),
+  instruction: z.string().nullable().optional(),
+  browser: z.boolean().nullable().optional(),
+  permissions: z
+    .object({
+      mode: z.string().nullable().optional(),
+      fileWrite: z.string().optional(),
+      shellExecute: z.string().optional(),
+      networkAccess: z.string().optional(),
+      writablePaths: z.array(z.string()).optional(),
+    })
+    .nullable()
+    .optional(),
+});
+
+/** A session player id: lowercase segments, dots by convention. */
+export const playerIdSchema = z
+  .string()
+  .regex(/^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)*$/);
+
+export const configEditOpSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("captain.set"), patch: agentPatchSchema }),
+  z.object({
+    kind: z.literal("notifications.set"),
+    prefs: z.record(z.string(), z.string()),
+  }),
+  z.object({ kind: z.literal("theme.set"), theme: z.string().nullable() }),
+  z.object({
+    kind: z.literal("player.set"),
+    playerId: playerIdSchema,
+    patch: agentPatchSchema,
+  }),
+  z.object({ kind: z.literal("player.delete"), playerId: playerIdSchema }),
+  z.object({
+    kind: z.literal("playbook.role.bind"),
+    playbookId: z.string().min(1),
+    role: z.string().min(1),
+    playerId: playerIdSchema,
+    // A concrete value pins, false selects the provider default, null
+    // clears the override so the role inherits the player (DR-032).
+    model: z.union([z.string().min(1), z.literal(false)]).nullable().optional(),
+    subagentModel: z.union([z.string().min(1), z.literal(false)]).nullable().optional(),
+    subagentEffort: z.union([z.string().min(1), z.literal(false)]).nullable().optional(),
+    effort: z.union([z.string().min(1), z.literal(false)]).nullable().optional(),
+    // Fast mode is literal: false disables; null inherits the player.
+    fastMode: z.boolean().nullable().optional(),
+  }),
+  z.object({
+    kind: z.literal("playbook.option.set"),
+    playbookId: z.string().min(1),
+    key: z.string().min(1),
+    value: z.unknown(),
+  }),
+  z.object({ kind: z.literal("playbook.delete"), playbookId: z.string().min(1) }),
+  z.object({
+    kind: z.literal("playbook.add"),
+    playbookId: z.string().min(1),
+    /** A legacy module specifier; an entry enabling a playbook an
+     * environment exports carries none (DR-104), and a project's file
+     * refuses one. */
+    from: z.string().min(1).optional(),
+    roles: z.record(z.string(), playerIdSchema),
+    options: z.record(z.string(), z.unknown()).optional(),
+  }),
+]);
+export type ConfigEditOpInput = z.infer<typeof configEditOpSchema>;
+
+/** A playbook id an authoring session or a compile names: the spec
+ * package, the file and the /command, so an Agent Skills name —
+ * lowercase letters and digits in hyphen-joined runs, at most 64
+ * characters (playbook-library-51, DR-104). */
+export const playbookIdSchema = z.string().max(64).regex(/^[a-z0-9]+(-[a-z0-9]+)*$/);
+/** An authoring session's id is its playbook's (DR-058). */
+export const draftIdSchema = playbookIdSchema;
+/** The license a new spec package names: an SPDX expression on one
+ * line, never empty or edged with spaces (playbook-library-51); the
+ * core refuses another naming the rule (core-service-96), as it does
+ * an org outside the manifest's name rule (environments-1). */
+export const PACKAGE_LICENSE_PATTERN = /^\S(?:[^\r\n]*\S)?$/;
+/** The instance an authoring session's file records (storage-23): every
+ * command on an existing session names the one it read (core-service-96). */
+const draftInstanceSchema = z.string().regex(UUID_PATTERN);
+
+/** Session channels carry a session's records; the draft channel
+ * carries one draft's authoring records (DR-058). Drafts never enter
+ * session folds — history, ledger, attention, titles. */
+export const channelSchema = z.union([
+  z.object({
+    kind: z.enum(["session", "debug"]),
+    sessionId: z.string().min(1),
+  }),
+  z.object({ kind: z.literal("draft"), draftId: z.string().min(1) }),
+]);
+export type Channel = z.infer<typeof channelSchema>;
+
+/** A sync's two sides in the reader's words (space-27): this device
+ * or the remote. */
+const spaceChoiceSchema = z.enum(["mine", "remote"]);
+export type SpaceChoice = z.infer<typeof spaceChoiceSchema>;
+
+/** The home's interface language, or null for the reader's system
+ * (core-service-109): a code no catalog holds is a validation error,
+ * so no client can store a language the interface cannot speak. */
+const languageChoiceSchema = z.enum(LANGUAGES).nullable();
+
+const capabilityAgentSchema = agentBlockSchema.extend({adapter: adapterNameSchema});
+const capabilityContextSchema = mediaOwnerSchema.refine((owner) => owner.kind !== "session");
+
+export const commandSchema = z.discriminatedUnion("type", [
+  z.object({type: z.literal("approval.list"), id}).strict(),
+  z.object({type: z.literal("approval.respond"), id, generation: z.string().uuid(),
+    requestId: z.string().uuid(), owner: approvalOwnerSchema,
+    decision: z.enum(["allow_once", "deny"])}).strict(),
+  z.object({ type: z.literal("agent.capabilities"), id, agent: capabilityAgentSchema,
+    context: capabilityContextSchema.optional() }).strict(),
+  z.object({ type: z.literal("browser.prepare"), id, operationId: z.string().uuid(), agent: capabilityAgentSchema,
+    context: capabilityContextSchema.optional() }).strict(),
+  z.object({ type: z.literal("browser.cancel"), id, operationId: z.string().uuid() }).strict(),
+  z.object({ type: z.literal("media.begin"), id, uploadId: z.string().uuid(),
+    owner: mediaOwnerSchema.refine((owner) => owner.kind !== "session"),
+    name: mediaAssetSchema.shape.name.unwrap(), mimeType: mediaAssetSchema.shape.mimeType,
+    byteLength: mediaAssetSchema.shape.byteLength }).strict(),
+  z.object({ type: z.literal("media.chunk"), id, uploadId: z.string().uuid(),
+    offset: z.number().int().nonnegative(), data: z.string().max(Math.ceil(MEDIA_CHUNK_BYTES / 3) * 4) }).strict(),
+  z.object({ type: z.literal("media.finish"), id, uploadId: z.string().uuid() }).strict(),
+  z.object({ type: z.literal("media.cancel"), id, uploadId: z.string().uuid() }).strict(),
+  z.object({ type: z.literal("media.read"), id, owner: mediaOwnerSchema,
+    assetId: mediaAssetSchema.shape.assetId, offset: z.number().int().nonnegative(),
+    length: z.number().int().positive().max(MEDIA_CHUNK_BYTES) }).strict(),
+  /** With `projectId`, the configuration a session of that project
+   * runs with: your own group's, the project's own file on top, its
+   * environment's playbooks first (core-service-2, environments-9). */
+  z.object({ type: z.literal("config.get"), id, projectId: repositoryKeySchema.optional() }),
+  z.object({ type: z.literal("readiness.get"), id }),
+  // A seat member's own credentials (settings-48, storage-44): a code
+  // host's token, `values` {token, username?}, or an agent's, `values`
+  // {<NAME>: value} over its forms; the core checks each field and
+  // refuses `invalid_request` before anything is written.
+  z.object({ type: z.literal("credential.set"), id, kind: z.enum(["host", "agent"]), name: z.string(),
+    values: z.record(z.string(), z.string()) }).strict(),
+  z.object({ type: z.literal("credential.remove"), id, kind: z.enum(["host", "agent"]), name: z.string() }).strict(),
+  z.object({ type: z.literal("credential.list"), id }).strict(),
+  z.object({ type: z.literal("agent.options"), id, adapter: adapterNameSchema }),
+  z.object({ type: z.literal("project.list"), id }),
+  z.object({ type: z.literal("project.register"), id, path: z.string().min(1) }),
+  /** Forget the working folder and delete its spex repository's clone
+   * (projects-9); a clone holding what has not reached the host is
+   * refused `conflict` with the count until `confirm` is set. */
+  z.object({ type: z.literal("project.remove"), id, projectId: z.string().min(1), confirm: z.boolean().optional() }),
+  z.object({
+    type: z.literal("project.create"),
+    id,
+    path: z.string().min(1),
+    scaffold: z.boolean().optional(),
+    /** The creating page's resolved language; otherwise the core's. */
+    scaffoldLanguage: z.enum(LANGUAGES).optional(),
+    /** Seed the Academy example corpus (DR-015); excludes scaffold. */
+    example: z.boolean().optional(),
+  }),
+  z.object({ type: z.literal("project.status"), id, projectId: z.string().min(1) }),
+  z.object({
+    type: z.literal("forge.items"),
+    id,
+    projectId: z.string().min(1),
+    refresh: z.boolean().optional(),
+  }),
+  z.object({ type: z.literal("session.list"), id }),
+  z.object({ type: z.literal("session.create"), id, projectId: z.string().min(1) }),
+  /** Pair a working folder with a spex repository (storage-22): the
+   * supplied aliases replace the alias list, omitted ones keep it. */
+  z.object({ type: z.literal("project.rebind"), id, projectId: repositoryKeySchema, path: z.string().min(1), aliases: z.array(z.string()).optional() }).strict(),
+  z.object({ type: z.literal("storage.diagnostics"), id }).strict(),
+  z.object({ type: z.literal("session.dispose"), id, sessionId: z.string().min(1) }),
+  z.object({ type: z.literal("session.restore"), id, sessionId: z.string().min(1) }).strict(),
+  z.object({ type: z.literal("session.discard"), id, sessionId: z.string().min(1) }).strict(),
+  z.object({
+    type: z.literal("turn.submit"),
+    id,
+    sessionId: z.string().min(1),
+    text: z.string(),
+    attachments: mediaAttachmentsSchema.optional(),
+    /** The staged intent this turn dispatches (DR-035): validated,
+     * then stamped when the turn starts — never on a submission that
+     * starts no turn. */
+    intentId: z.string().min(1).optional(),
+  }),
+  /** core-service-98: one advertised control run as the session's next
+   * turn — a recovery the parked run offers, or the shell's own ending.
+   * `actionId` names which one, as the summary published it; without a
+   * name the core runs the first the opened shell advertises. */
+  z.object({
+    type: z.literal("session.control"),
+    id,
+    sessionId: z.string().min(1),
+    kind: z.enum(["recovery", "ending"]),
+    actionId: z.string().min(1).optional(),
+  }).strict(),
+  /** core-service-100: one agent's settings for one session, above the
+   * config and touching no file the launcher reads (DR-067) — the same
+   * act as `captain.set` and `player.set`, at a different scope. */
+  z.object({
+    type: z.literal("session.agent.set"),
+    id,
+    sessionId: z.string().min(1),
+    agentId: z.string().min(1),
+    // A concrete value pins, false selects the provider default, null
+    // clears this session's own, absent preserves it (DR-032/DR-067).
+    model: z.union([z.string().min(1), z.literal(false)]).nullable().optional(),
+    subagentModel: z.union([z.string().min(1), z.literal(false)]).nullable().optional(),
+    subagentEffort: z.union([z.string().min(1), z.literal(false)]).nullable().optional(),
+    effort: z.union([z.string().min(1), z.literal(false)]).nullable().optional(),
+    fastMode: z.boolean().nullable().optional(),
+    browser: z.boolean().nullable().optional(),
+  }).strict(),
+  z.object({ type: z.literal("turn.abort"), id, sessionId: z.string().min(1) }),
+  z.object({ type: z.literal("subscribe"), id, channel: channelSchema }),
+  z.object({ type: z.literal("unsubscribe"), id, channel: channelSchema }),
+  z.object({
+    type: z.literal("history.get"),
+    id,
+    sessionId: z.string().min(1),
+    afterSeq: z.number().int().nonnegative().optional(),
+  }),
+  z.object({ type: z.literal("usage.get"), id, sessionId: z.string().min(1) }),
+  z.object({ type: z.literal("usage.days"), id }),
+  /** `repository` names the spex repository whose config the op
+   * writes — a project's, or your own group's, the default
+   * (playbook-library-3, DR-103). */
+  z.object({ type: z.literal("config.edit"), id, op: configEditOpSchema, repository: repositoryKeySchema.optional() }),
+  z.object({ type: z.literal("compile.check"), id }),
+  z.object({
+    type: z.literal("playbook.artifacts"),
+    id,
+    playbookId: z.string().min(1),
+    /** The spex repository whose environment exports the playbook
+     * (playbook-library-24); absent, the composed config's. */
+    repository: repositoryKeySchema.optional(),
+  }),
+  z.object({
+    type: z.literal("compile.run"),
+    id,
+    playbookId: playbookIdSchema,
+    sourceText: z.string().optional(),
+    sourcePath: z.string().optional(),
+    roles: z.array(z.string().min(1)).min(1),
+    command: z.string().min(1),
+    intent: z.string().min(1),
+    /** role -> the session player that answers it (DR-032). */
+    bindings: z.record(z.string(), playerIdSchema),
+    /** Lanes to create for bindings naming a player not yet in the
+     * roster — the Playbooks surface may mint one in place. */
+    newPlayers: z.record(playerIdSchema, agentBlockSchema).optional(),
+    /** The project whose working folder holds the spec package under
+     * development, `spex-packages/<org>/<id>/` (environments-10): a compile
+     * always writes inside one, so it is always named. */
+    projectId: repositoryKeySchema,
+    /** The spex repository to enable in — the project's, the default,
+     * or your own group's (playbook-library-7, playbook-library-69). */
+    repository: repositoryKeySchema.optional(),
+  }),
+  z.object({
+    type: z.literal("compile.abort"),
+    id,
+    playbookId: z.string().min(1),
+    /** An authoring session's compile, named by the session's instance:
+     * canceled only while that instance's compile runs (core-service-96). */
+    instance: z.string().regex(UUID_PATTERN).optional(),
+  }),
+  z.object({ type: z.literal("library.builtins"), id }),
+  z.object({ type: z.literal("specs.get"), id, projectId: z.string().min(1) }),
+  z.object({
+    type: z.literal("specs.read"),
+    id,
+    projectId: z.string().min(1),
+    /** Path relative to the project's specs/ directory. */
+    path: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal("specs.write"),
+    id,
+    projectId: z.string().min(1),
+    /** Path relative to the project's specs/ directory; the file must
+     * exist — the write never creates one (DR-043). */
+    path: z.string().min(1),
+    /** The whole file, written exactly as sent. */
+    content: z.string(),
+    /** The version token specs.read handed out: a mismatch is a
+     * conflict, and no token writes unconditionally. */
+    baseVersion: z.string().min(1).optional(),
+  }),
+  z.object({
+    type: z.literal("intent.queue"),
+    id,
+    projectId: z.string().min(1),
+    text: z.string(),
+    attachments: mediaAttachmentsSchema.optional(),
+    source: z
+      .object({
+        kind: z.enum(["issue", "pr", "record", "chat"]),
+        ref: z.string().min(1),
+        url: z.string().min(1).optional(),
+        labels: z.array(z.string()).optional(),
+      })
+      .optional(),
+  }),
+  z.object({
+    type: z.literal("intent.edit"),
+    id,
+    intentId: z.string().min(1),
+    text: z.string(),
+    attachments: mediaAttachmentsSchema.optional(),
+  }),
+  z.object({
+    type: z.literal("intent.close"),
+    id,
+    intentId: z.string().min(1),
+    as: z.enum(["done", "dropped"]),
+  }),
+  z.object({
+    /** Retire a closed intent from History and every other read
+     * (core-service-79, DR-038). */
+    type: z.literal("intent.remove"),
+    id,
+    intentId: z.string().min(1),
+  }),
+  z.object({ type: z.literal("ledger.get"), id }),
+  z.object({
+    type: z.literal("ledger.history"),
+    id,
+    projectId: z.string().min(1),
+    /** Page cursor: the last served row's closedAt and id. */
+    before: z
+      .object({ closedAt: z.number().int(), intentId: z.string().min(1) })
+      .optional(),
+  }),
+  z.object({
+    type: z.literal("session.viewed"),
+    id,
+    sessionId: z.string().min(1),
+    turnId: z.number().int().nonnegative(),
+  }),
+  z.object({ type: z.literal("session.delete"), id, sessionId: z.string().min(1) }),
+  // The home's interface language (core-service-108/109, DR-078): one
+  // choice every client of the home reads, the reader's system when
+  // none is stored.
+  z.object({ type: z.literal("language.get"), id }).strict(),
+  z.object({ type: z.literal("language.set"), id, language: languageChoiceSchema }).strict(),
+  // Environments (environments-17, DR-104): one spex repository's requests,
+  // lock, installs and exports; long commands reply `accepted` at once and
+  // report through `environment.state`.
+  z.object({ type: z.literal("environment.get"), id, repository: repositoryKeySchema }).strict(),
+  /** `name` may be left out of a request by path, which takes the name
+   * its folder's `meta.yaml` gives; `dryRun` runs the refusals and
+   * replies the name and version the request would take, writing
+   * nothing (environments-15). */
+  z.object({
+    type: z.literal("environment.request"),
+    id,
+    wait: z.boolean().optional(),
+    dryRun: z.boolean().optional(),
+    repository: repositoryKeySchema,
+    name: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*\/[a-z0-9]+(?:-[a-z0-9]+)*$/).optional(),
+    request: environmentRequestSchema,
+  }).strict(),
+  z.object({ type: z.literal("environment.remove"), id, wait: z.boolean().optional(), repository: repositoryKeySchema, name: z.string().min(1) }).strict(),
+  z.object({ type: z.literal("environment.resolve"), id, wait: z.boolean().optional(), repository: repositoryKeySchema }).strict(),
+  z.object({ type: z.literal("environment.install"), id, wait: z.boolean().optional(), repository: repositoryKeySchema }).strict(),
+  /** A search names the environment it adds to: the registry of
+   * `repository`'s environment answers it (environments-17, DR-127). */
+  z.object({ type: z.literal("environment.search"), id, repository: repositoryKeySchema, query: z.string().max(200) }).strict(),
+  /** `name` names the spec package under development, `<org>/<pkg>`,
+   * whose folder — the environment's request by path for it, else
+   * `spex-packages/<org>/<pkg>/` — the core publishes (environments-10,
+   * DR-165); `dryRun` runs the checks and replies the inline summary —
+   * name, version and the files it would upload — uploading nothing
+   * (playbook-library-93). */
+  z.object({ type: z.literal("environment.publish"), id, repository: repositoryKeySchema, name: z.string().min(1), dryRun: z.boolean().optional(), wait: z.boolean().optional() }).strict(),
+  z.object({ type: z.literal("environment.playbooks"), id, projectId: repositoryKeySchema.optional() }).strict(),
+  // Applets (applets-3, DR-161): the path the core serves an installed
+  // applet under for one project — `repository` the spex repository
+  // whose environment installs it, `applet` its id, `project` the spex
+  // repository of the project whose tab shows it.
+  z.object({ type: z.literal("applet.open"), id, repository: repositoryKeySchema, applet: z.string().min(1), project: repositoryKeySchema }).strict(),
+  // Groups (space-29, DR-103): the core performs every Git operation,
+  // one spex repository at a time, `repository` naming it by its key
+  // and `instance` an instance by its origin (DR-127); long commands
+  // reply `accepted` at once and report their outcome as `space.state`.
+  z.object({ type: z.literal("registry.get"), id, origin: instanceOriginSchema.optional(), repository: repositoryKeySchema.optional() }).strict(),
+  z.object({ type: z.literal("registry.signin.start"), id, origin: instanceOriginSchema }).strict(),
+  z.object({ type: z.literal("registry.signin.cancel"), id, origin: instanceOriginSchema }).strict(),
+  z.object({ type: z.literal("registry.signout"), id, origin: instanceOriginSchema }).strict(),
+  z.object({ type: z.literal("registry.orgs"), id, repository: repositoryKeySchema }).strict(),
+  z.object({ type: z.literal("registry.directory"), id, origin: instanceOriginSchema.optional() }).strict(),
+  z.object({ type: z.literal("environment.registry.set"), id, repository: repositoryKeySchema, origin: instanceOriginSchema }).strict(),
+  z.object({ type: z.literal("space.get"), id }).strict(),
+  z.object({ type: z.literal("space.refresh"), id }).strict(),
+  /** `url`: the instance's URL as the reader gave it, held by its origin;
+   * `ticket`, on a seat alone, the ticket the member's client presented
+   * for it (git-host-27, DR-164). */
+  z.object({ type: z.literal("space.signin.start"), id, url: z.string().min(1), reportCompletion: z.boolean().optional(), ticket: z.string().min(1).optional() }).strict(),
+  z.object({ type: z.literal("space.signin.cancel"), id, startId: z.string().min(1).optional() }).strict(),
+  z.object({ type: z.literal("space.signout"), id, instance: instanceOriginSchema }).strict(),
+  /** `instance`: the signed-out instance to remove from the home (space-82). */
+  z.object({ type: z.literal("space.forget"), id, instance: instanceOriginSchema }).strict(),
+  z.object({
+    type: z.literal("space.pick"),
+    id,
+    repository: repositoryKeySchema,
+    /** `instance`: the one the choice is at. */
+    choice: groupChoiceSchema,
+    /** The privacy notice was shown for a join into a repository with other members (space-57). */
+    noticed: z.boolean().optional(),
+  }).strict(),
+  /** A placement added at an instance the clone holds none at
+   * (space-97, DR-128), its choice as a pick's. */
+  z.object({
+    type: z.literal("space.place"),
+    id,
+    repository: repositoryKeySchema,
+    /** `instance`: the one the choice is at. */
+    choice: groupChoiceSchema,
+    /** The privacy notice was shown for that placement (space-57). */
+    noticed: z.boolean().optional(),
+  }).strict(),
+  /** A placement left (space-98, DR-128): `instance` the placement's;
+   * `confirmed` the reader's second Remove, after a leave stopped for
+   * records no remaining placement received or for a placement it could
+   * not read. */
+  z.object({ type: z.literal("space.leave"), id, repository: repositoryKeySchema, instance: instanceOriginSchema, confirmed: z.boolean().optional() }).strict(),
+  /** A placement a placement file of the clone names, attached
+   * (space-99, DR-128): `instance` the one the file names; `noticed` the
+   * reader's Continue past that placement's sharing notice, which Attach
+   * is (space-90). */
+  z.object({ type: z.literal("space.attach"), id, repository: repositoryKeySchema, instance: instanceOriginSchema, noticed: z.boolean() }).strict(),
+  /** `instance`: the one the row stands under (space-1). */
+  z.object({ type: z.literal("space.join"), id, instance: instanceOriginSchema, hostId: z.string().min(1), folder: z.string().min(1).optional() }).strict(),
+  // Members of a spex repository's placement by its key — `instance` the
+  // placement's, its first where omitted — or of a group by its host id
+  // at its instance; exactly one (space-29, DR-128), a group with its
+  // instance (parseCommand). Share and unshare name theirs alike.
+  z.object({ type: z.literal("space.members"), id, instance: instanceOriginSchema.optional(), repository: repositoryKeySchema.optional(), group: z.string().min(1).optional() }).strict(),
+  // Groups and sharing (DR-114, space-29), a group at the instance named.
+  z.object({ type: z.literal("space.group.create"), id, instance: instanceOriginSchema, name: z.string().min(1), path: z.string().min(1), parent: z.string().min(1).nullable() }).strict(),
+  // Undo in Spex (DR-120, space-29): a group of the instance renamed or
+  // deleted by its host id, a spex repository moved by its key into a
+  // group by its host id, or into your own group where none is named.
+  z
+    .object({
+      type: z.literal("space.group.rename"),
+      id,
+      instance: instanceOriginSchema,
+      group: z.string().min(1),
+      name: z.string().min(1).optional(),
+      path: z.string().min(1).optional(),
+    })
+    .strict(),
+  z.object({ type: z.literal("space.group.delete"), id, instance: instanceOriginSchema, group: z.string().min(1) }).strict(),
+  /** `instance`: the placement's, its first where omitted (space-29, DR-128). */
+  z.object({ type: z.literal("space.repository.move"), id, repository: repositoryKeySchema, instance: instanceOriginSchema.optional(), groupId: z.string().min(1).nullable() }).strict(),
+  z
+    .object({
+      type: z.literal("space.share"),
+      id,
+      instance: instanceOriginSchema.optional(),
+      group: z.string().min(1).optional(),
+      repository: repositoryKeySchema.optional(),
+      login: z.string().min(1),
+      role: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("space.unshare"),
+      id,
+      instance: instanceOriginSchema.optional(),
+      group: z.string().min(1).optional(),
+      repository: repositoryKeySchema.optional(),
+      login: z.string().min(1),
+    })
+    .strict(),
+  /** The way a test or a reader gives a clone a remote until the Git
+   * host sets it up (DR-103); null removes it. */
+  z.object({ type: z.literal("space.remote.set"), id, repository: repositoryKeySchema, url: z.string().nullable() }).strict(),
+  z.object({ type: z.literal("space.fetch"), id, repository: repositoryKeySchema }).strict(),
+  z
+    .object({
+      type: z.literal("space.sync"),
+      id,
+      repository: repositoryKeySchema,
+      /** The placement `choices`, `join` and `noticed` are for — its
+       * instance's origin, or null for the path placement — required
+       * with any of them (space-29, DR-128; parseCommand). */
+      placement: instanceOriginSchema.nullable().optional(),
+      choices: z.record(z.string().min(1), spaceChoiceSchema).optional(),
+      join: z.boolean().optional(),
+      noticed: z.boolean().optional(),
+    })
+    .strict(),
+  z.object({ type: z.literal("space.cancel"), id, repository: repositoryKeySchema }).strict(),
+  z
+    .object({
+      type: z.literal("space.diff"),
+      id,
+      repository: repositoryKeySchema,
+      unit: z.string().min(1),
+      path: z.string().min(1),
+      side: spaceChoiceSchema,
+      /** The placement the `remote` side is of, its first where omitted
+       * (space-29, DR-128). */
+      placement: instanceOriginSchema.nullable().optional(),
+    })
+    .strict(),
+  z.object({ type: z.literal("space.tree"), id, repository: repositoryKeySchema, path: z.string().optional() }).strict(),
+  z.object({ type: z.literal("space.read"), id, repository: repositoryKeySchema, path: z.string().min(1) }).strict(),
+  z.object({ type: z.literal("space.repair.decline"), id, repair: z.string().min(1), declined: z.boolean() }).strict(),
+  // Team servers (core-service-128, DR-133): the servers each signed-in
+  // instance lists, and a seat on one opened or closed, the server named
+  // by its instance's origin and its id there. `consented`: the client
+  // showed the contract of the instance's record; absent or false, the
+  // core refuses the open and asks nothing.
+  z.object({ type: z.literal("server.list"), id }).strict(),
+  z.object({ type: z.literal("server.open"), id, instance: instanceOriginSchema, serverId: z.string().min(1), consented: z.boolean().optional() }).strict(),
+  z.object({ type: z.literal("server.close"), id, instance: instanceOriginSchema, serverId: z.string().min(1) }).strict(),
+  /** The seat's sign-in at its instance started again (core-service-142). */
+  z.object({ type: z.literal("server.signin"), id, instance: instanceOriginSchema, serverId: z.string().min(1) }).strict(),
+  // Authoring sessions (DR-058, core-service-96): each in the spex
+  // repository of the project `projectId` names; one activity per
+  // session, Boss messages queue while a turn or compile runs.
+  z.object({ type: z.literal("draft.list"), id }),
+  // What a new playbook of the project starts from (playbook-library-103).
+  z.object({ type: z.literal("draft.defaults"), id, projectId: repositoryKeySchema }),
+  z.object({
+    type: z.literal("draft.create"),
+    id,
+    projectId: repositoryKeySchema,
+    draftId: draftIdSchema,
+    /** The new spec package's `org` and `license` (playbook-library-51),
+     * each refused `invalid_request` naming its rule (core-service-96). */
+    org: z.string(),
+    license: z.string(),
+  }),
+  z.object({
+    type: z.literal("draft.open"),
+    id,
+    projectId: repositoryKeySchema,
+    draftId: draftIdSchema,
+    /** Serve stored records after this sequence; absent serves all. */
+    afterSeq: z.number().int().nonnegative().optional(),
+  }),
+  z.object({
+    type: z.literal("draft.send"),
+    id,
+    projectId: repositoryKeySchema,
+    draftId: draftIdSchema,
+    instance: draftInstanceSchema,
+    text: z.string(),
+    attachments: mediaAttachmentsSchema.optional(),
+  }),
+  z.object({ type: z.literal("draft.abort"), id, projectId: repositoryKeySchema, draftId: draftIdSchema, instance: draftInstanceSchema }),
+  z.object({
+    type: z.literal("draft.source.write"),
+    id,
+    projectId: repositoryKeySchema,
+    draftId: draftIdSchema,
+    instance: draftInstanceSchema,
+    /** In-app markdown text, or a picked file's path — one of the two. */
+    content: z.string().optional(),
+    sourcePath: z.string().min(1).optional(),
+    /** The version token draft.open or draft.source handed out: a
+     * mismatch is a conflict, and no token writes unconditionally. */
+    baseVersion: z.string().min(1).optional(),
+  }),
+  z.object({ type: z.literal("draft.compile"), id, projectId: repositoryKeySchema, draftId: draftIdSchema, instance: draftInstanceSchema }),
+  z.object({
+    type: z.literal("draft.register"),
+    id,
+    projectId: repositoryKeySchema,
+    draftId: draftIdSchema,
+    instance: draftInstanceSchema,
+    command: z.string().min(1),
+    intent: z.string().min(1),
+    /** derived role -> the session player that answers it (DR-032). */
+    bindings: z.record(z.string(), playerIdSchema),
+    /** Lanes to create for bindings naming a player the roster lacks. */
+    newPlayers: z.record(playerIdSchema, agentBlockSchema).optional(),
+    /** The spex repository to enable in — the project's, the default,
+     * or your own group's (playbook-library-7, playbook-library-61). */
+    repository: repositoryKeySchema.optional(),
+  }),
+  z.object({
+    type: z.literal("draft.player.set"),
+    id,
+    projectId: repositoryKeySchema,
+    draftId: draftIdSchema,
+    instance: draftInstanceSchema,
+    /** The roster player answering this draft; null = the Captain's block. */
+    playerId: playerIdSchema.nullable(),
+  }),
+  z.object({
+    type: z.literal("draft.delete"),
+    id,
+    projectId: repositoryKeySchema,
+    draftId: draftIdSchema,
+    /** The instance read; for a session file that will not read, its
+     * `fileVersion` instead — exactly one of the two. */
+    instance: draftInstanceSchema.optional(),
+    fileVersion: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  }),
+  z.object({ type: z.literal("draft.artifacts"), id, projectId: repositoryKeySchema, draftId: draftIdSchema }),
+]);
+
+export type Command = z.infer<typeof commandSchema>;
+export type CommandType = Command["type"];
+
+/** Reply result payload per command type. */
+export interface CommandResults {
+  "agent.capabilities": AgentCapabilities;
+  "approval.list": ApprovalState;
+  "approval.respond": ApprovalAcknowledgement;
+  "browser.prepare": BrowserSetupResult;
+  "browser.cancel": { canceled: boolean };
+  "media.begin": MediaUploadState;
+  "media.chunk": MediaUploadState;
+  "media.finish": MediaUploadState & {asset: MediaAsset};
+  "media.cancel": {canceled: boolean};
+  "media.read": {asset: MediaAsset; offset: number; data: string; eof: boolean};
+  "config.get": ConfigState;
+  "readiness.get": ReadinessEntry[];
+  /** The credentials after the write, as `credential.list` lists them. */
+  "credential.set": CredentialList;
+  "credential.remove": CredentialList;
+  "credential.list": CredentialList;
+  "agent.options": AgentOptions;
+  "project.list": ProjectInfo[];
+  "project.rebind": ProjectInfo;
+  "storage.diagnostics": { file: string; reason: string; blocking: boolean; repair?: DiagnosticRepair }[];
+  "project.register": ProjectInfo;
+  "project.remove": null;
+  "project.create": ProjectInfo;
+  "project.status": RepoStatusInfo;
+  "forge.items": ForgeState;
+  "session.list": SessionInfo[];
+  "session.create": SessionInfo;
+  "session.dispose": null;
+  "session.restore": { accepted: true };
+  "session.discard": { removed: boolean };
+  "session.delete": null;
+  "turn.submit": { accepted: true };
+  "session.control": { accepted: true };
+  "session.agent.set": SessionInfo;
+  "turn.abort": { aborted: boolean };
+  subscribe: null;
+  unsubscribe: null;
+  "history.get": { records: StoredRecord[] };
+  "usage.get": UsageRollup;
+  "usage.days": { day: string; totals: UsageRollup }[];
+  "config.edit": ConfigState;
+  "compile.check": {
+    node: { ok: boolean; version?: string; command: string; guidance?: string };
+    slc: { ok: boolean; command: string[]; guidance?: string };
+  };
+  "compile.run": ConfigState;
+  "compile.abort": null;
+  "playbook.artifacts": PlaybookArtifacts;
+  "library.builtins": { builtins: BuiltinPlaybookInfo[] };
+  "specs.get": SpecTreeState;
+  /** The file's text with its version token — a digest of the bytes —
+   * and last change (spec-view-16, DR-043). */
+  "specs.read": { markdown: string; version: string; mtime: number };
+  /** The token and last change of the bytes written (spec-view-47). */
+  "specs.write": { version: string; mtime: number };
+  "intent.queue": IntentInfo;
+  "intent.edit": IntentInfo;
+  "intent.close": IntentInfo;
+  /** The intent is gone from every read, so nothing comes back. */
+  "intent.remove": null;
+  "ledger.get": LedgerState;
+  "ledger.history": { intents: ClosedIntent[]; more: boolean };
+  "session.viewed": null;
+  /** The stored choice; null is the reader's system (core-service-108). */
+  "language.get": { language: Language | null };
+  /** The choice after the write, as `language.state` carries it. */
+  "language.set": { language: Language | null };
+  "environment.get": EnvironmentState;
+  "environment.request":
+    | { accepted: true; preview?: RequestPreview; completed?: never }
+    | { completed: true; accepted?: never; preview?: never };
+  "environment.remove": EnvironmentMutationResult;
+  "environment.resolve": EnvironmentMutationResult;
+  "environment.install": EnvironmentMutationResult;
+  "environment.search": { packages: { name: string; description: string | null; versions: string[] }[] };
+  "environment.publish":
+    | { accepted: true; preview?: PublishPreview; completed?: never; published?: never }
+    | { completed: true; published: PublishedPackage; accepted?: never; preview?: never };
+  /** `/applets/<capability>/` on the core's own endpoint (applets-3). */
+  "applet.open": { path: string };
+  "environment.playbooks": {
+    project: PlaybookAvailability[] | null;
+    own: PlaybookAvailability[];
+    /** Enabled entries failing the fail-closed validation
+     * (playbook-library-2), each with the specific failure. */
+    invalid?: InvalidPlaybookEntry[];
+  };
+  "registry.get": RegistryState;
+  "registry.signin.start": CommandResults["space.signin.start"];
+  "registry.signin.cancel": { stopped: boolean };
+  "registry.signout": RegistryState;
+  "registry.orgs": { orgs: { name: string; path: string; provider?: string }[] };
+  "registry.directory": { spaces: { origin: string; displayName: string; signIn: string[] }[] };
+  "environment.registry.set": EnvironmentState;
+  "space.get": GroupsState;
+  "space.refresh": { accepted: true };
+  "space.signin.start":
+    | { flow: "browser"; url: string }
+    | { flow: "device"; userCode: string; verificationUri: string; expiresAt: number; interval: number };
+  "space.signin.cancel": { stopped: boolean };
+  "space.signout": GroupsState;
+  "space.forget": GroupsState;
+  "space.pick": { accepted: true };
+  /** Once the creation or the join is accepted at the host, the sync
+   * following as state (space-29). */
+  "space.place": { accepted: true };
+  /** At once, its outcome as state (space-29). */
+  "space.leave": { accepted: true };
+  /** Once its remote is added, the sync following as state (space-29). */
+  "space.attach": { accepted: true };
+  "space.join": { accepted: true };
+  "space.members": { members: HostMemberInfo[] };
+  "space.group.create": { group: { id: string; fullPath: string; name: string } };
+  "space.group.rename": { group: { id: string; fullPath: string; name: string } };
+  "space.group.delete": { deleted: true };
+  /** `fullPath`: the repository's path in the instance after the move. */
+  "space.repository.move": { repository: { id: string; fullPath: string } };
+  "space.share": { members: HostMemberInfo[] };
+  "space.unshare": { members: HostMemberInfo[] };
+  "space.remote.set": GroupsState;
+  "space.fetch": { accepted: true };
+  "space.sync": { accepted: true };
+  /** `false` when no transport child was running. */
+  "space.cancel": { stopped: boolean };
+  "space.diff": { patch: string; truncated: boolean };
+  "space.tree": { path: string; entries: SpaceEntry[] };
+  "space.read": SpaceReadResult;
+  "space.repair.decline": GroupsState;
+  "server.list": ServerListing;
+  /** The seat's place and its lease's expiry in Unix milliseconds; never
+   * its endpoint or its bearer (core-service-128). */
+  "server.open": { place: string; leaseExpiresAt: number };
+  "server.close": { closed: true };
+  /** Whether the seat's Groups state is read anew, and its sign-in
+   * started where it is not signed in; false while a read or a flow of
+   * this core's own runs there (core-service-142). The outcome follows
+   * as `server.state`. */
+  "server.signin": { started: boolean };
+  "draft.list": DraftInfo[];
+  /** The org and license a new playbook of the project starts from,
+   * null where no license is derived (playbook-library-103). */
+  "draft.defaults": { org: string; license: string | null };
+  "draft.create": DraftInfo;
+  "draft.open": { draft: DraftInfo; source: DraftSource | null; records: DraftRecord[] };
+  /** Replies when the message is accepted, never when the turn ends. */
+  "draft.send": { accepted: true; queued: boolean };
+  "draft.abort": { aborted: boolean };
+  /** A stale baseVersion replies with the `conflict` error instead. */
+  "draft.source.write": { version: string; mtime: number };
+  /** Resolves when the compile settles; a failed phase replies
+   * `invalid_request` with the phase, a canceled compile `aborted`. */
+  "draft.compile": { ok: true; roles: string[] };
+  "draft.register": ConfigState;
+  "draft.player.set": DraftInfo;
+  "draft.delete": null;
+  /** Resolved from `<library>/<id>/<id>.registry.mjs`. */
+  "draft.artifacts": PlaybookArtifacts;
+}
+
+// ---------------------------------------------------------------------------
+// Playbook drafts (DR-058)
+// ---------------------------------------------------------------------------
+
+/** One question of slc's `SLC_CLARIFICATION:` report. */
+export interface ClarificationQuestion {
+  id: string;
+  question: string;
+  reason: string;
+  evidence: string;
+  choices?: string[];
+}
+
+export type DraftActivity = "idle" | "turn" | "compiling";
+
+/** The chip's word: derived by the core, never stored. */
+export type DraftState =
+  | "no-source"
+  | "draft"
+  | "compiling"
+  | "failed"
+  | "interrupted"
+  | "compiled"
+  | "changed"
+  /** Enabled in a config, the session kept to work on (playbook-library-61). */
+  | "enabled";
+
+export type DraftCompileOutcome =
+  | "running"
+  | "ok"
+  | "failed"
+  | "canceled"
+  | "interrupted";
+
+/** The draft's last compile (storage-23). */
+export interface DraftCompileInfo {
+  at: number;
+  by: "boss" | "agent";
+  outcome: DraftCompileOutcome;
+  /** The failed phase — the compiler's id, "packaging", or the toolchain. */
+  phase?: string;
+  /** The failed phase's captured output. */
+  output?: string;
+  questions?: ClarificationQuestion[];
+  /** On failure, what became of it: relayed to the agent, the relay
+   * stopped after three in a row, or carried by the Boss's queued
+   * message — the page phrases it (playbook-library-58). */
+  relay?: DraftCompileRelay;
+  /** The compiled entry's derived roles, on success. */
+  roles?: string[];
+}
+
+export type DraftCompileRelay = "sent" | "stopped" | "queued";
+
+/** The agent's latest register block (playbook-library-66). */
+export interface DraftProposal {
+  command: string;
+  intent: string;
+  /** Role -> player id, as proposed; roles the entry lacks stay as a
+   * mismatch for the form to show. */
+  players: Record<string, string>;
+}
+
+export interface DraftInfo {
+  id: string;
+  /** The session's recorded instance (storage-23): what every command
+   * on it names. Absent where the session file will not read. */
+  instance?: string;
+  /** The unreadable session file's bytes digest, which its Delete
+   * names in place of an instance (core-service-96). */
+  fileVersion?: string;
+  /** The project whose spex repository holds this authoring session
+   * (storage-23), named by its key. */
+  projectId: string;
+  createdAt: number;
+  touchedAt: number;
+  /** The source's title: its first `#` heading's text, else its first
+   * non-empty line; null with no source (playbook-library-70). */
+  firstLine: string | null;
+  /** The spec package folder is gone; the row offers only Delete. */
+  sourceMissing?: boolean;
+  /** The spec package under development's name, `<org>/<id>`
+   * (playbook-library-52). */
+  package?: string;
+  /** Its folder in the working folder, e.g. `spex-packages/<org>/<id>`
+   * (playbook-library-70). */
+  packagePath?: string;
+  /** The playbook artifact's `<id>.md`, relative to the working folder
+   * (playbook-library-56). */
+  sourcePath?: string;
+  /** The playbook is enabled: an environment of the project or your own
+   * group requests this session's spec package by path and that spex
+   * repository's config enables its id (playbook-library-69); the state
+   * then reads "enabled" unless a compile, a failure or a change stands. */
+  enabled?: boolean;
+  /** `turn` while its turn runs, else `compiling` while its compile
+   * runs, else `idle`. */
+  activity: DraftActivity;
+  /** A compile of the session runs, a turn beside it or not, so a turn
+   * and a compile at once are each reported (core-service-96); the core
+   * always sends it, a client reading its absence from `activity`. */
+  compiling?: boolean;
+  state: DraftState;
+  /** Boss messages waiting for the draft to go idle, in order. */
+  queued: MessageContent[];
+  /** The roster player answering; null = the Captain's block. */
+  player: string | null;
+  /** What effectively answers. */
+  agent: AgentSummary;
+  /** That adapter's readiness (ReadinessEntry.ready). */
+  ready: boolean | null;
+  /** The draft's record or transcript is unreadable: the file and the
+   * reason (playbook-library-70). Every command but delete refuses
+   * while it stands, and the workspace shows it in place of the thread. */
+  diagnostic?: string;
+  compile?: DraftCompileInfo;
+  /** Consecutive failed compiles with no Boss message between. */
+  failures: number;
+  proposal?: DraftProposal;
+  /** Fenced spex blocks of the last reply the core could not read: each
+   * block's text and why it did not read (playbook-library-66). */
+  malformedDirectives?: { text: string; reason: string }[];
+}
+
+/** One stored authoring record. Shapes: turn_started (Boss or system
+ * text — a system turn's prompt starts "Spex:"), player_prompt /
+ * player_event / player_finished with playerId "author", turn_finished,
+ * turn_aborted, captain_status for system lines, runtime_error for
+ * runner failures (playbook-library-64). */
+export interface DraftRecord {
+  seq: number;
+  record: TmuxPlayRecord;
+}
+
+/** The draft's `<id>.md` with its version token — a digest of the
+ * bytes — and last change. */
+export interface DraftSource {
+  markdown: string;
+  version: string;
+  mtime: number;
+}
+
+// ---------------------------------------------------------------------------
+// Spec view data (SPECV, DR-011)
+// ---------------------------------------------------------------------------
+
+export type SpecGroup = "external" | "internal" | "test";
+
+export interface SpecItemInfo {
+  /** Item ID, e.g. "run-view-9". */
+  id: string;
+  /** Section-kind group (DR-015): External Behavior external,
+   * Internal Behavior internal, Verification test. */
+  group: SpecGroup;
+  /** Containing `##` section heading, verbatim. */
+  section: string;
+  /** Nearest `###` topic heading above a `####` item, when present. */
+  topic?: string;
+  /** One-line digest: the item's first sentence. */
+  firstLine: string;
+  /** Full markdown body of the item. */
+  text: string;
+  /** Item IDs cited by inline links in the item body. */
+  cites: string[];
+}
+
+export interface SpecFileInfo {
+  /** Path relative to the project root. */
+  path: string;
+  /** Collection-relative path minus .md, e.g. "identity/github-login". */
+  key: string;
+  /** Collection subdirectory ("" at collection root) — navigation only. */
+  dir: string;
+  /** The package identifier: the file's basename (meta-10). */
+  basename: string;
+  /** Title from the `# <pack>: <Title>` heading, after the
+   * identifier — or the whole H1 when it lacks that pattern. */
+  title?: string;
+  /** First paragraph of the file's `## Intent` section. */
+  intent?: string;
+  /** Items in document order — never sorted by ID. */
+  items: SpecItemInfo[];
+  /** Consistency notices: an H1 identifier or item-ID prefix
+   * disagreeing with the basename, section surprises. */
+  notices: string[];
+  /** Parse-failure notice; items may be partial when set. */
+  error?: string;
+  /** A spec an install placed: the package, `<org>/<pkg>`, and version
+   * the marker on its first line names, where its bytes carry the hash
+   * the install record under `.spex/` holds for it or no record lists
+   * it; absent for an edited copy and every other file, so the view
+   * offers it no Edit (spec-view-10, DR-174). */
+  placed?: { name: string; version: string };
+}
+
+export interface SpecRecordInfo {
+  /** Record ID, e.g. "DR-011" or "IR-016". */
+  id: string;
+  title: string;
+  /** Path relative to the project's specs/ directory. */
+  path: string;
+  /** The first non-empty line of the record's `## Status` section,
+   * verbatim; absent when the file has none. */
+  status?: string;
+  /** The core's classification of that line (spec-view-14, DR-038):
+   * absent while open; "done" or "superseded" once finished. */
+  finished?: "done" | "superseded";
+  /** The record's last change, for History's timeline (DR-038): the
+   * last commit touching the file where Git tracks it, else the
+   * file's mtime. */
+  updatedAt?: number;
+}
+
+export interface SpecTreeState {
+  /** False when the project has no specs/ directory. */
+  present: boolean;
+  /** True when specs/ holds a legacy-generation directory other
+   * than iterations/ — see LEGACY_DIRS in specs.ts; files stay empty
+   * and the view shows migration guidance. */
+  legacy: boolean;
+  /** The packages/ collection's files, keyed by collection-relative
+   * path. */
+  files: SpecFileInfo[];
+  decisions: SpecRecordInfo[];
+  /** Intent records, read from intents/ or a legacy iterations/. */
+  intents: SpecRecordInfo[];
+  /** Tree-level notices (unknown top-level entries, etc.). */
+  notices: string[];
+  /** When the tree was read, ms epoch. */
+  readAt: number;
+}
+
+// ---------------------------------------------------------------------------
+// Built-in playbook catalog (DR-015)
+// ---------------------------------------------------------------------------
+
+export interface BuiltinPlaybookInfo {
+  id: string;
+  command: string;
+  intent: string;
+  /** Registry module specifier for the config `from` key. */
+  from: string;
+  /** Role ids the registry entry requires. */
+  roles: string[];
+  /** True when the active config already registers this id. */
+  configured: boolean;
+  /** Playbook source markdown from the installed package (DR-019). */
+  source?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Groups (space-30, DR-103)
+// ---------------------------------------------------------------------------
+
+/** What a folder on this device would repair (space-46): a spex
+ * repository no working folder here pairs, or a working folder whose
+ * clone is missing. */
+export interface DiagnosticRepair {
+  kind: "repository" | "folder";
+  /** The spex repository's key: the unpaired clone's, or the one the
+   * folder's pair names. */
+  repository?: string;
+  /** The spex repository's name and its group, for an unpaired clone. */
+  name?: string;
+  group?: string;
+  /** The working directories its sessions record, or the folder. */
+  directories: string[];
+  sessions: number;
+  /** Stable over the facts it names (space-54): the checked findings
+   * are deliberately outside it, so a folder appearing or vanishing
+   * never mints a repair that re-asks an answered question. */
+  key: string;
+  /** When this device's reader declined to add it, in Unix
+   * milliseconds (space-54); absent while it stands unanswered. */
+  declined?: number;
+  /** What the core found about each path the repair already names
+   * (space-53): checked, never searched for. */
+  checked?: RepairChecked[];
+  /** The one folder the core proposes, when exactly one qualifies. */
+  proposal?: { path: string; from: "recorded" | "beside-chosen" | "beside-projects" };
+}
+
+/** What the core found about one path it already knew to check
+ * (space-53): it lists no directory and descends none. */
+export interface RepairChecked {
+  path: string;
+  here: boolean;
+  repo: boolean;
+  /** The project already claiming it, where one does. */
+  claimedBy?: string;
+  /** The check could not complete — a slow mount, an error. */
+  unknown?: boolean;
+}
+
+/** A sync's steps (space-12), and `code`: a join's code clone (space-63). */
+export type SyncStep = "save" | "check" | "compare" | "apply" | "refresh" | "push" | "code";
+
+export type SyncCause =
+  | "unreachable"
+  | "throttled"
+  | "reauth"
+  | "refused"
+  | "size_limit"
+  | "gone"
+  | "timeout"
+  | "stopped"
+  | "rejected"
+  | "validation"
+  | "lease"
+  | "writer"
+  | "unrelated"
+  | "git"
+  /** A leave's units no remaining placement received (space-98). */
+  | "unreceived";
+
+export type SpaceOp = "sync" | "check" | "join" | "move" | "place" | "leave" | "attach";
+
+export type SpaceChange = "new" | "updated" | "deleted";
+
+export type SpaceUnitKind =
+  | "session"
+  | "intent"
+  | "authoring"
+  | "environment"
+  | "settings"
+  | "code"
+  | "rules"
+  | "other";
+
+/** One whole-unit selection subject of a spex repository (storage-11). */
+export interface SpaceUnit {
+  /** "sessions/<id>" | "intents/<id>" | "authoring/<id>" |
+   * "environment" | "config/playbook.config.yaml" | "project.json" |
+   * ".gitignore" | path. */
+  unit: string;
+  kind: SpaceUnitKind;
+  label: string;
+  detail?: string;
+  change: SpaceChange;
+  sessionId?: string;
+  intentId?: string;
+  paths: string[];
+  /** Whether `space.diff` can show this unit. */
+  diff: boolean;
+}
+
+export interface SpaceSide {
+  change: SpaceChange;
+  at?: number;
+  detail?: string;
+  diff: boolean;
+}
+
+export interface SpaceConflict {
+  unit: SpaceUnit;
+  mine: SpaceSide;
+  remote: SpaceSide;
+}
+
+export type SpaceSyncPhase =
+  | { phase: "idle" }
+  | {
+      phase: "running";
+      op: SpaceOp;
+      /** The placement in flight: its instance's origin, or null for the
+       * path placement (space-30, DR-128). */
+      placement?: string | null;
+      step: SyncStep;
+      since: number;
+      cancelable: boolean;
+    }
+  /** `placement`: the one in choices or with an unrelated history, its
+   * instance's origin or null for the path placement (space-30). */
+  | { phase: "choices"; placement: string | null; savedCommit: string | null }
+  | { phase: "unrelated"; placement: string | null }
+  | {
+      phase: "stopped";
+      op: SpaceOp;
+      step: SyncStep;
+      cause: SyncCause;
+      message: string;
+      guidance: string;
+      retry: boolean;
+      /** A leave's units no remaining placement received (space-98). */
+      count?: number;
+      /** On a seat, the https code host a join's failed code clone
+       * needs a credential of the member's for, or whose credential of
+       * theirs cannot be read, by the name the Credentials section
+       * takes it (space-103, settings-48); absent for any other
+       * failure. */
+      credential?: string;
+    }
+  | { phase: "done"; at: number; sent: number; received: number; pushed: boolean };
+
+/** One spex repository as the Space surface reads it (space-30,
+ * space-61, DR-128): one row per clone, with a line per placement. */
+/** What a project row's code phrase says (space-1, core-service-145). */
+export type CodeKind = "space" | "elsewhere" | "none" | "unknown";
+
+export interface RepositoryState {
+  /** The clone's path under `workspace/`, beginning with its instance's
+   * folder where it lies at an instance (`@spex.sublang.ai/acme/a-spex`,
+   * DR-127); for a row the host lists in a group held as colliding,
+   * `<folder>/<path>@<id>`, naming no clone (space-61). */
+  key: string;
+  /** Its instance's origin (storage-31, DR-127): the one its key's
+   * folder names, the one a migration deferred it to, else the one its
+   * remote's name names; for a row an instance lists and this device
+   * lacks, that instance's; null for a clone with none. */
+  instance: string | null;
+  /** The origin of the instance governing it (git-host-5, space-61): its
+   * instance while signed in there, else the earliest signed-in instance
+   * in the home's list that lists it — for a clone at the host whose key
+   * and remote name no instance, the default instance while signed in
+   * there, as its row reads; for a row an instance lists and this device
+   * lacks, that instance's; null while none does — local only, a remote
+   * the reader named, or its instance signed out with no signed-in
+   * instance listing it. Its members panel and its Sync's refusal read
+   * it (space-1). */
+  governing: string | null;
+  /** `<name>-spex`, the clone's folder name. */
+  name: string;
+  /** Its first placement's host id, or the listed repository's with no
+   * clone here; null where none is known. */
+  id: string | null;
+  /** Your own group's spex repository. */
+  own: boolean;
+  /** Where a project's code is, as its row's code glyph is titled
+   * (space-1, core-service-145): "Code: <where>", <where> the display
+   * name of the listed instance under whose reported Git origin the
+   * remote its `project.json` names lies, else that remote's host as the
+   * reader set it, or the remote itself where it names no host; "Code:
+   * no remote" where `project.json` names none; null while the default
+   * instance or an instance the home lists has not reported its Git
+   * origin, and for a repository with no `project.json` — a group's own,
+   * your own group's own. */
+  code: string | null;
+  /** What `code` says, for the glyph a client draws (space-1):
+   * "space" under a listed instance's reported Git origin, "elsewhere"
+   * outside all of them, "none" where `project.json` names no remote —
+   * a warning — and "unknown" where `code` is null, which draws nothing. */
+  codeKind: CodeKind;
+  /** The working folder paired with it on this device, or null. */
+  folder: string | null;
+  /** The row's state (space-61). */
+  state: "local-only" | "reachable" | "read-only" | "unreachable" | "absent";
+  /** The host's words for read-only or unreachable. */
+  reason: string | null;
+  /** A Git merge pending from a terminal in the clone (space-11); false
+   * where no clone is here. */
+  mergePending: boolean;
+  /** In the order added, the path placement last, then each a placement
+   * file names that a signed-in instance lists and no remote here holds,
+   * then each instance a creation waits at (space-87); empty while local
+   * only but for a creation waiting; for a row with no clone, its one
+   * listed placement, `attached` false. */
+  placements: PlacementState[];
+  /** The origin of each instance a placement file of the clone names,
+   * held here or not (space-62). */
+  placedAt: string[];
+  local: SpaceUnit[];
+  /** Every placement's, in the placements' order. */
+  conflicts: SpaceConflict[];
+  sync: SpaceSyncPhase;
+}
+
+/** A clone's `spex` against one placement's (space-30, space-61). */
+export interface PlacementBranch {
+  ahead: number | null;
+  behind: number | null;
+  checkedAt: number | null;
+  hostEmpty: boolean;
+  unrelated: boolean;
+  /** The last sync the clone holds with this placement (space-61): the
+   * commit `spex` last shared with its `spex` as the clone last fetched
+   * or pushed it — its commit time, and whether `spex` is that commit;
+   * null where the clone holds none. */
+  agreed: { at: number; current: boolean } | null;
+}
+
+/** One placement of a spex repository, as its row's line reads it
+ * (space-30, space-87, DR-128). */
+export interface PlacementState {
+  /** Its instance's origin; null for the path placement. */
+  instance: string | null;
+  /** Its path in the instance, or the path placement's remote as a
+   * report reads it (space-15). */
+  path: string;
+  /** The host's id there. */
+  id: string | null;
+  /** False for one a placement file names, or a creation waits at, and
+   * no remote here holds (space-87). */
+  attached: boolean;
+  state: "reachable" | "read-only" | "unreachable" | "absent";
+  /** The host's words for read-only or unreachable. */
+  reason: string | null;
+  /** A creation or branch preparation waiting at the host (space-64). */
+  waiting: { step: "create" | "branch"; group: string; message: string } | null;
+  members: number | null;
+  visibility: string | null;
+  /** What its instance's last read said the person may do on it —
+   * manage its members, move it to another group; both false until one
+   * is held. */
+  can: { manageMembers: boolean; transfer: boolean };
+  /** Against this placement's `spex`; null where no clone holds it. */
+  branch: PlacementBranch | null;
+  incoming: SpaceUnit[];
+  /** Its incoming units this device changed too, each a choice to make
+   * (space-8). */
+  conflicts: SpaceConflict[];
+  lastSync: { at: number; sent: number; received: number } | null;
+  noticed: boolean;
+  /** What the last sync left on its line (space-87). */
+  outcome:
+    | null
+    | { kind: "synced" | "behind" | "choices" | "unrelated" | "waiting"; sent: number; received: number }
+    | { kind: "stopped"; step: SyncStep; cause: SyncCause; message: string; guidance: string; retry: boolean };
+}
+
+/** A spex repository's or a group's member as the host reports them
+ * (space-30, space-62): no page of the host (DR-120). */
+export interface HostMemberInfo {
+  id: string;
+  login: string;
+  displayName: string | null;
+  role: string;
+  /** The repository's or group's own membership (space-30, DR-114). */
+  direct: boolean;
+  /** The path in the instance of the group the membership comes through
+   * where it is not direct, else null. */
+  via: string | null;
+}
+
+/** A team server a signed-in instance lists for the person
+ * (core-service-128, DR-133): its instance's origin, its id there, its
+ * name, its group's path in the instance, and whether a seat this core
+ * opened is open at it. */
+export interface ServerInfo { instance: string; id: string; name: string; group: string; open: boolean }
+
+/** `server.list`'s reply (core-service-128): every server each signed-in
+ * instance lists, in the home's order of instances and each instance's
+ * own, and one entry per instance whose read failed, with the failure as
+ * the reader reads it (git-host-11); one instance failing hides no
+ * other's servers. */
+export interface ServerListing { servers: ServerInfo[]; failures: { instance: string; message: string }[] }
+
+/** A seat's relay (core-service-128, core-service-129): connecting to
+ * the seat, open, closed, or mismatched — the seat speaking another
+ * protocol version. */
+export type SeatRelayState = "connecting" | "open" | "closed" | "mismatched";
+
+/** A seat's sign-in at its instance (core-service-142): pending until
+ * the seat's hello and its Groups state are read; running while the
+ * seat's flow waits for the person's approval at `verificationUri`, the
+ * instance's page with the code carried in it, until `expiresAt` in
+ * Unix milliseconds; signed in once the seat's Groups state lists its
+ * instance signed in; failed with the seat's one-sentence cause. Nothing
+ * of the seat's app token. */
+export type SeatSignIn =
+  | { state: "pending" }
+  | { state: "running"; verificationUri: string; expiresAt: number }
+  | { state: "signedIn" }
+  | { state: "failed"; cause: string };
+
+/** An open seat (core-service-128, DR-133): its instance's origin, its
+ * server's id there, the server's name and group, its place, the lease's
+ * expiry in Unix milliseconds, its relay's state and its sign-in at the
+ * instance (core-service-142). Never its endpoint or its bearer. */
+export interface SeatState {
+  instance: string;
+  serverId: string;
+  name: string;
+  group: string;
+  /** `<instance origin>#<server id>` (storage-45): the place, shown by
+   * the server's name. */
+  place: string;
+  leaseExpiresAt: number;
+  relay: SeatRelayState;
+  signIn: SeatSignIn;
+}
+
+/** The home, its groups and their spex repositories (space-30,
+ * DR-127): your own group, then every instance the home lists with its
+ * groups. */
+export interface GroupsState {
+  home: string;
+  git: { ok: true; version: string } | { ok: false; guidance: string };
+  /** The default instance's origin, which the sign-in card holds (space-3). */
+  defaultInstance: string;
+  signIn:
+    | { phase: "idle" }
+    /** `instance`: the origin being signed in to. */
+    | { phase: "running"; instance: string; flow: "browser" | "device"; userCode?: string; verificationUri?: string; since: number }
+    | { phase: "failed"; instance: string; cause: "denied" | "expired" | "refused" | "unreachable"; message: string };
+  /** Your own group, keyed `own`: its folder name; whether that folder
+   * still bears this device's user name, as it does until a sign-in names
+   * it after a login (storage-2, space-59), which its heading reads
+   * (space-1); and its rows — its own spex repository and the clones no
+   * instance's heading holds (space-1). */
+  own: { name: string; named: boolean; repositories: RepositoryState[] };
+  /** Every instance the home lists, in its order (space-1). */
+  instances: InstanceState[];
+  diagnostics: { file: string; reason: string; blocking: boolean; repair?: DiagnosticRepair }[];
+  /** What the header counts (space-1): the repairs this device's
+   * reader has not answered, plus every diagnostic no repair folds.
+   * Carried as one number so header and list cannot disagree. */
+  issues: number;
+}
+
+/** An instance the home lists, as the Space surface heads it (space-30,
+ * DR-127). */
+export interface InstanceState {
+  /** The instance's origin, naming it in every command. */
+  origin: string;
+  /** Its host name. */
+  host: string;
+  /** As last read, null until one is. */
+  displayName: string | null;
+  /** The account there; `canCreateGroup` as its last read said (DR-114),
+   * false until one is held. */
+  account: { id: string; login: string; displayName: string | null; canCreateGroup: boolean };
+  signedIn: boolean;
+  /** It signed this device out (git-host-4), held for the core's run
+   * (space-3). */
+  hostSignedOut: boolean;
+  /** Its full read and accepted Refresh setup; idle while signed out. */
+  read: { phase: "idle" } | { phase: "running" } | { phase: "failed"; message: string };
+  /** Its last complete view, retained while reading or after failure. */
+  readAt: number | null;
+  /** Its own roles in its order, empty until a read is held. */
+  roles: { id: string; name: string; mayPush: boolean }[];
+  /** Its groups, your namespace there, and each other account's login
+   * under which it lists a spex repository (space-1). */
+  groups: InstanceGroupState[];
+}
+
+/** A group an instance lists, or a namespace there (space-30): keyed with
+ * its instance by id, a namespace by login. */
+export interface InstanceGroupState {
+  /** The host's id; null for a namespace and for a key's group no read
+   * lists. */
+  id: string | null;
+  /** A namespace's login — your login there, `mine`, or another
+   * account's; null for a group. */
+  login: string | null;
+  mine: boolean;
+  /** The path in the instance. */
+  fullPath: string;
+  name: string;
+  /** What its last read said the person may do there; all false until
+   * one is held, and in a namespace. */
+  can: { createSubgroup: boolean; manageMembers: boolean; rename: boolean; delete: boolean };
+  /** The rows standing elsewhere one of whose placements this group or
+   * namespace holds, each shown as one line (space-1, DR-128). */
+  placed: { key: string; name: string }[];
+  repositories: RepositoryState[];
+}
+
+/** One entry of a `space.tree` level of a clone, annotated from the
+ * catalog (space-23, space-35). */
+export interface SpaceEntry {
+  name: string;
+  path: string;
+  kind: "file" | "dir" | "git";
+  family: string;
+  sync: "shared" | "pending" | "local" | "git";
+  size?: number;
+  count?: number;
+  mtime?: number;
+  owner?: { sessionId?: string; intentId?: string; title?: string };
+  preview: "text" | "withheld" | "binary" | "none";
+}
+
+export type SpaceReadResult =
+  | { kind: "text"; text: string; lines: number; truncated: boolean }
+  | { kind: "withheld"; reason: string }
+  | { kind: "binary"; size: number };
+
+// ---------------------------------------------------------------------------
+// Core → client messages
+// ---------------------------------------------------------------------------
+
+export type ErrorCode =
+  | "invalid_message"
+  | "invalid_request"
+  | "invalid_config"
+  | "not_found"
+  | "busy"
+  | "aborted"
+  | "conflict"
+  | "internal";
+
+export interface HelloMessage {
+  type: "hello";
+  protocolVersion: number;
+  coreVersion: string;
+}
+
+export type ReplyMessage =
+  | { type: "reply"; id: string; ok: true; result: unknown }
+  | {
+      type: "reply";
+      id: string;
+      ok: false;
+      /** `details` carries the facts a page acts on — never its words
+       * (core-service-111): a conflict's registered path, for one, or
+       * a refused initial commit's `output`, Git's own words relayed
+       * whole beneath the core's (projects-34). */
+      error: { code: ErrorCode; message: string; details?: Record<string, unknown> };
+    };
+
+export interface RecordMessage {
+  type: "record";
+  channel: "session" | "debug";
+  sessionId: string;
+  seq: number;
+  record: TmuxPlayRecord;
+  /** The role this player record's call served — see StoredRecord. */
+  role?: string;
+}
+
+export interface ConfigStateMessage {
+  type: "config.state";
+  state: ConfigState;
+  /** Each project's composed configuration, as `config.get` with its
+   * `projectId` answers it, keyed by the project's id: what a session
+   * of that project offers and runs with (core-service-2). Absent while
+   * your own group's config is not valid. */
+  projects?: Record<string, ConfigState>;
+}
+
+export interface ReadinessStateMessage {
+  type: "readiness.state";
+  entries: ReadinessEntry[];
+}
+
+/** A stored session was deleted (DR-038): clients drop every trace. */
+export interface SessionRemovedMessage {
+  type: "session.removed";
+  sessionId: string;
+  projectId: string;
+}
+
+export interface SessionHistoryReplacedMessage {
+  type: "session.history-replaced";
+  sessionId: string;
+}
+
+export interface SessionStateMessage {
+  type: "session.state";
+  session: SessionInfo;
+}
+
+export interface CompileProgressMessage {
+  type: "compile.progress";
+  playbookId: string;
+  /** An authoring session's compile names the session's instance. */
+  instance?: string;
+  line: string;
+}
+
+/** The ledger changed for these projects: an intents write landed, or
+ * a session event moved a derived state (DR-035). Clients re-pull
+ * ledger.get; the payload names the projects so a narrow view may
+ * skip a foreign change. */
+export interface IntentsChangedMessage {
+  type: "intents.changed";
+  projectIds: string[];
+}
+
+/** The home's interface language was set (core-service-109):
+ * broadcast to every connected client, so every page of the home
+ * follows one choice. */
+export interface LanguageStateMessage {
+  type: "language.state";
+  language: Language | null;
+}
+
+/** A repository's machine moved, or `space.remote.set` or a sync's
+ * Refresh step landed (space-29): broadcast to every client, the
+ * state replacing the last one wholesale. */
+/** An environment changed: after a resolve, an install, a publish or a
+ * sync-applied lock (environments-17). */
+export interface EnvironmentStateMessage {
+  type: "environment.state";
+  repository: string;
+  state: EnvironmentState;
+}
+
+export type SignInCompletion =
+  | { account: { id: string; login: string; displayName: string | null } }
+  | { error: unknown };
+
+export type SpaceSignInCompletedMessage = {
+  type: "space.signin.completed";
+  id: string;
+  instance: string;
+} & (
+  | { ok: true; account: { id: string; login: string; displayName: string | null } }
+  | { ok: false; error: { code: ErrorCode; message: string; details?: Record<string, unknown> } }
+);
+
+export interface SpaceStateMessage {
+  type: "space.state";
+  state: GroupsState;
+}
+
+/** The open seats, whole (core-service-128): broadcast to every client
+ * on every change, and sent to each client as it connects. */
+export interface ServerStateMessage {
+  type: "server.state";
+  seats: SeatState[];
+}
+
+/** One authoring record, to the subscribers of the draft's channel. */
+export interface DraftRecordMessage {
+  type: "draft.record";
+  draftId: string;
+  instance: string;
+  seq: number;
+  record: TmuxPlayRecord;
+}
+
+/** Broadcast to every client on every transition (core-service-96). */
+export interface DraftStateMessage {
+  type: "draft.state";
+  draft: DraftInfo;
+}
+
+/** The draft's source changed on disk — an agent write, a Boss edit,
+ * or a paste — broadcast to every client (playbook-library-71).
+ * compile.progress is reused, keyed by the draft's id. */
+export interface DraftSourceMessage {
+  type: "draft.source";
+  draftId: string;
+  instance: string;
+  markdown: string;
+  version: string;
+  mtime: number;
+}
+
+/** A draft was retired by registration or deleted (playbook-library-70):
+ * broadcast to every client, which drops every trace of it. */
+/** A sync applied the spex repository holding the session: a client
+ * showing it reads its transcript again (core-service-96). */
+export interface DraftHistoryReplacedMessage {
+  type: "draft.history-replaced";
+  draftId: string;
+  instance: string;
+}
+
+export interface DraftRemovedMessage {
+  type: "draft.removed";
+  projectId: string;
+  draftId: string;
+  /** The instance removed; absent for a session file that would not read. */
+  instance?: string;
+}
+
+export interface BrowserProgressMessage { type: "browser.progress"; operationId: string; progress: BrowserSetupProgress }
+
+export type ServerMessage =
+  | ApprovalStateMessage
+  | BrowserProgressMessage
+  | HelloMessage
+  | ReplyMessage
+  | RecordMessage
+  | ConfigStateMessage
+  | ReadinessStateMessage
+  | SessionStateMessage
+  | SessionRemovedMessage
+  | SessionHistoryReplacedMessage
+  | CompileProgressMessage
+  | IntentsChangedMessage
+  | LanguageStateMessage
+  | SpaceSignInCompletedMessage
+  | { type: "registry.state"; state: RegistryState }
+  | SpaceStateMessage
+  | ServerStateMessage
+  | EnvironmentStateMessage
+  | DraftRecordMessage
+  | DraftStateMessage
+  | DraftSourceMessage
+  | DraftHistoryReplacedMessage
+  | DraftRemovedMessage;
+
+// ---------------------------------------------------------------------------
+// Parsing helpers
+// ---------------------------------------------------------------------------
+
+export type ParseCommandResult =
+  | { ok: true; command: Command }
+  | { ok: false; error: string; id?: string };
+
+/** Parse and validate one inbound client message (CORE-13). */
+export function parseCommand(raw: unknown): ParseCommandResult {
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return { ok: false, error: "message is not valid JSON" };
+    }
+  }
+  const result = commandSchema.safeParse(value);
+  if (result.success) {
+    const command = result.data;
+    // A submission naming a queued intent may rely on that intent's own
+    // attachments; the service checks it once they are resolved.
+    if ((command.type === "intent.queue" || command.type === "draft.send" ||
+      (command.type === "turn.submit" && command.intentId === undefined)) &&
+      command.text.length === 0 && !command.attachments?.length) {
+      return { ok: false, error: "text or an attachment is required", id: command.id };
+    }
+    // A group is a host id at one instance, so a command naming one names
+    // that instance too; a spex repository's key names its own (space-29).
+    if ((command.type === "space.members" || command.type === "space.share" || command.type === "space.unshare") &&
+      command.group !== undefined && command.instance === undefined) {
+      return { ok: false, error: "instance: a group is named with its instance", id: command.id };
+    }
+    // Choices, a join and a notice are each for one placement, which the
+    // sync names (space-29, DR-128).
+    if (command.type === "space.sync" && command.placement === undefined &&
+      (command.choices !== undefined || command.join !== undefined || command.noticed !== undefined)) {
+      return { ok: false, error: "placement: required with choices, join or noticed", id: command.id };
+    }
+    return { ok: true, command };
+  }
+  const maybeId =
+    typeof value === "object" &&
+    value !== null &&
+    "id" in value &&
+    typeof (value as { id: unknown }).id === "string"
+      ? (value as { id: string }).id
+      : undefined;
+  return {
+    ok: false,
+    error: result.error.issues
+      .map((issue) => `${issue.path.join(".") || "message"}: ${issue.message}`)
+      .join("; "),
+    id: maybeId,
+  };
+}

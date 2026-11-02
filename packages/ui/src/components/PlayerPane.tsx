@@ -1,0 +1,827 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// Read-only streaming player transcript (RUN-2/4/5): markdown text,
+// collapsed tool-use cards, collapsed thinking, per-turn usage.
+
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import type { SessionInfo } from "@sublang/spex-core/protocol";
+
+import type { PlayerView, TranscriptSegment, UsageView } from "../state/reducer.js";
+import { useStickToBottom, jumpPillClasses } from "../lib/useStickToBottom.js";
+import { absoluteTitle, clockTime, duration } from "../lib/time.js";
+import { currentLocale, i18n } from "../i18n.js";
+import { mediaOrigin } from "../lib/media.js";
+import { inputBlocks, outputBlock } from "../lib/tool-body.js";
+import { useClock } from "../lib/useClock.js";
+import { FAST_MODE_MARK } from "./AgentChip.js";
+import { AgentChipButton, agentReading, reportedPhrase } from "./AgentSettings.js";
+import {
+  AgentActiveTime,
+  activeTimeDescription,
+  activeTimeDescriptionId,
+} from "./AgentActiveTime.js";
+import type { SessionAgent } from "../lib/session-agents.js";
+import { StoredMedia, assetReference, DeferredToolOutput } from "./StoredMedia.js";
+import { Markdown } from "./Markdown.js";
+import { RunningMark } from "./RunningMark.js";
+import { AgentMark } from "./AgentMark.js";
+import { callPlace } from "./CallLines.js";
+import type { StepCall, StepCallState } from "../lib/step-calls.js";
+
+const RENDER_WINDOW = 200;
+
+function timeTitle(at: number): string {
+  return Number.isFinite(at) ? new Date(at).toLocaleString(currentLocale()) : "";
+}
+
+/** Prints only the tokens the call reported. A runtime that told us
+ * nothing about tokens gets silence, not a zero it never measured
+ * (DR-032); a cost it reported is never shown (DR-044). */
+function Usage({ usage }: { usage: UsageView }) {
+  if (usage.inputTokens === undefined && usage.outputTokens === undefined) {
+    return null;
+  }
+  return (
+    <span className="text-xs text-neutral-500">
+      {i18n._({
+        id: "{input}→{output} token",
+        values: {
+          input: (usage.inputTokens ?? 0).toLocaleString(currentLocale()),
+          output: (usage.outputTokens ?? 0).toLocaleString(currentLocale()),
+        },
+        comment: "a call's tokens in and out; token stays as it is",
+      })}
+    </span>
+  );
+}
+
+/** The keys a tool call names its subject with, in the order the
+ * card reads them (run-view-4). */
+const SUBJECT_KEYS = [
+  "command",
+  "file_path",
+  "path",
+  "pattern",
+  "url",
+  "query",
+  "prompt",
+  "description",
+] as const;
+
+/** What the call acts on, in one line: a collapsed card that says only
+ * "Bash" leaves the reader guessing at every step of a run. */
+/** The call a lane is on, or was last on: its latest prompt names the
+ * role it served and when it opened (run-view-7). */
+export function latestCall(
+  view: PlayerView,
+): { role?: string; at: number } | undefined {
+  for (let i = view.segments.length - 1; i >= 0; i -= 1) {
+    const segment = view.segments[i];
+    if (segment.kind === "prompt") {
+      return { at: segment.at, ...(segment.role ? { role: segment.role } : {}) };
+    }
+  }
+  return undefined;
+}
+
+/** The seq of the open call's prompt: every tool card after it with
+ * no result yet is still at work (run-view-4). */
+function openCallSeq(view: PlayerView): number | undefined {
+  if (!view.running) return undefined;
+  for (let i = view.segments.length - 1; i >= 0; i -= 1) {
+    const segment = view.segments[i];
+    if (segment.kind === "prompt") return segment.seq;
+  }
+  return undefined;
+}
+
+function pendingTool(segment: TranscriptSegment, openSeq: number | undefined): boolean {
+  return openSeq !== undefined && segment.kind === "tool" &&
+    segment.status === undefined && segment.seq > openSeq;
+}
+
+function toolSubject(input: unknown): string | undefined {
+  const raw =
+    typeof input === "string"
+      ? input
+      : input && typeof input === "object"
+        ? SUBJECT_KEYS.map(
+            (key) => (input as Record<string, unknown>)[key],
+          ).find((value): value is string => typeof value === "string")
+        : undefined;
+  const line = unwrapShell(raw ?? "").trim().replace(/\s+/g, " ");
+  return line ? line : undefined;
+}
+
+/** A command an agent's runner wrapped as `<shell> -lc <command>` —
+ * codex runs every command through a login shell — is the inner
+ * command as it was typed, its wrapper quotes gone (run-view-4). */
+export function unwrapShell(command: string): string {
+  const match = /^\s*(?:\/bin\/|\/usr\/bin\/)?(?:zsh|bash|sh)\s+-l?c\s+([\s\S]+)$/.exec(
+    command,
+  );
+  if (!match) return command;
+  const inner = match[1].trim();
+  const quote = inner[0];
+  if ((quote === "'" || quote === '"') && inner.endsWith(quote) && inner.length >= 2) {
+    const body = inner.slice(1, -1);
+    return quote === '"' ? body.replace(/\\(["\\$`])/g, "$1") : body.replace(/'\\''/g, "'");
+  }
+  return inner;
+}
+
+/** The tool name as a person reads it: a runner's wire name for its
+ * shell tool reads "shell"; every other name stands as the runner
+ * gave it. */
+export function toolLabel(name: string): string {
+  return name === "command_execution" ? "shell" : name;
+}
+
+/** One transcript segment as the pane draws it (run-view-3/4):
+ * exported so the authoring thread renders the agent's segments with
+ * the same cards (playbook-library-53). */
+export function Segment({
+  segment,
+  call,
+  onShowDispatch,
+  now,
+}: {
+  segment: TranscriptSegment;
+  /** Set only on a tool card still at work in the open call: the
+   * clock its running span reads against (run-view-4). */
+  now?: number;
+  /** The traced call a prompt began, whose step it names (run-view-181). */
+  call?: StepCall;
+  onShowDispatch?: (callKey: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  switch (segment.kind) {
+    case "prompt": {
+      const place = call ? callPlace(call) : undefined;
+      return (
+        <div data-call-block={segment.callKey} className="flex flex-col gap-1">
+        {call && place ? (
+          // Which playbook's which step this call runs, leading back to
+          // the Captain's delegation line (run-view-181).
+          <button
+            type="button"
+            data-testid={`call-label-${segment.seq}`}
+            onClick={() => onShowDispatch?.(call.key)}
+            title={place.full}
+            className="self-start rounded text-left text-xs font-medium text-neutral-700 hover:text-brand-600 dark:text-neutral-300 dark:hover:text-brand-300"
+          >
+            {place.short}
+          </button>
+        ) : null}
+        <details
+          title={timeTitle(segment.at)}
+          className="rounded border border-neutral-200 bg-neutral-100/60 px-2 py-1 text-xs text-neutral-600 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-400"
+        >
+          <summary className="cursor-pointer select-none">
+            {/* A lane answers several roles over a session, so the call
+                that opens here says which one it served (DR-032). */}
+            {segment.role ? (
+              <span
+                data-testid={`call-role-${segment.seq}`}
+                className="mr-2 rounded bg-brand-50 px-1.5 py-0.5 font-mono text-xs text-brand-700 dark:bg-brand-950 dark:text-brand-300"
+              >
+                {segment.role}
+              </span>
+            ) : null}
+            {i18n._({
+              id: "Prompt",
+              comment: "collapsed card: the text the playbook sent the player",
+            })}
+            {/* The call's clock, in the thread's one vocabulary
+                (run-view-41); the exact moment stays in the tooltip. */}
+            <time
+              dateTime={new Date(segment.at).toISOString()}
+              className="ml-2 text-xs tabular-nums text-neutral-500"
+            >
+              {clockTime(segment.at)}
+            </time>
+          </summary>
+          <pre className="mt-1 whitespace-pre-wrap [overflow-wrap:anywhere] font-mono text-xs">
+            {segment.text}
+          </pre>
+        </details>
+        </div>
+      );
+    }
+    case "text":
+      return (
+        <div>
+          <Markdown text={segment.text} links="web-only" />
+          {segment.streaming ? (
+            <span className="inline-block h-3 w-1.5 animate-pulse bg-neutral-400 align-baseline" />
+          ) : null}
+        </div>
+      );
+    case "media":
+      return <StoredMedia media={segment.media} origin={mediaOrigin(segment.origin)} />;
+    case "thinking":
+      return (
+        <details className="rounded border border-dashed border-neutral-300 px-2 py-1 text-xs italic text-neutral-500 dark:border-neutral-700">
+          <summary className="cursor-pointer select-none not-italic">
+            {i18n._({
+              id: "Thinking",
+              comment: "collapsed card: the agent's own reasoning summary",
+            })}
+          </summary>
+          <div className="mt-1 whitespace-pre-wrap">{segment.summary}</div>
+        </details>
+      );
+    case "tool": {
+      const subject = toolSubject(segment.input);
+      const deferred = assetReference(segment.output);
+      // The glyph's hue says how the call ended; the word and the
+      // mark say it too, so color is never the only channel
+      // (run-view-50).
+      const outcome =
+        segment.status === "success"
+          ? {
+              word: i18n._({
+                id: "ok",
+                comment: "how a tool call ended: it succeeded",
+              }),
+              mark: "✓",
+              tone: "text-emerald-700 dark:text-emerald-400",
+            }
+          : segment.status === "error"
+            ? {
+                word: i18n._({
+                  id: "failed",
+                  comment: "how a tool call ended: it failed",
+                }),
+                mark: "✗",
+                tone: "text-red-600 dark:text-red-400",
+              }
+            : segment.status === "denied"
+              ? {
+                  word: i18n._({
+                    id: "denied",
+                    comment: "how a tool call ended: permission was refused",
+                  }),
+                  mark: "✗",
+                  tone: "text-red-600 dark:text-red-400",
+                }
+              : undefined;
+      // A card still at work says so on its own row, collapsed or not:
+      // the running mark where the ending's mark will stand, and its
+      // ticking span, on a tinted ground (run-view-4).
+      const working = now !== undefined && !outcome;
+      return (
+        <details
+          data-running={working ? "true" : undefined}
+          onToggle={(event) => setExpanded(event.currentTarget.open)}
+          className={`rounded border px-2 py-1 text-xs ${
+            working
+              ? "border-emerald-300 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/40"
+              : "border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900"
+          }`}
+        >
+          <summary className="min-w-0 cursor-pointer select-none font-mono">
+            {/* Long tool names wrap in narrow lanes; the subject takes
+                remaining room and elides without widening the pane. */}
+            <span className="inline-flex w-[calc(100%-1.25rem)] min-w-0 flex-wrap items-baseline gap-1.5 align-middle">
+              <span
+                aria-hidden="true"
+                className={outcome?.tone ?? "text-neutral-500"}
+              >
+                ⚒
+              </span>
+              <span className="min-w-0 max-w-full [overflow-wrap:anywhere]" title={segment.toolName}>
+                {toolLabel(segment.toolName)}
+              </span>
+              {working ? (
+                <span
+                  data-testid={`tool-running-${segment.seq}`}
+                  className="inline-flex shrink-0 items-center gap-1 self-center font-sans text-emerald-700 dark:text-emerald-400"
+                >
+                  <RunningMark running aria-hidden="true" />
+                  {i18n._({
+                    id: "running · {span}",
+                    values: { span: duration(Math.max(0, now - segment.at)) },
+                    comment: "a tool call still at work and how long it has run",
+                  })}
+                </span>
+              ) : null}
+              {outcome ? (
+                <span
+                  data-testid={`tool-status-${segment.seq}`}
+                  title={outcome.word}
+                  className={`shrink-0 ${outcome.tone}`}
+                >
+                  <span aria-hidden="true">{outcome.mark}</span>
+                  <span className="sr-only">{outcome.word}</span>
+                </span>
+              ) : null}
+              {segment.durationMs !== undefined ? (
+                <span
+                  data-testid={`tool-duration-${segment.seq}`}
+                  className="shrink-0 text-neutral-500"
+                >
+                  · {duration(segment.durationMs)}
+                </span>
+              ) : null}
+              {subject ? (
+                <span
+                  data-testid={`tool-subject-${segment.seq}`}
+                  className="min-w-0 flex-1 truncate text-neutral-500 dark:text-neutral-400"
+                >
+                  {subject}
+                </span>
+              ) : null}
+            </span>
+          </summary>
+          {/* Each string field verbatim, the rest as JSON, every line
+              wrapping inside the card (run-view-4). */}
+          <div
+            data-testid={`tool-body-${segment.seq}`}
+            className="relative mt-1 flex max-h-64 flex-col gap-1.5 overflow-y-auto"
+          >
+            {[...inputBlocks(segment.input), outputBlock(deferred ? undefined : segment.output)]
+              .filter((block) => block !== undefined)
+              .map((block, index) => (
+                <div key={index} className="min-w-0">
+                  {block.label ? (
+                    <div className="text-xs font-medium text-neutral-500 dark:text-neutral-400">
+                      {block.label}
+                    </div>
+                  ) : null}
+                  <pre
+                    data-kind={block.kind}
+                    className="whitespace-pre-wrap [overflow-wrap:anywhere] font-mono text-xs text-neutral-600 dark:text-neutral-400"
+                  >
+                    {block.text}
+                  </pre>
+                </div>
+              ))}
+            {deferred ? <DeferredToolOutput asset={deferred} visible={expanded} /> : null}
+          </div>
+        </details>
+      );
+    }
+    case "error":
+      // One line per failure (run-view-127): a repeat folds into a
+      // count whose meaning is also in text (DR-010 §7).
+      return (
+        <div
+          data-testid="player-failure"
+          title={timeTitle(segment.at)}
+          className="flex items-baseline gap-2 rounded border border-red-300 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300"
+        >
+          <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{segment.message}</span>
+          {segment.count !== undefined && segment.count > 1 ? (
+            <span
+              data-testid="player-failure-count"
+              title={i18n._(
+                "{count, plural, one {The same failure # time in this call} other {The same failure # times in this call}}",
+                { count: segment.count },
+              )}
+              className="shrink-0 font-medium"
+            >
+              <span aria-hidden="true">×{segment.count}</span>
+              <span className="sr-only">
+                {i18n._({
+                  id: "{count, plural, one {, # time} other {, # times}}",
+                  values: { count: segment.count },
+                  comment: "follows the ×N mark, for a screen reader: how many times",
+                })}
+              </span>
+            </span>
+          ) : null}
+        </div>
+      );
+    case "result":
+      return (
+        <div
+          title={timeTitle(segment.at)}
+          className="flex items-center gap-2 border-t border-neutral-200 pt-1 text-xs dark:border-neutral-800"
+        >
+          <span
+            data-testid="player-result"
+            // An error the failure line above already carries is not
+            // printed twice (run-view-127): the words stay in the tooltip.
+            title={segment.errorAbove ? segment.error : undefined}
+            className={
+              segment.status === "ok"
+                ? "text-emerald-700 dark:text-emerald-400"
+                : segment.status === "aborted"
+                  ? "text-neutral-600 dark:text-neutral-400"
+                  : "text-red-600 dark:text-red-400"
+            }
+          >
+            {segment.status === "ok"
+              ? i18n._({
+                  id: "✓ done",
+                  comment: "how a player's call ended; ✓ stays as it is",
+                })
+              : segment.status === "aborted"
+                ? i18n._({
+                    id: "◇ aborted",
+                    comment: "how a player's call ended; ◇ stays as it is",
+                  })
+                : segment.errorAbove
+                  ? i18n._({
+                      id: "✗ failed",
+                      comment: "how a player's call ended; ✗ stays as it is",
+                    })
+                  : i18n._({
+                      id: "✗ {error}",
+                      values: {
+                        error:
+                          segment.error ??
+                          i18n._({
+                            id: "error",
+                            comment: "stands where a failed call named no reason",
+                          }),
+                      },
+                      comment: "a failed call and what it said; ✗ stays as it is",
+                    })}
+          </span>
+          {segment.usage ? <Usage usage={segment.usage} /> : null}
+        </div>
+      );
+  }
+}
+
+/** The lane's foot while its call is open (run-view-7): what the
+ * player is doing now, read from the open call's latest entry, so a
+ * reader scrolled anywhere in the transcript sees the lane at work. */
+function WorkingLine({
+  view,
+  openSeq,
+  now,
+}: {
+  view: PlayerView;
+  openSeq: number | undefined;
+  now: number;
+}) {
+  const last = view.segments[view.segments.length - 1];
+  const open = last !== undefined && openSeq !== undefined && last.seq > openSeq ? last : undefined;
+  let doing: string;
+  let span: string | undefined;
+  let subject: string | undefined;
+  if (open && pendingTool(open, openSeq) && open.kind === "tool") {
+    doing = toolLabel(open.toolName);
+    span = duration(Math.max(0, now - open.at));
+    subject = toolSubject(open.input);
+  } else if (open?.kind === "text" && open.streaming) {
+    doing = i18n._({
+      id: "Writing a reply",
+      comment: "the lane's foot: the player is writing its reply",
+    });
+  } else {
+    doing = i18n._({
+      id: "Thinking…",
+      comment: "the lane's foot: the player is between steps, its model at work",
+    });
+  }
+  return (
+    <div
+      data-testid="player-working-line"
+      className="flex min-w-0 items-center gap-1.5 border-t border-emerald-200 bg-emerald-50/70 px-3 py-1 text-xs text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300"
+    >
+      <RunningMark running />
+      {/* Read aloud as one line: the mark's word, then each part apart. */}
+      <span className="sr-only">: </span>
+      {/* A long tool name, such as an MCP tool's, gives way before the span
+          and keeps half the line for the subject; its title holds it whole. */}
+      <span title={doing} className="min-w-0 max-w-[50%] truncate font-mono">
+        {doing}
+      </span>
+      {span ? <span className="shrink-0 whitespace-pre font-mono">{` · ${span}`}</span> : null}
+      {subject ? (
+        <span title={subject} className="min-w-0 flex-1 truncate font-mono text-neutral-500 dark:text-neutral-400">
+          <span className="sr-only">, </span>
+          {subject}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+export function PlayerPane({
+  view,
+  meta,
+  activeMs,
+  settings,
+  onEditSettings,
+  settingsAnchorRef,
+  settingsOpen = false,
+  settingsPopover,
+  collapsed = false,
+  onCollapsedChange,
+  name = view.id,
+  chipHighlighted = false,
+  calls,
+  onShowDispatch,
+}: {
+  view: PlayerView;
+  meta?: SessionInfo["players"][number];
+  /** The core-folded completed active time for this lane. */
+  activeMs?: number;
+  /** What this lane's agent is set to run, and the door to changing it
+   * for this conversation alone (run-view-139). */
+  settings?: SessionAgent;
+  onEditSettings?: () => void;
+  /** Set only while this lane's panel is the open one, so one anchor
+   * serves every pane (the Library's role-row idiom). */
+  settingsAnchorRef?: RefObject<HTMLButtonElement | null>;
+  settingsOpen?: boolean;
+  /** This agent's editor, beside its chip while it is open. */
+  settingsPopover?: ReactNode;
+  /** The lane stands as a rail (run-view-116). */
+  collapsed?: boolean;
+  onCollapsedChange?: (collapsed: boolean) => void;
+  /** The player's name over the session's roster (run-view-177). */
+  name?: string;
+  /** A failure's "Adjust" points at the chip before its popover opens
+   * (run-view-179). */
+  chipHighlighted?: boolean;
+  /** The traced calls the lane's call labels read (run-view-181). */
+  calls?: StepCallState;
+  onShowDispatch?: (callKey: string) => void;
+}) {
+  const [windowSize, setWindowSize] = useState(RENDER_WINDOW);
+  const { scrollRef, contentRef, onScroll, newBelow, jump, revealAbove } = useStickToBottom(
+    view.segments.length,
+  );
+  // The pane names the role its latest call served, and while that
+  // call is open, how long the player has been at it — ticking, so a
+  // minutes-long call never reads as a hang (DR-010 §5).
+  const call = latestCall(view);
+  const who = call?.role ?? name;
+  const now = useClock(view.running);
+  const activeDescription = activeMs === undefined
+    ? undefined
+    : activeTimeDescription(activeMs);
+  const activeDescriptionId = activeMs === undefined
+    ? undefined
+    : activeTimeDescriptionId(view.id);
+  // A folded lane's rail carries its chip's reading, what is set kept
+  // beside a reported model as on the chip itself (run-view-139).
+  const reported = settings ? reportedPhrase(settings) : undefined;
+  const railLabel = settings
+    ? `${view.id} · ${agentReading(settings)}${reported ? ` — ${reported}` : ""}`
+    : view.id;
+  // The role the latest call served reads before the name, unless it
+  // is the name again (run-view-177).
+  const role = call?.role && call.role !== name ? call.role : undefined;
+  const railTitle = activeDescription
+    ? `${railLabel} · ${activeDescription}`
+    : railLabel;
+  // The toggle hands focus to its counterpart once the pane has taken
+  // its other form (run-view-116): on the reader's own gesture, or
+  // when the control they were on left with the form — a lane that
+  // opens itself for its call (run-view-117) otherwise steals none.
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  const refocus = useRef(false);
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!refocus.current && !focused.current) return;
+    refocus.current = false;
+    toggleRef.current?.focus();
+  }, [collapsed]);
+  const toggleProps = {
+    type: "button" as const,
+    ref: toggleRef,
+    onClick: () => {
+      refocus.current = true;
+      onCollapsedChange?.(!collapsed);
+    },
+    onFocus: () => {
+      focused.current = true;
+    },
+    onBlur: () => {
+      focused.current = false;
+    },
+    className:
+      "flex h-6 w-6 shrink-0 items-center justify-center rounded text-neutral-500 hover:bg-neutral-100 hover:text-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-200",
+  };
+
+  if (collapsed) {
+    // The rail (run-view-116): the way back, the lane's running mark,
+    // and its name read down the rail's length — exempt from the pane
+    // floor, since it holds no transcript to fit.
+    return (
+      <section
+        data-testid={`player-pane-${view.id}`}
+        data-collapsed="true"
+        aria-describedby={activeDescriptionId}
+        className="flex min-h-0 w-9 flex-none flex-col items-center gap-2 rounded-lg border border-neutral-200 bg-white py-1.5 dark:border-neutral-800 dark:bg-neutral-900"
+      >
+        <button
+          {...toggleProps}
+          title={i18n._("Expand {player}", { player: name })}
+          aria-label={i18n._("Expand {player}", { player: name })}
+          aria-expanded={false}
+        >
+          <span aria-hidden="true">⇥</span>
+        </button>
+        {view.running ? (
+          <RunningMark
+            running
+            data-testid="player-running"
+            title={i18n._({
+              id: "Running",
+              comment: "tooltip on the aliveness mark: this lane is at work",
+            })}
+          />
+        ) : null}
+        <AgentMark player={name} size="sm" />
+        <span
+          data-testid={`player-name-${view.id}`}
+          title={railTitle}
+          className="min-h-0 overflow-hidden text-ellipsis whitespace-nowrap text-sm font-semibold [writing-mode:vertical-rl]"
+        >
+          {name}
+        </span>
+        {activeMs !== undefined ? (
+          <AgentActiveTime agentId={view.id} ms={activeMs} visible={false} />
+        ) : null}
+      </section>
+    );
+  }
+
+  const segments = view.segments.slice(-windowSize);
+  const openSeq = openCallSeq(view);
+  // The lane's frame wears its status (run-view-186): running while its
+  // call is open, failed where its last call failed.
+  const lastResult = [...view.segments].reverse().find((segment) => segment.kind === "result");
+  const laneTone = view.running
+    ? "border-emerald-400 dark:border-emerald-700"
+    : lastResult?.kind === "result" && lastResult.status === "error"
+      ? "border-red-300 dark:border-red-900"
+      : "border-neutral-200 dark:border-neutral-800";
+
+  return (
+    <section
+      data-testid={`player-pane-${view.id}`}
+      className={`@container grid min-h-min min-w-[280px] flex-1 grid-cols-[minmax(0,1fr)] grid-rows-[auto_minmax(min-content,1fr)_auto] rounded-lg border bg-white dark:bg-neutral-900 ${laneTone}`}
+    >
+      {/* One line at any pane width: identity and controls remain;
+          cumulative time yields before a live elapsed reading. */}
+      <header
+        aria-describedby={activeDescriptionId}
+        className="flex items-center gap-2 border-b border-neutral-200 px-3 py-1.5 dark:border-neutral-800"
+      >
+        <AgentMark player={name} />
+        <span
+          data-testid={`player-name-${view.id}`}
+          title={view.id}
+          className="shrink-0 text-sm font-semibold"
+        >
+          {role ? (
+            <>
+              {role}
+              <span className="font-normal text-neutral-400"> · </span>
+            </>
+          ) : null}
+          {name}
+        </span>
+        {settings && onEditSettings ? (
+          // The chip reads what this lane is set to run and is the
+          // control that changes it for this session (run-view-139).
+          // Its popover hangs from this box, so the panel arrives where
+          // the hand is rather than at a fixed corner (run-view-138).
+          <span
+            data-highlighted={chipHighlighted ? "1" : undefined}
+            className={`relative flex min-w-0 shrink rounded ${chipHighlighted ? "ring-2 ring-brand-400 dark:ring-brand-500" : ""}`}
+          >
+            <AgentChipButton
+              agent={settings}
+              onOpen={onEditSettings}
+              {...(settingsAnchorRef ? { anchorRef: settingsAnchorRef } : {})}
+              open={settingsOpen}
+            />
+            {settingsOpen ? settingsPopover : null}
+          </span>
+        ) : meta ? (
+          <span
+            title={meta.model ?? meta.adapter}
+            className="min-w-0 truncate rounded bg-neutral-100 px-1.5 py-0.5 text-xs whitespace-nowrap text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300"
+          >
+            {meta.model ?? meta.adapter}
+            {meta.fastMode ? (
+              // The player label wears the mark every chip wears
+              // (DR-038, run-view-25).
+              <span
+                data-testid="player-fast-mode"
+                title={i18n._({
+                  id: "fast mode",
+                  comment: "mark on an agent: it runs in the runtime's fast mode",
+                })}
+                aria-label={i18n._({
+                  id: "fast mode",
+                  comment: "mark on an agent: it runs in the runtime's fast mode",
+                })}
+                className="ml-1 text-amber-500"
+              >
+                {FAST_MODE_MARK}
+              </span>
+            ) : null}
+          </span>
+        ) : null}
+        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {view.running ? (
+            // The app's one running mark (run-view-61), its meaning in
+            // text as well as in the pulse — and the elapsed span of
+            // the open call beside it, hidden first in a narrow pane.
+            <>
+              <RunningMark
+                running
+                data-testid="player-running"
+                title={i18n._({
+                  id: "Running",
+                  comment: "tooltip on the aliveness mark: this lane is at work",
+                })}
+              />
+              {call ? (
+                <span
+                  data-testid="player-working"
+                  title={i18n._("{who} running since {since}", {
+                    who,
+                    since: absoluteTitle(call.at),
+                  })}
+                  className="hidden whitespace-nowrap text-xs text-neutral-500 @md:inline dark:text-neutral-400"
+                >
+                  {i18n._({
+                    id: "{who} running · {span}",
+                    values: { who, span: duration(now - call.at) },
+                    comment: "who is at work and how long the open call has run",
+                  })}
+                </span>
+              ) : null}
+            </>
+          ) : null}
+          {activeMs !== undefined ? (
+            <AgentActiveTime
+              agentId={view.id}
+              ms={activeMs}
+              visible={!view.running}
+            />
+          ) : null}
+        </span>
+        <button
+          {...toggleProps}
+          title={i18n._("Collapse {player}", { player: name })}
+          aria-label={i18n._("Collapse {player}", { player: name })}
+          aria-expanded
+        >
+          <span aria-hidden="true">⇤</span>
+        </button>
+      </header>
+      <div className="relative flex min-h-min flex-1 flex-col">
+        <div
+          ref={scrollRef}
+          onScroll={onScroll}
+          className="relative flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-2 [contain:size]"
+        >
+          <div ref={contentRef} className="flex min-h-full min-w-0 shrink-0 flex-col gap-2">
+            {view.segments.length > windowSize ? (
+              <button
+                type="button"
+                onClick={() => {
+                  revealAbove();
+                  setWindowSize((size) => size + RENDER_WINDOW);
+                }}
+                className="text-center text-xs text-neutral-500 hover:text-brand-500"
+              >
+                {i18n._("Show {count} of {rest} earlier entries", {
+                  count: Math.min(
+                    RENDER_WINDOW,
+                    view.segments.length - windowSize,
+                  ),
+                  rest: view.segments.length - windowSize,
+                })}
+              </button>
+            ) : null}
+            {segments.map((segment) => (
+              <Segment
+                key={segment.seq}
+                segment={segment}
+                call={segment.kind === "prompt" && segment.callKey
+                  ? calls?.calls.find((entry) => entry.key === segment.callKey)
+                  : undefined}
+                onShowDispatch={onShowDispatch}
+                {...(pendingTool(segment, openSeq) ? { now } : {})}
+              />
+            ))}
+          </div>
+        </div>
+        {newBelow ? (
+          <button type="button" onClick={jump} className={jumpPillClasses()}>
+            {i18n._({
+              id: "↓ Latest",
+              comment: "act: jump to the end of the transcript; ↓ stays as it is",
+            })}
+          </button>
+        ) : null}
+      </div>
+      {view.running ? <WorkingLine view={view} openSeq={openSeq} now={now} /> : null}
+    </section>
+  );
+}

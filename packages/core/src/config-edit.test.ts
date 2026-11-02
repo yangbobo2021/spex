@@ -1,0 +1,571 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 SubLang International <https://sublang.ai>
+
+// SET-17/18 coverage over the inline-agent ops (DR-019):
+// comment-preserving merge-patch round-trips, scalar-to-block
+// promotion, hand-written field survival, and launcher-parity
+// rejection that leaves the file untouched.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { parse } from "yaml";
+
+import {
+  applyConfigOp,
+  editConfigFile,
+  type AgentPatch,
+  type ConfigEditOp,
+} from "./config-edit.js";
+import { starterText, templatePath, type LoadModule, type PlaybookModules } from "./config.js";
+import { ARTIFACT_SCHEMAS } from "./config.js";
+import { scratchDir } from "./testing/scratch.js";
+
+function stubEntry(id: string, roles: string[]) {
+  return {
+    id,
+    command: id,
+    intent: `${id} stub`,
+    artifactSchema: ARTIFACT_SCHEMAS[0],
+    requiredRoleIds: roles,
+    validateOptions: () => ({}),
+    createRuntime: () => ({}),
+  };
+}
+
+const stubLoader: LoadModule = async (specifier) => {
+  if (specifier === "@sublang/playbook/code/registry") {
+    return { default: stubEntry("code", ["coder"]) };
+  }
+  if (specifier === "@sublang/playbook/review/registry") {
+    return { default: stubEntry("review", ["coder", "reviewer"]) };
+  }
+  if (specifier === "@sublang/playbook/decide/registry") {
+    return { default: stubEntry("decide", ["coder", "reviewer"]) };
+  }
+  if (specifier === "@sublang/playbook/inspect/registry") {
+    return { default: stubEntry("inspect", ["inspector"]) };
+  }
+  if (specifier === "@sublang/playbook/dev/registry") {
+    return { default: stubEntry("dev", ["analyst"]) };
+  }
+  if (specifier === "@sublang/playbook/branch/registry") {
+    return { default: stubEntry("branch", ["coder"]) };
+  }
+  if (specifier === "@sublang/playbook/pr/registry") {
+    return { default: stubEntry("pr", ["coder"]) };
+  }
+  if (specifier === "@stub/other") {
+    return { default: stubEntry("other", ["helper"]) };
+  }
+  throw new Error(`no module ${specifier}`);
+};
+
+function templateFile(): string {
+  const dir = scratchDir("spex-edit-");
+  const path = join(dir, "playbook.config.yaml");
+  writeFileSync(path, starterText(readFileSync(templatePath(), "utf8")));
+  return path;
+}
+
+/** The environments' module locations, standing in (environments-9). */
+const STUB_MODULES: PlaybookModules = {
+  repository: "me/me-spex",
+  find: (id) => ({ module: id === "other" ? "@stub/other" : `@sublang/playbook/${id}/registry`, builtin: true }),
+};
+
+function edit(path: string, op: ConfigEditOp, loader?: LoadModule) {
+  return editConfigFile(path, op, loader, { modules: STUB_MODULES });
+}
+
+/** Every comment in the text, content-level (the yaml library may
+ * normalize spacing before inline comments). */
+function comments(text: string): string[] {
+  return text.split("\n").flatMap((line) => {
+    const index = line.indexOf("#");
+    return index >= 0 ? [line.slice(index).trim()] : [];
+  });
+}
+
+function assertCommentsSurvive(before: string, after: string): void {
+  const afterComments = new Set(comments(after));
+  for (const comment of comments(before)) {
+    assert.ok(afterComments.has(comment), `lost comment: ${comment}`);
+  }
+}
+
+test("captain.set merge patch preserves comments and unrelated keys", async () => {
+  const path = templateFile();
+  const before = readFileSync(path, "utf8");
+  const result = await edit(
+    path,
+    { kind: "captain.set", patch: { model: "claude-opus-4-9", effort: "max" } },
+    stubLoader,
+  );
+  assert.equal(result.ok, true);
+  const after = readFileSync(path, "utf8");
+  // Every comment in the template survives the edit (the patched
+  // captain keys carry no inline comments of their own).
+  assertCommentsSurvive(before, after);
+  // Only the provided keys changed; the rest of the block and every
+  // unrelated key are untouched: the players keep the model Playbook
+  // 17.1's starter names.
+  assert.match(after, /captain:\n\s+adapter: claude\n\s+model: claude-opus-4-9\n\s+effort: max/);
+  assert.match(after, /model: claude-opus-5-5\n/);
+});
+
+test("player.set merge patch swaps a lane's vendor in place", async () => {
+  const path = templateFile();
+  const before = readFileSync(path, "utf8");
+  const result = await edit(
+    path,
+    {
+      kind: "player.set",
+      playerId: "dev.reviewer",
+      patch: { adapter: "codex", model: "gpt-5.5" },
+    },
+    stubLoader,
+  );
+  assert.equal(result.ok, true);
+  const after = readFileSync(path, "utf8");
+  // The role's own inline comment survives on the patched pair.
+  assert.match(
+    after,
+    /dev\.reviewer:\n\s+adapter: codex[^\n]*\n\s+model: gpt-5\.5\n\s+effort: xhigh/,
+  );
+  // Unrelated lanes and their comments survive, byte for byte: the
+  // coder's block as the installed template wrote it.
+  const coderBlock = before.slice(
+    before.indexOf("  dev.coder:"),
+    before.indexOf("\n\n", before.indexOf("  dev.coder:")),
+  );
+  assert.ok(after.includes(coderBlock), "the coder lane is untouched");
+  const option = await edit(
+    path,
+    {
+      kind: "playbook.option.set",
+      playbookId: "review",
+      key: "focus",
+      value: "committed-phases",
+    },
+    stubLoader,
+  );
+  assert.equal(option.ok, true);
+  assert.match(readFileSync(path, "utf8"), /focus: committed-phases/);
+});
+
+test("a scalar shorthand becomes a block on first edit", () => {
+  const text = `captain: claude\nplayers:\n  dev.coder: claude\n  dev.reviewer: codex\nplaybooks:\n  code:\n    roles:\n      coder: dev.coder\n`;
+  const captain = applyConfigOp(text, {
+    kind: "captain.set",
+    patch: { model: "claude-test" },
+  });
+  assert.match(captain, /captain:\n\s+adapter: claude\n\s+model: claude-test/);
+  const player = applyConfigOp(captain, {
+    kind: "player.set",
+    playerId: "dev.coder",
+    patch: { effort: "high" },
+  });
+  assert.match(player, /dev\.coder:\n\s+adapter: claude\n\s+effort: high/);
+  // The untouched scalar stays as written.
+  assert.match(player, /dev\.reviewer: codex/);
+});
+
+test("hand-written fields survive a model/effort patch", () => {
+  const text = `captain:
+  adapter: claude
+  model: claude-opus-4-8
+  instruction: keep answers short  # hand-written
+  permissions:
+    mode: auto
+    shellExecute: ask
+players:
+  dev.coder: claude
+  dev.reviewer: claude
+playbooks:
+  code:
+    roles:
+      coder: dev.coder
+`;
+  const patched = applyConfigOp(text, {
+    kind: "captain.set",
+    patch: { model: "claude-opus-4-9", effort: "high" },
+  });
+  assert.match(patched, /model: claude-opus-4-9/);
+  assert.match(patched, /effort: high/);
+  assert.match(patched, /instruction: keep answers short/);
+  assert.match(patched, /# hand-written/);
+  assert.match(patched, /shellExecute: ask/);
+  assert.match(patched, /mode: auto/);
+});
+
+test("an effort patch retires the legacy reasoningEffort key", () => {
+  const text = `captain:
+  adapter: claude
+  reasoningEffort: low
+players:
+  dev.coder:
+    adapter: claude
+    reasoningEffort: low
+  dev.reviewer: claude
+playbooks:
+  code:
+    roles:
+      coder: dev.coder
+`;
+  const captain = applyConfigOp(text, {
+    kind: "captain.set",
+    patch: { effort: "high" },
+  });
+  assert.match(captain, /captain:\n\s+adapter: claude\n\s+effort: high/);
+  const player = applyConfigOp(captain, {
+    kind: "player.set",
+    playerId: "dev.coder",
+    patch: { effort: "xhigh" },
+  });
+  assert.doesNotMatch(player, /reasoningEffort/);
+  assert.match(player, /dev\.coder:\n\s+adapter: claude\n\s+effort: xhigh/);
+});
+
+test("playbook.add binds its roles to session players", async () => {
+  const path = templateFile();
+  // A binding may only name a lane that exists, so the lane is minted
+  // first — the order the compile flow uses (DR-032).
+  const minted = await edit(
+    path,
+    { kind: "player.set", playerId: "dev.helper", patch: { adapter: "claude" } },
+    stubLoader,
+  );
+  assert.equal(minted.ok, true);
+  const result = await edit(
+    path,
+    {
+      kind: "playbook.add",
+      playbookId: "other",
+      // A client's `from` is retired: accepted, never written (DR-104).
+      from: "@stub/other",
+      roles: { helper: "dev.helper" },
+      options: { committer: "helper" },
+    },
+    stubLoader,
+  );
+  assert.equal(result.ok, true);
+  const after = readFileSync(path, "utf8");
+  assert.doesNotMatch(after, /from:/);
+  assert.match(after, /other:\n\s+roles:/);
+  // Enabling binds roles to lanes; the lanes live in their own map.
+  assert.match(after, /roles:\n\s+helper: dev\.helper/);
+  assert.match(after, /committer: helper/);
+});
+
+test("edits the launcher would reject never reach the file", async () => {
+  const path = templateFile();
+  const before = readFileSync(path, "utf8");
+
+  const badAdapter = await edit(
+    path,
+    { kind: "captain.set", patch: { adapter: "mystery" } },
+    stubLoader,
+  );
+  assert.equal(badAdapter.ok, false);
+  assert.match(badAdapter.error ?? "", /Unknown adapter "mystery"/);
+  assert.equal(readFileSync(path, "utf8"), before);
+
+  // Effort validation is adapter-scoped at composition (DR-019): a
+  // value the block's adapter refuses fails closed the same way.
+  const badEffort = await edit(
+    path,
+    {
+      kind: "player.set",
+      playerId: "dev.reviewer",
+      patch: { effort: "off" },
+    },
+    stubLoader,
+  );
+  assert.equal(badEffort.ok, false);
+  assert.match(
+    badEffort.error ?? "",
+    /effort "off" is not supported by the "claude" adapter/,
+  );
+  assert.equal(readFileSync(path, "utf8"), before);
+});
+
+test("the retired profile key never survives an edit", async () => {
+  // A hand-typed profiles-era survivor on the target block is dropped
+  // by the merge patch rather than written back.
+  const dir = scratchDir("spex-edit-");
+  const path = join(dir, "playbook.config.yaml");
+  writeFileSync(
+    path,
+    `captain:
+  adapter: claude
+  profile: legacy-opus
+players:
+  dev.coder: claude
+playbooks:
+  code:
+    roles:
+      coder: dev.coder
+`,
+  );
+  const result = await edit(
+    path,
+    { kind: "captain.set", patch: { model: "claude-test" } },
+    stubLoader,
+  );
+  assert.equal(result.ok, true);
+  const after = readFileSync(path, "utf8");
+  assert.doesNotMatch(after, /profile:/);
+  assert.match(after, /model: claude-test/);
+
+  // A profile key smuggled into the patch input itself is stripped too.
+  const smuggled = applyConfigOp(after, {
+    kind: "captain.set",
+    patch: { profile: "sneak", effort: "high" } as unknown as AgentPatch,
+  });
+  assert.doesNotMatch(smuggled, /profile:/);
+  assert.match(smuggled, /effort: high/);
+});
+
+/** The indented block a top-level or nested key owns, read by
+ * indentation rather than by a pattern that has to span it. A regex
+ * like `/key:(?:\n\s+.*)*?\n\s+wanted/` backtracks catastrophically
+ * the moment `wanted` is absent, which turns a plain assertion failure
+ * into a hang — this reads the block first and matches inside it. */
+function block(text: string, key: string): string {
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.trimEnd().endsWith(`${key}:`));
+  if (start < 0) return "";
+  const indent = lines[start]!.length - lines[start]!.trimStart().length;
+  const body: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() === "") continue;
+    if (line.length - line.trimStart().length <= indent) break;
+    body.push(line);
+  }
+  return body.join("\n");
+}
+
+test("a fastMode patch writes the key, null removes it, comments kept (DR-038)", async () => {
+  const path = templateFile();
+  const seeded = readFileSync(path, "utf8");
+  // The starter ships no fastMode of its own — the adapter it seeds is
+  // chosen from what the machine has, so no per-adapter flag is assumed
+  // (PBCLI-11). The comment documenting the key still stands, and the
+  // edit under test is what puts a value under it.
+  assert.doesNotMatch(seeded, /^\s+fastMode:/m);
+  const attached = comments(seeded).filter(
+    (comment) =>
+      comment.startsWith("# Adapter-scoped fast mode") ||
+      comment.startsWith("# omitting it takes the provider default"),
+  );
+  assert.equal(attached.length, 2);
+
+  // Writing the key puts it in the lane it names.
+  const written = await edit(
+    path,
+    { kind: "player.set", playerId: "dev.coder", patch: { fastMode: true } },
+    stubLoader,
+  );
+  assert.ok(written.ok, written.error ?? "edit refused");
+  const before = readFileSync(path, "utf8");
+  assert.match(block(before, "dev.coder"), /\n\s+fastMode: true/);
+
+  // null removes it again, and every comment survives the round trip.
+  const off = await edit(
+    path,
+    { kind: "player.set", playerId: "dev.coder", patch: { fastMode: null } },
+    stubLoader,
+  );
+  assert.ok(off.ok, off.error ?? "edit refused");
+  const afterOff = readFileSync(path, "utf8");
+  assert.doesNotMatch(afterOff, /^\s+fastMode:/m);
+  assertCommentsSurvive(before, afterOff);
+
+  // true and false both write the key.
+  const on = await edit(
+    path,
+    { kind: "captain.set", patch: { fastMode: true } },
+    stubLoader,
+  );
+  assert.ok(on.ok, on.error ?? "edit refused");
+  const literalOff = await edit(
+    path,
+    { kind: "player.set", playerId: "dev.reviewer", patch: { fastMode: false } },
+    stubLoader,
+  );
+  assert.ok(literalOff.ok, literalOff.error ?? "edit refused");
+  const afterOn = readFileSync(path, "utf8");
+  assert.match(block(afterOn, "captain"), /\n\s+fastMode: true/);
+  assert.match(block(afterOn, "dev.reviewer"), /\n\s+fastMode: false/);
+  assertCommentsSurvive(afterOff, afterOn);
+});
+
+test("a subagentModel patch and a role binding write the key, null clears it, comments kept (DR-093)", async () => {
+  const path = templateFile();
+  const seeded = readFileSync(path, "utf8");
+  assert.doesNotMatch(seeded, /^\s+subagentModel:/m);
+
+  // The shared editor's merge patch writes it in the lane it names.
+  const written = await edit(
+    path,
+    { kind: "player.set", playerId: "dev.coder", patch: { subagentModel: "claude-sonnet-5-5" } },
+    stubLoader,
+  );
+  assert.ok(written.ok, written.error ?? "edit refused");
+  const pinned = readFileSync(path, "utf8");
+  assert.match(block(pinned, "dev.coder"), /\n\s+subagentModel: claude-sonnet-5-5/);
+  assertCommentsSurvive(seeded, pinned);
+
+  // A role binding pins it, `false` takes the provider's default, and
+  // null returns the role to the player's own.
+  const bind = { kind: "playbook.role.bind" as const, playbookId: "code", role: "coder", playerId: "dev.coder" };
+  for (const [subagentModel, expected] of [
+    ["claude-haiku-5", /\n\s+subagentModel: claude-haiku-5/],
+    [false, /\n\s+subagentModel: false/],
+  ] as const) {
+    const bound = await edit(path, { ...bind, subagentModel }, stubLoader);
+    assert.ok(bound.ok, bound.error ?? "edit refused");
+    assert.match(readFileSync(path, "utf8"), expected);
+  }
+  const inherit = await edit(path, { ...bind, subagentModel: null }, stubLoader);
+  assert.ok(inherit.ok, inherit.error ?? "edit refused");
+  const inherited = readFileSync(path, "utf8");
+  // The template's own comments name the key, so only key lines count.
+  assert.equal(inherited.match(/^\s+subagentModel:/gm)?.length, 1, "only the player's own key remains");
+  assertCommentsSurvive(pinned, inherited);
+
+  // null removes the player's key again.
+  const cleared = await edit(
+    path,
+    { kind: "player.set", playerId: "dev.coder", patch: { subagentModel: null } },
+    stubLoader,
+  );
+  assert.ok(cleared.ok, cleared.error ?? "edit refused");
+  const after = readFileSync(path, "utf8");
+  assert.doesNotMatch(after, /^\s+subagentModel:/m);
+  assertCommentsSurvive(seeded, after);
+
+  // An adapter cligent serves no subagent model for is refused in the
+  // runtime's words, and the file does not move.
+  const refused = await edit(
+    path,
+    { kind: "player.set", playerId: "dev.reviewer", patch: { adapter: "codex", model: null, effort: null, subagentModel: "gpt-6" } },
+    stubLoader,
+  );
+  assert.ok(!refused.ok);
+  assert.match(refused.error ?? "", /players\.dev\.reviewer\.subagentModel is not supported for adapter "codex"/);
+  assert.equal(readFileSync(path, "utf8"), after);
+});
+
+test("a subagent effort, the inherit literal and Off write their keys, null clears them, comments kept (DR-095)", async () => {
+  const path = templateFile();
+  const seeded = readFileSync(path, "utf8");
+  assert.doesNotMatch(seeded, /^\s+subagentEffort:/m);
+
+  // The shared editor's patch writes the literal and the effort in the
+  // lane it names, and "Off" as `false` on the Captain.
+  const player = await edit(
+    path,
+    { kind: "player.set", playerId: "dev.coder", patch: { subagentModel: "inherit", subagentEffort: "high" } },
+    stubLoader,
+  );
+  assert.ok(player.ok, player.error ?? "edit refused");
+  const off = await edit(path, { kind: "captain.set", patch: { subagentModel: false } }, stubLoader);
+  assert.ok(off.ok, off.error ?? "edit refused");
+  const pinned = readFileSync(path, "utf8");
+  assert.match(block(pinned, "dev.coder"), /\n\s+subagentModel: inherit\n\s+subagentEffort: high/);
+  assert.match(block(pinned, "captain"), /\n\s+subagentModel: false/);
+  assertCommentsSurvive(seeded, pinned);
+
+  // A role binding pins it, `false` leaves it to the agent, and null
+  // returns the role to the player's own.
+  const bind = { kind: "playbook.role.bind" as const, playbookId: "code", role: "coder", playerId: "dev.coder" };
+  for (const [subagentEffort, expected] of [
+    ["low", /\n\s+subagentEffort: low/],
+    [false, /\n\s+subagentEffort: false/],
+  ] as const) {
+    const bound = await edit(path, { ...bind, subagentEffort }, stubLoader);
+    assert.ok(bound.ok, bound.error ?? "edit refused");
+    assert.match(readFileSync(path, "utf8"), expected);
+  }
+  const inherit = await edit(path, { ...bind, subagentEffort: null }, stubLoader);
+  assert.ok(inherit.ok, inherit.error ?? "edit refused");
+  assert.equal(readFileSync(path, "utf8").match(/^\s+subagentEffort:/gm)?.length, 1, "only the player's own key remains");
+
+  // An effort beside a subagent model switched off is refused in its
+  // own words, the file unmoved.
+  const before = readFileSync(path, "utf8");
+  const refused = await edit(path, { ...bind, subagentModel: false }, stubLoader);
+  assert.ok(!refused.ok);
+  assert.match(refused.error ?? "", /playbooks\.code\.roles\.coder\.subagentEffort for adapter "claude" requires subagentModel/);
+  assert.equal(readFileSync(path, "utf8"), before);
+
+  // null removes every key again.
+  for (const op of [
+    { kind: "player.set" as const, playerId: "dev.coder", patch: { subagentModel: null, subagentEffort: null } },
+    { kind: "captain.set" as const, patch: { subagentModel: null } },
+  ]) {
+    const cleared = await edit(path, op, stubLoader);
+    assert.ok(cleared.ok, cleared.error ?? "edit refused");
+  }
+  const after = readFileSync(path, "utf8");
+  assert.doesNotMatch(after, /^\s+subagent(Model|Effort):/m);
+  assertCommentsSurvive(seeded, after);
+});
+
+test("applyConfigOp on an empty file creates the mapping", () => {
+  const text = applyConfigOp("", {
+    kind: "captain.set",
+    patch: { adapter: "claude" },
+  });
+  assert.match(text, /captain:\n\s+adapter: claude/);
+});
+
+test("an explicit null unsets a pinned key (DR-019)", () => {
+  const text = `captain:
+  adapter: claude
+  model: claude-opus-4-8
+  effort: high
+  instruction: keep answers short
+`;
+  const patched = applyConfigOp(text, {
+    kind: "captain.set",
+    patch: { adapter: "claude", model: null },
+  });
+  assert.doesNotMatch(patched, /model:/);
+  // Only the nulled key goes; everything else — including the
+  // hand-written instruction — survives.
+  assert.match(patched, /effort: high/);
+  assert.match(patched, /instruction: keep answers short/);
+});
+
+// approvals-9, settings-21: exercise the real native acceptance stage through
+// the same file-edit validator as config.edit, stopping before any provider.
+test("native approval acceptance replaces seeded auto mode with explicit ask policy", async () => {
+  const path = templateFile();
+  assert.equal(parse(readFileSync(path, "utf8")).players["inspect.inspector"].permissions.mode, "auto");
+  const moduleUrl = new URL("../../../scripts/native-approval-stage.mjs", import.meta.url).href;
+  const { nativeApprovalStage } = await import(moduleUrl);
+  const stopBeforeProvider = new Error("validated configuration; stop before capability/provider work");
+  await assert.rejects(nativeApprovalStage({
+    inspector: "inspect.inspector",
+    client: {
+      async command(type: string, fields: { op: Parameters<typeof editConfigFile>[1] }) {
+        if (type === "agent.capabilities") throw stopBeforeProvider;
+        assert.equal(type, "config.edit");
+        const result = await edit(path, fields.op, stubLoader);
+        assert.equal(result.ok, true, result.error ?? "config edit rejected");
+        return result;
+      },
+    },
+  }), (error: unknown) => error === stopBeforeProvider);
+  const saved = parse(readFileSync(path, "utf8"));
+  assert.equal(saved.players["inspect.inspector"].adapter, "claude");
+  assert.equal(saved.players["inspect.inspector"].browser, false);
+  assert.deepEqual(saved.players["inspect.inspector"].permissions, {
+    shellExecute: "ask", fileWrite: "deny", networkAccess: "deny",
+  });
+  assert.deepEqual(saved.captain.permissions, { mode: "auto" });
+});
